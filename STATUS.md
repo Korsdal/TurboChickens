@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 06 landed (127/127 tests green, e2e smoke verified).
+**Last updated:** 2026-11-12, after spec 07 landed (133/133 tests green, e2e smoke verified).
 
 ---
 
@@ -26,7 +26,7 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01, spec 02, spec 03, spec 04, spec 05, and spec 06 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, and the spec-06 commit).
+**Spec 01, spec 02, spec 03, spec 04, spec 05, spec 06, and spec 07 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, and the spec-07 commit).
 Verified this session:
 
 ```
@@ -49,6 +49,14 @@ Verified this session:
 #   → tc schedule list → row with cron + next_run; tc status → schedules count; tc schedule rm → "no schedules"
 #   → a cron expr firing at the next minute boundary enqueues a run with trigger=cron → succeeded, attested,
 #     result stored; audit shows schedule.fired + run.queued(trigger=cron); schedules survive a daemon restart
+# spec-07 smoke (fake vibe binary via $TURBOCHICKENS_VIBE_BIN, temp data_dir, subprocess daemon):
+#   → tc run <SLEEP 30 job, timeout_sec=1> --wait → failed "timeout: hard-killed after 1s", rc 1, in ~1s;
+#     manifest budget.outcome=timeout + timed_out=true; teardown attestation (1,1,1); audit teardown.attested +
+#     run.finished(reason contains timeout); tc runs show prints the budget block
+#   → tc run <1.5 MiB attachment job, max_context_mb=1> --wait → failed at provisioning "injected context
+#     1500005 bytes (1.431 MB) > max_context_mb=1", rc 1; never reached running (no harness events); manifest
+#     budget.outcome=context_cap + injected_context_bytes; attestation (1,1,1); no results row; workspace gone
+#   → tc run <exactly-1-MiB job, max_context_mb=1> --wait → succeeded (cap is inclusive), budget.outcome=ok
 ```
 
 What exists:
@@ -71,8 +79,9 @@ src/turbochickens/
 │                          # settings.providers_path > $TURBOCHICKENS_PROVIDERS > <data_dir>/providers.toml
 │                          # > built-in mistral defaults (overlaid per provider)
 ├── runner.py              # RunPipeline: lifecycle queued→…→succeeded/failed, fresh workspace +
-│                          # per-run env, manifest, run_events, spec-04 result store / quarantine
-│                          # at `collecting`, teardown attestation + audit rows
+│                          # per-run env, manifest (+ spec-07 `budget` outcome block), run_events,
+│                          # spec-04 result store / quarantine at `collecting`, spec-07 context cap
+│                          # at `provisioning`, teardown attestation + audit rows
 ├── scheduler.py           # spec 06: CronScheduler over APScheduler AsyncIOScheduler; standard
 │                          # POSIX cron semantics (aps_trigger resolves the day-of-week field via
 │                          # croniter because APScheduler numbers 0=Monday); schedules re-registered
@@ -106,6 +115,9 @@ tests/
 │                          # add/list/rm over socket+CLI, manual-trigger rejection, hash/spec checks,
 │                          # replace-on-re-add, persistence across daemon restart, and a real cron firing
 │                          # (next-minute expression) driving a trigger=cron run through the full pipeline
+├── test_budgets.py        # spec 07: timeout hard-kill e2e (vibe-cli + mistral-api), injected-context
+│                          # cap failure at provisioning, at-cap boundary, manifest budget outcome via
+│                          # tc runs show, no-token-cap model check
 ├── test_api_adapter.py    # spec 05: providers seam, MistralAPIAdapter contract seam (MockTransport:
                            # JSON-mode shape, exp backoff on 429/5xx, no retry on 4xx, Retry-After,
                            # timeout, missing credential), e2e via daemon thread + subprocess against
@@ -283,6 +295,30 @@ Spec-06 deliverables, concretely:
   persistence across a daemon restart; and one real firing (cron at the next minute boundary)
   producing a `trigger=cron` run that reaches `succeeded` with result store + attestation + audit.
 
+Spec-07 deliverables, concretely:
+
+- **Wall-clock hard kill** (spec 03 adapters, verified e2e here): a run exceeding `timeout_sec` is hard-killed
+  (`proc.kill()` / `asyncio.wait_for` over the whole API call incl. backoff), marked `failed` with reason
+  `timeout: hard-killed after Ns`, and still gets a full teardown attestation + `teardown.attested` /
+  `run.finished` audit rows. Tested for both `vibe-cli` (fake binary sleeping past the budget) and
+  `mistral-api` (fake provider slower than the budget).
+- **Injected-context cap** (`runner.py` at provisioning): `_provision` now returns the injected-context size in
+  bytes (prompt + attachments; injected trajectory state is post-MVP). If it exceeds
+  `max_context_mb * 1MiB`, the run fails at provisioning — before any harness work — with a recorded reason
+  (`budget exceeded at provisioning: injected context N bytes (X MB) > max_context_mb=M`), no `running`
+  transition, no harness events, no result row; teardown attestation + audit rows still happen and the
+  workspace is verified gone. The cap is inclusive: exactly-at-cap runs proceed.
+- **Budget outcome in the manifest** (`runner.py` `_manifest`): every run manifest gains a `budget` block —
+  `{timeout_sec, max_context_mb, injected_context_bytes, timed_out, context_exceeded, outcome}` with
+  `outcome ∈ ok | timeout | context_cap` (top-level `timed_out` kept for compatibility) — visible in
+  `runs_show` / `tc runs show`. The spec model still has **no token cap**: `max_tokens` anywhere is rejected
+  by `extra="forbid"` (covered in `test_spec_model.py` / `test_budgets.py`); token usage remains telemetry
+  in `manifest.usage`.
+- **Tests** (`test_budgets.py`): timeout hard-kill e2e for both adapters (failed + attested + audited +
+  manifest outcome, hard-kill latency asserted), context-over-cap failure at provisioning (clear reason,
+  never reached running, attested, audited, no result, workspace gone, `tc runs show` shows `context_cap`),
+  exactly-at-cap success, success manifest `budget` block, and the pure no-token-cap model check.
+
 | Spec | Title | Status | Blocked by |
 | --- | --- | --- | --- |
 | 01 | Scaffold + job spec model + `tc jobs validate` | **done** (`f8b8061`) | — |
@@ -291,7 +327,7 @@ Spec-06 deliverables, concretely:
 | 04 | Output validation + result store + quarantine + `tc results get` | **done** (2026-11-12) | 03 |
 | 05 | `mistral-api` adapter + `providers.toml` + backoff on 429/5xx | **done** (2026-11-12) | 03, 04 |
 | 06 | Cron scheduling (APScheduler) + `tc schedule add/list/rm` | **done** (2026-11-12) | 03 |
-| 07 | Run budgets: wall-clock hard kill + injected-context cap | ready-for-agent | 03 |
+| 07 | Run budgets: wall-clock hard kill + injected-context cap | **done** (2026-11-12) | 03 |
 | 08 | Usage stats + expected cost + retention TTLs | ready-for-agent | 04, 05 |
 
 ## 5. Non-negotiable invariants (baseline v0.2 — do not regress these)
@@ -348,9 +384,11 @@ tables deliberately excluded).
   <vibe@mistral.ai>`.
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 
-## 7. Next up — spec 07 (`specs/07-run-budgets.md`)
+## 7. Next up — spec 08 (`specs/08-usage-stats-retention.md`)
 
-Run budgets: wall-clock hard kill + injected-context cap (blocked by 03, done).
-Spec 06 (cron scheduling via APScheduler + `tc schedule add/list/rm`) landed:
-cron-triggered jobs submit over the same socket queue as manual runs — manual
-and cron runs stay indistinguishable downstream (`runs.trigger` aside).
+Usage stats + expected cost + retention TTLs (blocked by 04, 05 — both done).
+Spec 07 (run budgets) landed: wall-clock `timeout_sec` hard kill (attested +
+audited on both adapters) and the `max_context_mb` injected-context cap
+enforced at provisioning; every manifest now carries a `budget` outcome block
+(`ok` / `timeout` / `context_cap`). Token usage stays telemetry — no
+`max_tokens` anywhere.

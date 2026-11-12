@@ -77,15 +77,23 @@ class RunPipeline:
 
     # --- provisioning -----------------------------------------------------
 
-    def _provision(self, ctx: RunContext) -> None:
+    def _provision(self, ctx: RunContext) -> int:
         """Fresh per-run workspace with the job inputs copied in. Nothing is
-        shared between runs; nothing from the ambient environment either."""
+        shared between runs; nothing from the ambient environment either.
+        Returns the injected-context size in bytes (prompt + attachments;
+        injected trajectory state is post-MVP) so the spec-07 context cap can
+        be enforced at provisioning time."""
         ws = ctx.workspace
         ws.mkdir(parents=True, exist_ok=True)
         spec_dir = ctx.spec_path.parent
-        shutil.copyfile(spec_dir / ctx.spec.input.prompt_file, ws / "prompt.txt")
+        prompt_src = spec_dir / ctx.spec.input.prompt_file
+        shutil.copyfile(prompt_src, ws / "prompt.txt")
+        injected = prompt_src.stat().st_size
         for att in ctx.spec.input.attachments:
-            shutil.copyfile(spec_dir / att, ws / Path(att).name)
+            src = spec_dir / att
+            shutil.copyfile(src, ws / Path(att).name)
+            injected += src.stat().st_size
+        return injected
 
     # --- result store + quarantine (spec 04) --------------------------------
 
@@ -147,6 +155,7 @@ class RunPipeline:
         result: HarnessResult | None,
         status: str,
         reason: str,
+        budget: dict[str, Any],
     ) -> dict[str, Any]:
         spec = ctx.spec
         return {
@@ -173,6 +182,10 @@ class RunPipeline:
             "status": status,
             "status_reason": reason,
             "timed_out": bool(result and result.timed_out),
+            # spec 07: the enforced budget outcome — wall-clock timeout and
+            # injected-context cap. Token usage stays telemetry (usage above),
+            # never a budget.
+            "budget": budget,
         }
 
     # --- the lifecycle ----------------------------------------------------
@@ -200,21 +213,48 @@ class RunPipeline:
             "model": spec.harness.model,
             "temperature": spec.harness.temperature,
         }
+        budget: dict[str, Any] = {
+            "timeout_sec": spec.resources.timeout_sec,
+            "max_context_mb": spec.resources.max_context_mb,
+            "injected_context_bytes": None,
+            "timed_out": False,
+            "context_exceeded": False,
+            "outcome": "ok",
+        }
         try:
             await self._set_status(run_id, "provisioning")
-            self._provision(ctx)
-            prepared = adapter.prepare(ctx)
-            harness = prepared.harness
-            await self._set_status(run_id, "running")
-            result = await adapter.execute(
-                prepared,
-                lambda source, level, line: self._event(run_id, source, level, line),
-                timeout_sec=spec.resources.timeout_sec,
-            )
-            if result.timed_out:
+            injected_bytes = self._provision(ctx)
+            budget["injected_context_bytes"] = injected_bytes
+            cap_bytes = spec.resources.max_context_mb * 1024 * 1024
+            if injected_bytes > cap_bytes:
+                # spec 07: hard cap on injected context, enforced at
+                # provisioning — the run fails before any harness work
+                budget["context_exceeded"] = True
+                budget["outcome"] = "context_cap"
+                status = "failed"
+                reason = (
+                    f"budget exceeded at provisioning: injected context {injected_bytes} bytes"
+                    f" ({injected_bytes / 1024 / 1024:.3f} MB) > max_context_mb={spec.resources.max_context_mb}"
+                    f" ({cap_bytes} bytes)"
+                )
+                await self._event(run_id, "supervisor", "error", reason)
+            else:
+                prepared = adapter.prepare(ctx)
+                harness = prepared.harness
+                await self._set_status(run_id, "running")
+                result = await adapter.execute(
+                    prepared,
+                    lambda source, level, line: self._event(run_id, source, level, line),
+                    timeout_sec=spec.resources.timeout_sec,
+                )
+            if result is not None and result.timed_out:
+                budget["timed_out"] = True
+                budget["outcome"] = "timeout"
                 status, reason = "failed", f"timeout: hard-killed after {spec.resources.timeout_sec}s"
-            elif result.error:
+            elif result is not None and result.error:
                 status, reason = "failed", result.error
+            elif result is None:
+                pass  # context-cap failure at provisioning; status/reason already set
             elif result.exit_code != 0:
                 status, reason = "failed", f"harness exited rc={result.exit_code}"
             else:
@@ -246,7 +286,7 @@ class RunPipeline:
             with contextlib.suppress(Exception):
                 await self._event(run_id, "supervisor", "error", sanitize_log_line(str(e)))
         finally:
-            await self._finalize(item, ctx, harness, result, status, reason, adapter)
+            await self._finalize(item, ctx, harness, result, status, reason, adapter, budget)
 
     async def _finalize(
         self,
@@ -257,11 +297,12 @@ class RunPipeline:
         status: str,
         reason: str,
         adapter: Any,
+        budget: dict[str, Any],
     ) -> None:
         """Manifest + terminal status + teardown attestation + audit rows.
         Runs for every path out of `execute`, including exceptions."""
         run_id = ctx.run_id
-        manifest = self._manifest(item, ctx, harness, result, status, reason)
+        manifest = self._manifest(item, ctx, harness, result, status, reason, budget)
         # teardown first: destruction is verified, not assumed
         try:
             report: TeardownReport = await adapter.teardown(ctx)

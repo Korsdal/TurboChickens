@@ -4,8 +4,8 @@
 
 **Blocked by:** 03 (run pipeline and provisioner)
 
-**Status:** ready-for-agent
+**Status:** done (2026-11-12)
 
-- [ ] A run exceeding `timeout_sec` is hard-killed, marked failed, and still has a teardown attestation plus audit row
-- [ ] A run whose injected context exceeds `max_context_mb` fails at provisioning with a clear recorded reason
-- [ ] The manifest records the budget outcome; the spec model has no token cap
+- [x] A run exceeding `timeout_sec` is hard-killed, marked failed, and still has a teardown attestation plus audit row
+- [x] A run whose injected context exceeds `max_context_mb` fails at provisioning with a clear recorded reason
+- [x] The manifest records the budget outcome; the spec model has no token cap
