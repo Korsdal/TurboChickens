@@ -215,6 +215,23 @@ class SeatBroker:
         present = any(os.environ.get(k) is not None for k in self.env_allowlist)
         return {"mode": "api-key" if present else "none", "token_expires_at": None}
 
+    def bearer_token(self, provider_name: str) -> str:
+        """The current access token for a seat provider (refreshed first when
+        expired) — for out-of-band authenticated calls like `tc models list`
+        hitting the provider's /models. Raises SeatError for api-key providers
+        (use the env var there) and whenever no valid session exists; the
+        token itself is only ever returned, never logged."""
+        provider = self.providers.providers.get(provider_name)
+        if provider is None:
+            raise SeatError(
+                f"unknown provider {provider_name!r}; known providers: {', '.join(sorted(self.providers.providers)) or '(none)'}"
+            )
+        if provider.auth != "seat":
+            raise SeatError(
+                f"provider {provider_name!r} uses auth='api-key'; no seat token — set ${provider.api_key_env} instead"
+            )
+        return self._valid_session(provider_name, provider).access_token
+
     # --- session lifecycle ---------------------------------------------------
 
     def _valid_session(self, provider_name: str, provider: ProviderProfile) -> SeatSession:

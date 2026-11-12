@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 09 landed (166/166 tests green, e2e smoke verified).
+**Last updated:** 2026-11-12, after spec 10 landed (188/188 tests green, e2e smoke verified).
 
 ---
 
@@ -26,14 +26,14 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 09 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, and the spec-08 commit; spec 09 in the working tree).
+**Spec 01 through spec 10 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, and the spec-10 commit).
 
-**Specs 10 (model discovery — `tc models list` against live provider catalogs) and 19 (auth & access management UI) are backlogged** — `specs/10-model-discovery.md` and `specs/19-auth-access-management-ui.md`, both status ready-for-agent, not started. The vibe-cli harness is limited to vibe's own model catalog (mistral-medium-3.5 only in vibe 3.1.2); see that ticket. Note spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough.
+**Spec 19 (auth & access management UI) is backlogged** — `specs/19-auth-access-management-ui.md`, status ready-for-agent, not started. Note spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality.
 Verified this session:
 
 ```
-.venv/bin/python -m pytest -q          → 145 passed
-.venv/bin/tc --help                     → works, shows `run`, `runs`, `jobs`, `daemon`, `results`, `schedule`, `stats`, `status`
+.venv/bin/python -m pytest -q          → 188 passed
+.venv/bin/tc --help                     → works, shows `run`, `runs`, `jobs`, `daemon`, `results`, `schedule`, `stats`, `status`, `auth`, `models`
 .venv/bin/tc jobs validate examples/weekly-incidents-digest/job.toml
                                         → OK … sha256:18efbd8c…80b959 (unchanged)
 # e2e smoke (fake vibe binary via $TURBOCHICKENS_VIBE_BIN): tc daemon start (background)
@@ -77,6 +77,19 @@ Verified this session:
 #     session file deleted, teardown still attested (1,1,1)
 #   → vibe-cli job with no MISTRAL_API_KEY → succeeded; manifest.auth.mode=none; fake vibe saw home=set,
 #     mistral_api_key=unset (browser-auth profile in ~/.vibe/config.toml is vibe's own mechanism)
+# spec-10 smoke (loopback fake OpenAI-compatible server serving GET /v1/models via $TURBOCHICKENS_PROVIDERS,
+#   second provider pointed at a dead port):
+#   → tc models list → provider=mistral reachable=yes cred=env models=2 with per-model [priced] /
+#     [no-pricing-preset] marks; provider=dead reachable=no error=transport error (ConnectError); rc 0;
+#     the fake server saw "Authorization: Bearer <key>" and the key never appears in the output
+#   → no key in env → cred=none, request sent unauthenticated (or 401 → reachable=no row, rc 0)
+#   → seat provider (auth="seat", stored session) → cred=seat, /models authorized with the seat token,
+#     token never printed; no session → row reachable=no with a `tc auth login <provider>` hint, zero requests
+#   → tc models list --adapter vibe-cli → probes the vibe binary with a sentinel --model and prints the
+#     models from vibe's own "Unknown model … Available: …" diagnostic (real vibe 3.1.2: 4 models, rc 0)
+#   → tc jobs validate <mistral-api job, model without pricing preset> → warning on stderr + OK, rc 0;
+#     unknown provider → error harness.model … known providers, rc 1; vibe-cli model not in the probed
+#     catalog → error naming the offered models, rc 1
 ```
 
 What exists:
@@ -99,13 +112,15 @@ src/turbochickens/
 │                          # auth="seat": OAuth device-flow login (tc auth login), session stored
 │                          # 0600 under <data_dir>/seats/, refresh of expired tokens (fail-closed on
 │                          # revoked), token injected per-run under the provider's api_key_env;
-│                          # auth_telemetry() exposes only mode + token expiry (never tokens)
+│                          # auth_telemetry() exposes only mode + token expiry (never tokens);
+│                          # bearer_token() (spec 10) hands the session token to `tc models list`
 ├── adapter.py             # HarnessAdapter Protocol (prepare/execute/teardown) + CredentialProvider
 │                          # extension point + VibeCLIAdapter (headless subprocess pinned to the
 │                          # workspace, sanitized streamed logs) + MistralAPIAdapter (spec 05:
 │                          # OpenAI-compatible HTTP via httpx, JSON mode, exp backoff on 429/5xx)
 │                          # + adapter weights (API 0.25 / CLI 1.0); PreparedRun carries non-secret
-│                          # auth telemetry (spec 09); seat runs report cost_usd=0.0 billed_via=seat
+│                          # auth telemetry (spec 09); seat runs report cost_usd=0.0 billed_via=seat;
+│                          # module-level resolve_vibe_bin/vibe_version helpers (spec 10 probe)
 ├── providers.py           # spec 05: providers.toml registry — provider/model presets, base_url,
 │                          # credential env var, context_window, per-token pricing; resolution:
 │                          # settings.providers_path > $TURBOCHICKENS_PROVIDERS > <data_dir>/providers.toml
@@ -130,14 +145,21 @@ src/turbochickens/
 │                          # the daemon's own socket; retention sweep at startup + hourly (spec 08);
 │                          # results_get reports expired artifacts; status carries a retention block
 ├── client.py              # request(socket, op, **payload) → parsed response; DaemonUnreachable
+├── models.py              # spec 10: model discovery, on-demand per invocation (no daemon state) —
+│                          # fetch_models (GET {base_url}/models, bearer from the allowlisted env var
+│                          # or the seat session token; token never printed/logged), list_provider_catalogs
+│                          # (per-provider reachable row + live ids marked priced/no-pricing-preset),
+│                          # vibe_catalog (headless sentinel-model probe parsing vibe's own
+│                          # "Unknown model … Available:" list), model_issues (validate checks)
 ├── validate.py            # spec 04 pure seam: validate_output(raw, schema_path) → OutputValidation
 │                          # (jsonschema Draft 2020-12 + format checker; never raises on bad output)
 ├── spec/
 │   ├── model.py           # Pydantic v2 model, all 6 sections, extra="forbid"
 │   └── loader.py          # load_spec(), SpecValidationError (field-named issues), spec_hash()
 └── cli/main.py            # Typer app `tc`: run [--wait] | runs list/show/logs | results get |
-                           # jobs validate | daemon start/stop | status | schedule add/list/rm |
-                           # stats list/show (spec 08) | auth login/status/logout (spec 09, local)
+                           # jobs validate (spec 10: model checks) | daemon start/stop | status |
+                           # schedule add/list/rm | stats list/show (spec 08) |
+                           # auth login/status/logout (spec 09, local) | models list (spec 10, local)
 tests/
 ├── test_spec_model.py     # pure-function seam: parser/model/hash
 ├── test_cli_validate.py   # CLI seam: tc jobs validate behavior
@@ -166,6 +188,12 @@ tests/
 │                          # no session), device flow over loopback fake OAuth, tc auth CLI, and
 │                          # daemon e2e: seat run with no *_API_KEY, expired→refresh, revoked→fail
 │                          # closed, vibe-cli via HOME passthrough
+└── test_models.py         # spec 10: fetch_models contract over MockTransport (bearer sent only with
+                           # a token, token never in errors), model_issues pure seam, tc models list
+                           # e2e over a loopback fake /models server (priced marks, unreachable row
+                           # rc 0, env-key/401/seat-session credential paths), vibe catalog via a fake
+                           # vibe binary (probe parse + broken binary), and tc jobs validate
+                           # warn/error model checks
 ├── test_api_adapter.py    # spec 05: providers seam, MistralAPIAdapter contract seam (MockTransport:
                            # JSON-mode shape, exp backoff on 429/5xx, no retry on 4xx, Retry-After,
                            # timeout, missing credential), e2e via daemon thread + subprocess against
@@ -398,6 +426,14 @@ Spec-09 deliverables, concretely:
 - **CLI**: `tc auth login <provider>` / `tc auth status` / `tc auth logout <provider>` — local (no daemon), never print or log tokens.
 - **Tests** (`test_seat_auth.py`, 21): provider auth-field seams; store round-trip/perms/corrupt-fail-closed; broker + adapter contract over `MockTransport` (seat bearer sent, expired→refresh→new token, revoked→fail closed + session deleted, no session→no request, api-key passthrough unchanged); device flow over a loopback fake OAuth server (auto-approve, pending-then-success, api-key provider rejected); CLI login/status/logout; and four daemon e2e cases over loopback fake OAuth+API servers with no `*_API_KEY` in the environment.
 
+Spec-10 deliverables, concretely:
+
+- **Discovery module** (`models.py`): all on-demand per invocation, no daemon state, no caching. `fetch_models()` does `GET {base_url}/models` per provider in `providers.toml` and parses the OpenAI-compatible `{"data": [{"id": …}]}` payload (sorted, deduped; malformed → error). `list_provider_catalogs()` returns one row per provider — reachable or not + error — and marks each live model id `[priced]`/`[no-pricing-preset]` based on the provider's presets. `vibe_catalog()` probes the vibe binary headless with a sentinel `--model` (`__turbochickens_model_probe__`, never valid, so vibe fails before any API call) and parses its own `Unknown model … Available: …` diagnostic — the exact list a vibe-cli run validates `--model` against — run with the full user env so vibe's keyring/session credential resolution works. `model_issues()` backs the validate checks.
+- **Credentials (spec 05/09):** the /models call sends `Authorization: Bearer …` from the provider's allowlisted `api_key_env` when set (spec 05), or from the seat session token for `auth = "seat"` providers via the new public `SeatBroker.bearer_token()` (refreshing first when expired; no/revoked session → the row is marked unreachable with a `tc auth login <provider>` hint and zero requests are sent — fail closed). No key is ever printed, logged, or present in error strings (asserted in tests); without a key the request goes out unauthenticated (`cred=none`).
+- **CLI:** `tc models list [--adapter mistral-api|vibe-cli] [--settings …]` — local, no daemon. Default lists every provider (rows `provider=… auth=… cred=… base_url=… reachable=yes|no`, model lines with preset marks); unreachable providers are rows, not failures — rc stays 0 (rc 1 only for an invalid providers file or a bad `--adapter`). `--adapter vibe-cli` prints the vibe binary's own catalog (`bin=… version=… reachable=… models=N` + ids).
+- **`tc jobs validate`** (now takes `--settings` for providers resolution): a `mistral-api` model whose *provider* is unknown → `error harness.model: unknown provider …` (exit 1); a known provider without a pricing preset for the model → `warning harness.model: … no pricing preset …` on stderr, still `OK` exit 0 (the live catalog may offer it — check `tc models list`); a `vibe-cli` model not in the probed catalog → `error harness.model: unknown model … the vibe binary offers: …` (exit 1), skipped when the probe can't determine the catalog. Enqueue-time behavior is unchanged (spec 05: unresolvable model/provider still fails fast at the daemon).
+- **Tests** (`test_models.py`, 22): `fetch_models` contract over `MockTransport` (id parsing, bearer only with a token, 500/malformed/transport errors, token never in errors); `model_issues` pure seam; `tc models list` e2e over a hermetic loopback fake /models server (live ids + pricing marks, dead-port provider row rc 0, env-key vs no-key vs 401 vs seat-session credential paths, key/token never in output); vibe catalog via a fake vibe binary (probe parse, broken binary → reachable=no rc 0); and the `tc jobs validate` warn/error cases.
+
 | Spec | Title | Status | Blocked by |
 | --- | --- | --- | --- |
 | 01 | Scaffold + job spec model + `tc jobs validate` | **done** (`f8b8061`) | — |
@@ -410,7 +446,7 @@ Spec-09 deliverables, concretely:
 | 08 | Usage stats + expected cost + retention TTLs | **done** (2026-11-12) | 04, 05 |
 | 00 | Design system — TurboChickens GUI | **settled** (2026-11-12; governs 12–18) | — |
 | 09 | Seat/subscription auth, no API key | **done** (2026-11-12) | 05 |
-| 10 | Model discovery (`tc models list`) | ready-for-agent (backlog) | 05 |
+| 10 | Model discovery (`tc models list`) | **done** (2026-11-12) | 05 |
 | 11 | TurboChickens GUI in the coop container (parent spec) | ready-for-agent | 02–08 |
 | 12 | Coop skeleton: daemon serves GUI (HTTP + auth + shell + Dashboard) | ready-for-agent | — |
 | 13 | Jobs / Audit / Settings views (read-only socket ops) | ready-for-agent | 12 |
@@ -480,26 +516,21 @@ tables deliberately excluded).
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 - **Version management is a human responsibility.** Coding agents can bump the
   last part of a version number (`0.0.X`) — every other bump (minor, major) is
-  human initiated. Current version: `0.0.9`.
+  human initiated. Current version: `0.0.10`.
 
-## 7. Next up — spec 10, then the coop GUI roadmap
+## 7. Next up — the coop GUI roadmap
 
-Spec 09 (seat/subscription auth) landed: providers can declare
-`auth = "seat"` with OAuth endpoints in `providers.toml`; `tc auth login
-<provider>` runs the device flow and stores the session 0600 under
-`<data_dir>/seats/`; the `SeatBroker` credential provider refreshes expired
-tokens before a run and injects them per-run under the provider's `api_key_env`
-(allowlist discipline unchanged); manifests/audit record only the auth mode +
-token expiry; seat usage reports `cost_usd = 0.0` (`billed_via = "seat"`),
-never a fabricated per-token price. vibe-cli needs no key either: a
-browser-auth provider in `~/.vibe/config.toml` is picked up by the vibe binary
-via HOME passthrough.
+Spec 10 (model discovery) landed: `tc models list` queries each provider's
+live `GET /models` catalog (and `--adapter vibe-cli` probes the vibe binary's
+own model list), marking which live models have pricing presets, with
+spec-05/09 credential handling and no daemon state; `tc jobs validate` warns
+on unpriced mistral-api models and errors on models unknown to the chosen
+harness.
 
-Next backlog item is **spec 10** (`tc models list` against live provider
-catalogs), then the coop GUI roadmap (specs 11–18, governed by spec 00), with
-**spec 19** (auth & access management UI) queued behind spec 12. The MVP spec
-pipeline (01–09) is complete; what remains beyond 10 is the post-MVP roadmap
-in baseline §13.
+Next backlog item is the coop GUI roadmap — **specs 11–18** (governed by
+spec 00), with **spec 19** (auth & access management UI) queued behind
+spec 12. The MVP spec pipeline (01–10) is complete; what remains beyond the
+GUI is the post-MVP roadmap in baseline §13.
 
 **Deferred (backlog notes):**
 - *Async seat broker:* `SeatBroker` does its HTTP synchronously (httpx.Client)

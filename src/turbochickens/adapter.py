@@ -204,6 +204,16 @@ def resolve_vibe_bin() -> str:
     return os.environ.get(VIBE_BIN_ENVVAR) or shutil.which("vibe") or "vibe"
 
 
+def vibe_version(bin_path: str) -> str:
+    """Best-effort `vibe --version` parse; "unknown" on any failure."""
+    try:
+        out = subprocess.run([bin_path, "--version"], capture_output=True, text=True, timeout=15)
+        text = out.stdout.strip()
+        return text.split()[-1] if text else "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
 class VibeCLIAdapter:
     """Runs the Vibe CLI headless as a subprocess pinned to the run workspace
     (cwd = workspace, per-run env, stdin closed). stdout is the final message
@@ -224,14 +234,7 @@ class VibeCLIAdapter:
 
     def _vibe_version(self) -> str:
         if self._version is None:
-            try:
-                out = subprocess.run(
-                    [self.bin, "--version"], capture_output=True, text=True, timeout=15
-                )
-                text = out.stdout.strip()
-                self._version = text.split()[-1] if text else "unknown"
-            except (OSError, subprocess.SubprocessError):
-                self._version = "unknown"
+            self._version = vibe_version(self.bin)
         return self._version
 
     def prepare(self, run: RunContext) -> PreparedRun:

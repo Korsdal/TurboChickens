@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from rich.table import Table
 
 from turbochickens.client import DaemonUnreachable, request
 from turbochickens.daemon import DaemonAlreadyRunning, run_daemon
+from turbochickens.models import list_provider_catalogs, model_issues, vibe_catalog
 from turbochickens.providers import ProvidersError, load_providers
 from turbochickens.runner import TERMINAL_STATES
 from turbochickens.seat import SeatBroker, SeatError
@@ -32,6 +34,7 @@ results_app = typer.Typer(help="Fetch validated results.", no_args_is_help=True)
 schedule_app = typer.Typer(help="Manage cron schedules.", no_args_is_help=True)
 stats_app = typer.Typer(help="Per-job usage statistics (spec 08).", no_args_is_help=True)
 auth_app = typer.Typer(help="Seat/subscription auth (spec 09) — local, no daemon needed.", no_args_is_help=True)
+models_app = typer.Typer(help="Model discovery (spec 10) — local, no daemon needed.", no_args_is_help=True)
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(runs_app, name="runs")
@@ -39,6 +42,7 @@ app.add_typer(results_app, name="results")
 app.add_typer(schedule_app, name="schedule")
 app.add_typer(stats_app, name="stats")
 app.add_typer(auth_app, name="auth")
+app.add_typer(models_app, name="models")
 
 err_console = Console(stderr=True)
 console = Console()
@@ -63,16 +67,99 @@ def jobs_validate(
         dir_okay=False,
         readable=True,
     ),
+    settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Validate a job spec. Prints OK plus the stable spec hash, or field-named errors."""
+    """Validate a job spec. Prints OK plus the stable spec hash, or field-named errors.
+
+    Spec 10: also checks harness.model against the chosen harness — an unknown
+    provider/model errors (exit 1), a mistral-api model without a pricing
+    preset in providers.toml only warns (the live catalog may offer it; see
+    `tc models list`)."""
     try:
         spec = load_spec(spec_path)
     except SpecValidationError as e:
         for issue in e.issues:
             err_console.print(f"[bold red]error[/bold red] {issue}")
         raise typer.Exit(code=1) from None
+    try:
+        settings = load_settings(settings_path)
+        providers = load_providers(settings.providers_path, settings.data_dir)
+    except (SettingsError, ProvidersError) as e:
+        err_console.print(f"[bold red]error[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+    vibe_models = None
+    if spec.harness.adapter == "vibe-cli":
+        catalog = vibe_catalog()
+        if catalog.reachable:
+            vibe_models = catalog.models
+    errors, warnings = model_issues(spec, providers, vibe_models)
+    for w in warnings:
+        err_console.print(f"[yellow]warning[/yellow] {w}")
+    if errors:
+        for e in errors:
+            err_console.print(f"[bold red]error[/bold red] {e}")
+        raise typer.Exit(code=1) from None
     digest = spec_hash(spec)
     typer.echo(f"OK: job '{spec.job.name}' — spec hash sha256:{digest}")
+
+
+@models_app.command("list")
+def models_list(
+    adapter: str = typer.Option(
+        "mistral-api",
+        "--adapter",
+        help="Which catalog to list: 'mistral-api' = every provider in providers.toml via GET {base_url}/models; 'vibe-cli' = the models the vibe binary itself offers.",
+    ),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """List usable models, on demand (local, no daemon state).
+
+    Per provider: reachable or not, the live model ids from GET /models, and
+    which of them have a pricing preset in providers.toml. Credentials match
+    spec 05/09 (allowlisted env var, or the seat session token) and are never
+    printed. Unreachable providers are marked, not fatal — exit code stays 0.
+    """
+    if adapter not in ("mistral-api", "vibe-cli"):
+        err_console.print(f"[bold red]error[/bold red] --adapter must be 'mistral-api' or 'vibe-cli', got {adapter!r}")
+        raise typer.Exit(code=1)
+    try:
+        settings = load_settings(settings_path)
+        providers = load_providers(settings.providers_path, settings.data_dir)
+    except (SettingsError, ProvidersError) as e:
+        err_console.print(f"[bold red]error[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+    if adapter == "vibe-cli":
+        catalog = vibe_catalog()
+        line = f"adapter=vibe-cli  bin={catalog.bin}  version={catalog.version}  reachable={'yes' if catalog.reachable else 'no'}"
+        if catalog.reachable:
+            line += f"  models={len(catalog.models)}"
+        else:
+            line += f"  error={catalog.error}"
+        typer.echo(line)
+        for m in catalog.models:
+            typer.echo(f"  {m}")
+        return
+    broker = SeatBroker(settings, providers)
+
+    def token_for(name: str, provider) -> tuple[str | None, str]:
+        if provider.auth == "seat":
+            return broker.bearer_token(name), "seat"
+        token = os.environ.get(provider.api_key_env)
+        return token, "env" if token else "none"
+
+    rows = list_provider_catalogs(providers, token_for)
+    for r in rows:
+        line = (
+            f"provider={r.provider}  auth={r.auth}  cred={r.cred}  base_url={r.base_url}  "
+            f"reachable={'yes' if r.reachable else 'no'}"
+        )
+        if r.reachable:
+            line += f"  models={len(r.models)}"
+        else:
+            line += f"  error={r.error}"
+        typer.echo(line)
+        for m in r.models:
+            typer.echo(f"  {m.id}  [{'priced' if m.priced else 'no-pricing-preset'}]")
 
 
 @daemon_app.command("start")
