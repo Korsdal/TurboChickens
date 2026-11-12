@@ -28,11 +28,13 @@ daemon_app = typer.Typer(help="Daemon lifecycle commands.", no_args_is_help=True
 runs_app = typer.Typer(help="Inspect runs.", no_args_is_help=True)
 results_app = typer.Typer(help="Fetch validated results.", no_args_is_help=True)
 schedule_app = typer.Typer(help="Manage cron schedules.", no_args_is_help=True)
+stats_app = typer.Typer(help="Per-job usage statistics (spec 08).", no_args_is_help=True)
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(runs_app, name="runs")
 app.add_typer(results_app, name="results")
 app.add_typer(schedule_app, name="schedule")
+app.add_typer(stats_app, name="stats")
 
 err_console = Console(stderr=True)
 console = Console()
@@ -140,6 +142,12 @@ def status(
         err_console.print(f"[bold red]alerts[/bold red]: {len(alerts)} terminal run(s) without a valid teardown attestation: {', '.join(alerts)}")
     else:
         typer.echo("alerts: 0")
+    retention = resp.get("retention") or {}
+    if retention:
+        typer.echo(
+            f"retention: audit_log={retention.get('audit_retention')} "
+            f"results_retention_months={retention.get('results_retention_months')}"
+        )
     if in_flight:
         table = Table(title="In-flight runs")
         table.add_column("run_id")
@@ -294,6 +302,8 @@ def results_get(
                 err_console.print(f"  schema error: {e}")
             if resp.get("artifacts_dir"):
                 err_console.print(f"  quarantined artifacts: {resp['artifacts_dir']}")
+        if resp.get("expired"):
+            err_console.print("  the on-disk result artifacts expired under the retention TTL; the append-only index row remains")
         raise typer.Exit(code=1) from None
     typer.echo(json.dumps(resp["output"], indent=2, sort_keys=True, ensure_ascii=False))
 
@@ -360,6 +370,57 @@ def schedule_rm(
     """Remove a job's cron schedule from the daemon's scheduler."""
     resp = _request_or_exit(settings_path, "schedule_rm", job_id=job_id)
     typer.echo(f"removed schedule for job '{resp['job_id']}'")
+
+
+def _fmt_stat(v) -> str:
+    return "-" if v is None else f"{v:.6g}"
+
+
+def _stats_line(s: dict) -> str:
+    return (
+        f"job={s['job_name']}  n={s['n_runs']}  "
+        f"tokens_in mean={_fmt_stat(s['tokens_in_mean'])} p50={_fmt_stat(s['tokens_in_p50'])}"
+        f" p95={_fmt_stat(s['tokens_in_p95'])}  "
+        f"tokens_out mean={_fmt_stat(s['tokens_out_mean'])} p50={_fmt_stat(s['tokens_out_p50'])}"
+        f" p95={_fmt_stat(s['tokens_out_p95'])}  tokens_total_p95={_fmt_stat(s['tokens_p95'])}  "
+        f"expected_cost_usd={_fmt_stat(s['expected_cost_usd'])}  updated_at={s['updated_at']}"
+    )
+
+
+@stats_app.command("list")
+def stats_list(
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """List per-job usage stats (n, mean/p50/p95 tokens in+out, expected cost per run)."""
+    resp = _request_or_exit(settings_path, "stats_list")
+    if not resp["stats"]:
+        typer.echo("no usage stats yet")
+        return
+    for s in resp["stats"]:
+        typer.echo(_stats_line(s))
+
+
+@stats_app.command("show")
+def stats_show(
+    job_id: str = typer.Argument(..., help="Job name (id) whose usage stats to show."),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Show one job's usage stats in detail: n, mean/p50/p95 tokens in+out, expected cost."""
+    resp = _request_or_exit(settings_path, "stats_show", job_id=job_id)
+    s = resp["stats"]
+    typer.echo(f"job: {s['job_name']} ({s['job_id']})")
+    typer.echo(f"n_runs: {s['n_runs']}")
+    typer.echo(
+        f"tokens_in:  mean={_fmt_stat(s['tokens_in_mean'])} p50={_fmt_stat(s['tokens_in_p50'])}"
+        f" p95={_fmt_stat(s['tokens_in_p95'])}"
+    )
+    typer.echo(
+        f"tokens_out: mean={_fmt_stat(s['tokens_out_mean'])} p50={_fmt_stat(s['tokens_out_p50'])}"
+        f" p95={_fmt_stat(s['tokens_out_p95'])}"
+    )
+    typer.echo(f"tokens_total_p95: {_fmt_stat(s['tokens_p95'])}")
+    typer.echo(f"expected_cost_usd_per_run: {_fmt_stat(s['expected_cost_usd'])}")
+    typer.echo(f"updated_at: {s['updated_at']}")
 
 
 @app.callback()

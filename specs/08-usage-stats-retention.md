@@ -4,8 +4,8 @@
 
 **Blocked by:** 04 (results + store), 05 (`providers.toml` pricing and API usage reporting)
 
-**Status:** ready-for-agent
+**Status:** done (2026-11-12, 145/145 tests green)
 
-- [ ] After several runs of a job, per-job stats show n, mean/p50/p95 tokens in+out and an expected cost per run derived from provider pricing
-- [ ] Each run's manifest carries its token usage; nothing in the job spec caps tokens
-- [ ] Retention: expired results are deleted and each deletion is audit-logged; the audit log itself is never TTL-deleted
+- [x] After several runs of a job, per-job stats show n, mean/p50/p95 tokens in+out and an expected cost per run derived from provider pricing
+- [x] Each run's manifest carries its token usage; nothing in the job spec caps tokens
+- [x] Retention: expired results are deleted and each deletion is audit-logged; the audit log itself is never TTL-deleted

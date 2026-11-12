@@ -4,8 +4,8 @@ Append-only tables (job_specs, run_events, results, teardown_attestations) are
 protected by triggers that abort any UPDATE or DELETE — the result store and
 attestations are append-only by construction. runs, job_usage_stats, and
 schedules stay mutable (status transitions, stats rollups, schedule add/rm —
-spec 06). The audit trail itself is the append-only JSONL file in audit.py.
-Trajectory tables are deliberately absent (post-MVP).
+spec 06; stats rollups — spec 08). The audit trail itself is the append-only
+JSONL file in audit.py. Trajectory tables are deliberately absent (post-MVP).
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _TABLES = [
     """
@@ -74,7 +74,12 @@ _TABLES = [
         tokens_out_mean REAL,
         tokens_p95 REAL,
         expected_cost REAL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        -- spec 08: full mean/p50/p95 for tokens in and out
+        tokens_in_p50 REAL,
+        tokens_in_p95 REAL,
+        tokens_out_p50 REAL,
+        tokens_out_p95 REAL
     )
     """,
     """
@@ -113,6 +118,12 @@ def init_db(path: str | Path) -> sqlite3.Connection:
                 f"BEFORE {op} ON {table} "
                 f"BEGIN SELECT RAISE(ABORT, '{table} is append-only'); END"
             )
+    # spec 08 migration: DBs created at schema_version 2 lack the percentile
+    # columns on job_usage_stats; add them in place (the table is mutable).
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(job_usage_stats)")}
+    for col in ("tokens_in_p50", "tokens_in_p95", "tokens_out_p50", "tokens_out_p95"):
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE job_usage_stats ADD COLUMN {col} REAL")
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),

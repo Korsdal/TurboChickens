@@ -28,9 +28,11 @@ from turbochickens.adapter import (
     sanitize_log_line,
 )
 from turbochickens.audit import AuditLog
-from turbochickens.providers import ProvidersConfig, load_providers
+from turbochickens.providers import ProvidersConfig, ProvidersError, load_providers
 from turbochickens.settings import Settings
 from turbochickens.spec.loader import load_spec
+from turbochickens.spec.model import JobSpec
+from turbochickens.stats import rollup_usage
 from turbochickens.util import utcnow_iso
 from turbochickens.validate import OutputValidation, validate_output
 
@@ -144,6 +146,55 @@ class RunPipeline:
                 "schema_errors": schema_errors,
             }
         )
+
+    # --- per-job usage stats rollup (spec 08) -------------------------------
+
+    def _expected_cost_per_run(
+        self, spec: JobSpec, usages: list[dict[str, Any]], mean_in: float, mean_out: float
+    ) -> float | None:
+        """Expected cost per run derived from `providers.toml` pricing for the
+        job's model (cost is predicted telemetry, never a budget). If the
+        model does not resolve (e.g. a vibe-cli harness model), fall back to
+        the mean of the per-run `cost_usd` the harness itself reported."""
+        try:
+            _, _, _, profile = self.providers.resolve(spec.harness.model)
+        except ProvidersError:
+            costs = [float(u["cost_usd"]) for u in usages if isinstance(u.get("cost_usd"), (int, float))]
+            return sum(costs) / len(costs) if costs else None
+        return self.providers.cost_usd(profile, int(round(mean_in)), int(round(mean_out)))
+
+    async def _rollup_usage_stats(self, job_id: str, spec: JobSpec) -> None:
+        """Recompute the job's `job_usage_stats` row over all its finished runs
+        (every finalized run carries usage_json). Mutable rollup table."""
+        async with self._db_lock:
+            rows = self.db.execute(
+                "SELECT usage_json FROM runs WHERE job_id = ? AND usage_json IS NOT NULL", (job_id,)
+            ).fetchall()
+            usages = [json.loads(r[0]) for r in rows if r[0]]
+            stats = rollup_usage(usages)
+            expected_cost = self._expected_cost_per_run(
+                spec, usages, stats["tokens_in_mean"] or 0.0, stats["tokens_out_mean"] or 0.0
+            )
+            self.db.execute(
+                "INSERT OR REPLACE INTO job_usage_stats"
+                " (job_id, n_runs, tokens_in_mean, tokens_out_mean, tokens_p95, expected_cost,"
+                "  updated_at, tokens_in_p50, tokens_in_p95, tokens_out_p50, tokens_out_p95)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    stats["n_runs"],
+                    stats["tokens_in_mean"],
+                    stats["tokens_out_mean"],
+                    stats["tokens_p95"],
+                    expected_cost,
+                    utcnow_iso(),
+                    stats["tokens_in_p50"],
+                    stats["tokens_in_p95"],
+                    stats["tokens_out_p50"],
+                    stats["tokens_out_p95"],
+                ),
+            )
+            self.db.commit()
 
     # --- manifest ---------------------------------------------------------
 
@@ -339,6 +390,9 @@ class RunPipeline:
         )
         self.audit.append({"event": "run.finished", "run_id": run_id, "job_id": ctx.job_id, "status": status, "reason": reason})
         await self._event(run_id, "supervisor", "info", f"run {status}: {reason}")
+        # spec 08: roll the run's token usage up into the per-job stats
+        with contextlib.suppress(Exception):
+            await self._rollup_usage_stats(ctx.job_id, ctx.spec)
 
     async def execute_guard(self, run_id: str) -> None:
         """Last-resort guard for a run whose execute() itself blew up: make it

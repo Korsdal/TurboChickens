@@ -33,12 +33,16 @@ from turbochickens import __version__
 from turbochickens.adapter import AdapterNotImplemented, ProviderConfigError, run_weight
 from turbochickens.audit import AuditLog
 from turbochickens.providers import ProvidersConfig, load_providers
+from turbochickens.retention import sweep_expired_results
 from turbochickens.runner import TERMINAL_STATES, RunPipeline
 from turbochickens.scheduler import CronScheduler
 from turbochickens.settings import Settings
 from turbochickens.spec.loader import SpecValidationError, load_spec, spec_hash
 from turbochickens.storage import init_db
 from turbochickens.util import utcnow, utcnow_iso
+
+#: how often the retention sweeper re-runs after the startup sweep (spec 08)
+RETENTION_SWEEP_INTERVAL_SEC = 3600.0
 
 PROTOCOL_VERSION = 1
 
@@ -63,6 +67,8 @@ class Daemon:
         self._stop: asyncio.Event | None = None
         self._db_lock = asyncio.Lock()
         self._sched_task: asyncio.Task | None = None
+        self._retention_task: asyncio.Task | None = None
+        self._last_retention: dict[str, Any] | None = None
         self._run_tasks: set[asyncio.Task] = set()
 
     def request_stop(self) -> None:
@@ -100,6 +106,9 @@ class Daemon:
                 raise DaemonAlreadyRunning(f"daemon already running on {s.socket_path}")
             s.socket_path.unlink()  # stale socket from a dead daemon
         self.pipeline = RunPipeline(s, self.db, self.audit, providers=self.providers)
+        # spec 08: retention — sweep expired result artifacts once at startup
+        # (the audit log itself is never TTL-deleted), then periodically
+        self._last_retention = sweep_expired_results(s, self.db, self.audit)
         # spec 06: internal cron scheduler; persisted schedules are re-registered
         # before the socket accepts, so schedule ops never race scheduler setup
         self.cron = CronScheduler(fire=self._cron_fire)
@@ -110,6 +119,7 @@ class Daemon:
         serve_task = asyncio.create_task(self._server.serve_forever())
         stop_task = asyncio.create_task(self._stop.wait())
         self._sched_task = asyncio.create_task(self._scheduler())
+        self._retention_task = asyncio.create_task(self._retention_loop())
         try:
             await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         finally:
@@ -118,6 +128,8 @@ class Daemon:
             stop_task.cancel()
             if self._sched_task is not None:
                 self._sched_task.cancel()
+            if self._retention_task is not None:
+                self._retention_task.cancel()
             if self.cron is not None:
                 self.cron.stop()
             if self._run_tasks:  # graceful: let in-flight runs finish (bounded)
@@ -192,6 +204,12 @@ class Daemon:
             return self._runs_logs(req)
         if op == "results_get":
             return self._results_get(req)
+        if op == "stats_list":
+            return self._stats_list()
+        if op == "stats_show":
+            return self._stats_show(req)
+        if op == "retention_sweep":
+            return self._retention_sweep()
         if op == "schedule_add":
             return await self._schedule_add(req)
         if op == "schedule_list":
@@ -246,6 +264,11 @@ class Daemon:
             "audit_log": str(self.settings.audit_log_path),
             "schedules": self._schedule_count(),
             "alerts": self._alerts(),
+            "retention": {
+                "audit_retention": self.settings.audit_retention,
+                "results_retention_months": self.settings.results_retention_months,
+                "last_sweep": self._last_retention,
+            },
         }
 
     def _schedule_count(self) -> int:
@@ -501,6 +524,19 @@ class Daemon:
                 "schema_errors": json.loads(schema_errors) if schema_errors else [],
                 "artifacts_dir": artifacts_dir,
             }
+        # spec 08: the on-disk artifacts may have expired under the retention
+        # TTL (the append-only row stays as the index)
+        if artifacts_dir and not Path(artifacts_dir).exists():
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": (
+                    f"result artifacts for run {run_id!r} expired"
+                    f" (results_retention_months={self.settings.results_retention_months})"
+                ),
+                "expired": True,
+                "run_id": run_id,
+            }
         return {
             "ok": True,
             "op": "results_get",
@@ -509,6 +545,101 @@ class Daemon:
             "valid": True,
             "output": json.loads(output_json),
             "artifacts_dir": artifacts_dir,
+        }
+
+    # --- per-job usage stats (spec 08) ---------------------------------------
+
+    def _stats_list(self) -> dict[str, Any]:
+        if self.db is None:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "db not ready"}
+        rows = self.db.execute(
+            "SELECT s.job_id, j.name, s.n_runs, s.tokens_in_mean, s.tokens_in_p50, s.tokens_in_p95,"
+            " s.tokens_out_mean, s.tokens_out_p50, s.tokens_out_p95, s.tokens_p95, s.expected_cost,"
+            " s.updated_at FROM job_usage_stats s JOIN job_specs j ON j.id = s.job_id"
+            " ORDER BY s.job_id"
+        ).fetchall()
+        stats = [
+            {
+                "job_id": r[0],
+                "job_name": r[1],
+                "n_runs": r[2],
+                "tokens_in_mean": r[3],
+                "tokens_in_p50": r[4],
+                "tokens_in_p95": r[5],
+                "tokens_out_mean": r[6],
+                "tokens_out_p50": r[7],
+                "tokens_out_p95": r[8],
+                "tokens_p95": r[9],
+                "expected_cost_usd": r[10],
+                "updated_at": r[11],
+            }
+            for r in rows
+        ]
+        return {"ok": True, "op": "stats_list", "protocol": PROTOCOL_VERSION, "stats": stats}
+
+    def _stats_show(self, req: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(req.get("job_id", ""))
+        if not job_id:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "stats_show requires job_id"}
+        if self.db is None:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "db not ready"}
+        row = self.db.execute(
+            "SELECT s.job_id, j.name, s.n_runs, s.tokens_in_mean, s.tokens_in_p50, s.tokens_in_p95,"
+            " s.tokens_out_mean, s.tokens_out_p50, s.tokens_out_p95, s.tokens_p95, s.expected_cost,"
+            " s.updated_at FROM job_usage_stats s JOIN job_specs j ON j.id = s.job_id WHERE s.job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": f"no usage stats for job {job_id!r} (no finished runs yet)",
+            }
+        return {
+            "ok": True,
+            "op": "stats_show",
+            "protocol": PROTOCOL_VERSION,
+            "stats": {
+                "job_id": row[0],
+                "job_name": row[1],
+                "n_runs": row[2],
+                "tokens_in_mean": row[3],
+                "tokens_in_p50": row[4],
+                "tokens_in_p95": row[5],
+                "tokens_out_mean": row[6],
+                "tokens_out_p50": row[7],
+                "tokens_out_p95": row[8],
+                "tokens_p95": row[9],
+                "expected_cost_usd": row[10],
+                "updated_at": row[11],
+            },
+        }
+
+    # --- retention (spec 08) --------------------------------------------------
+
+    async def _retention_loop(self) -> None:
+        """Periodic retention sweep after the startup sweep (spec 08)."""
+        assert self._stop is not None
+        while not self._stop.is_set():
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), timeout=RETENTION_SWEEP_INTERVAL_SEC)
+                break
+            assert self.db is not None and self.audit is not None
+            self._last_retention = sweep_expired_results(self.settings, self.db, self.audit)
+
+    def _retention_sweep(self) -> dict[str, Any]:
+        """On-demand retention sweep over the socket: expire result artifacts
+        older than `results_retention_months`, audit-log every deletion. The
+        audit log itself is never TTL-deleted."""
+        if self.db is None or self.audit is None:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "db not ready"}
+        self._last_retention = sweep_expired_results(self.settings, self.db, self.audit)
+        return {
+            "ok": True,
+            "op": "retention_sweep",
+            "protocol": PROTOCOL_VERSION,
+            "audit_retention": self.settings.audit_retention,
+            **self._last_retention,
         }
 
     # --- cron scheduling (spec 06) -------------------------------------------

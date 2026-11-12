@@ -7,7 +7,7 @@ type = "manual"
 
 [harness]
 adapter = "vibe-cli"
-model = "mistral-small-latest"
+model = "mistral-medium-3.5"
 temperature = 0.0
 
 [resources]

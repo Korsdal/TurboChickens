@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 07 landed (133/133 tests green, e2e smoke verified).
+**Last updated:** 2026-11-12, after spec 08 landed (145/145 tests green, e2e smoke verified).
 
 ---
 
@@ -22,16 +22,18 @@ durable thing; the agents are not.
 | --- | --- |
 | `specs/archive/turbochickens-baseline-spec-v0-2.md` | **Governing baseline.** Its decision log (§14) wins any conflict. |
 | `specs/archive/turbochickens-mvp-spec.md` | Operational MVP spec derived from the baseline (user stories, decisions, test philosophy). |
-| `specs/01-*.md` … `specs/08-*.md` | Implementation tickets. Each has `Status: ready-for-agent`, a "Blocked by" line, and a checkbox acceptance list. |
+| `specs/01-*.md` … `specs/10-*.md` | Implementation tickets. Each has `Status: ready-for-agent`, a "Blocked by" line, and a checkbox acceptance list. |
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01, spec 02, spec 03, spec 04, spec 05, spec 06, and spec 07 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, and the spec-07 commit).
+**Spec 01 through spec 08 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, and the spec-08 commit).
+
+**Spec 09 (seat/subscription auth, no API key) and spec 10 (model discovery — `tc models list` against live provider catalogs) are backlogged** — `specs/09-seat-based-auth.md` and `specs/10-model-discovery.md`, both status ready-for-agent, not started. Both adapters currently require an API key; the vibe-cli harness is limited to vibe's own model catalog (mistral-medium-3.5 only in vibe 3.1.2); see those tickets.
 Verified this session:
 
 ```
-.venv/bin/python -m pytest -q          → 127 passed
-.venv/bin/tc --help                     → works, shows `run`, `runs`, `jobs`, `daemon`, `results`, `status`
+.venv/bin/python -m pytest -q          → 145 passed
+.venv/bin/tc --help                     → works, shows `run`, `runs`, `jobs`, `daemon`, `results`, `schedule`, `stats`, `status`
 .venv/bin/tc jobs validate examples/weekly-incidents-digest/job.toml
                                         → OK … sha256:18efbd8c…80b959 (unchanged)
 # e2e smoke (fake vibe binary via $TURBOCHICKENS_VIBE_BIN): tc daemon start (background)
@@ -57,6 +59,12 @@ Verified this session:
 #     1500005 bytes (1.431 MB) > max_context_mb=1", rc 1; never reached running (no harness events); manifest
 #     budget.outcome=context_cap + injected_context_bytes; attestation (1,1,1); no results row; workspace gone
 #   → tc run <exactly-1-MiB job, max_context_mb=1> --wait → succeeded (cap is inclusive), budget.outcome=ok
+# spec-08 smoke (fake vibe binary via $TURBOCHICKENS_VIBE_BIN, temp data_dir, subprocess daemon):
+#   → 3x tc run <job> --wait → tc stats list/show <job> → n=3 tokens_in mean/p50/p95=100, tokens_out=40,
+#     tokens_total_p95=140, expected_cost_usd=0.00018; manifest.usage carries tokens per run
+#   → backdate runs.finished_at 400d, retention_sweep op → result.expired audit row, artifacts dir gone,
+#     append-only results row kept, tc results get <run> → rc 1 "expired"; audit log untouched; tc status
+#     prints retention: audit_log=forever results_retention_months=6; sweep fires automatically on daemon start
 ```
 
 What exists:
@@ -66,9 +74,15 @@ src/turbochickens/
 ├── __main__.py            # python -m turbochickens → CLI
 ├── util.py                # utcnow / utcnow_iso (UTC, ms precision, Z suffix)
 ├── settings.py            # Settings (Pydantic, extra=forbid) + load_settings(); defaults below
-├── storage.py             # init_db(): full MVP SQLite schema + `schedules` table (spec 06,
-│                          # schema_version=2) + append-only triggers + schema_meta
-├── audit.py               # AuditLog: append-only JSONL (open "a" only, fsync per row)
+├── storage.py             # init_db(): full MVP SQLite schema + `schedules` table (spec 06) +
+│                          # `job_usage_stats` percentile columns (spec 08, schema_version=3, with
+│                          # in-place migration of v2 DBs) + append-only triggers + schema_meta
+├── audit.py               # AuditLog: append-only JSONL (open "a" only, fsync per row) — never TTL-deleted
+├── stats.py               # spec 08 pure seam: percentile (linear interpolation) + rollup_usage
+│                          # (n, mean/p50/p95 tokens in/out/total over a job's finished runs)
+├── retention.py           # spec 08: sweep_expired_results — deletes on-disk result/quarantine
+│                          # artifacts older than results_retention_months (calendar months),
+│                          # audit-logs every deletion as result.expired; never touches the audit log
 ├── adapter.py             # HarnessAdapter Protocol (prepare/execute/teardown) + CredentialProvider
 │                          # extension point + VibeCLIAdapter (headless subprocess pinned to the
 │                          # workspace, sanitized streamed logs) + MistralAPIAdapter (spec 05:
@@ -81,16 +95,19 @@ src/turbochickens/
 ├── runner.py              # RunPipeline: lifecycle queued→…→succeeded/failed, fresh workspace +
 │                          # per-run env, manifest (+ spec-07 `budget` outcome block), run_events,
 │                          # spec-04 result store / quarantine at `collecting`, spec-07 context cap
-│                          # at `provisioning`, teardown attestation + audit rows
+│                          # at `provisioning`, teardown attestation + audit rows, spec-08 per-job
+│                          # usage-stats rollup at finalize (expected cost from providers.toml pricing)
 ├── scheduler.py           # spec 06: CronScheduler over APScheduler AsyncIOScheduler; standard
 │                          # POSIX cron semantics (aps_trigger resolves the day-of-week field via
 │                          # croniter because APScheduler numbers 0=Monday); schedules re-registered
 │                          # from the DB on daemon start; misfires coalesce (grace 300s)
 ├── daemon.py              # Daemon: asyncio process, Unix socket, JSON-lines ops
 │                          # ping/status/shutdown/enqueue/runs_list/runs_show/runs_logs/results_get/
-│                          # schedule_add/schedule_list/schedule_rm (spec 06);
-│                          # admission-control scheduler (over-budget backlogs, never rejects);
-│                          # a firing cron submits enqueue trigger=cron over the daemon's own socket
+│                          # schedule_add/schedule_list/schedule_rm (spec 06)/stats_list/stats_show/
+│                          # retention_sweep (spec 08); admission-control scheduler (over-budget
+│                          # backlogs, never rejects); a firing cron submits enqueue trigger=cron over
+│                          # the daemon's own socket; retention sweep at startup + hourly (spec 08);
+│                          # results_get reports expired artifacts; status carries a retention block
 ├── client.py              # request(socket, op, **payload) → parsed response; DaemonUnreachable
 ├── validate.py            # spec 04 pure seam: validate_output(raw, schema_path) → OutputValidation
 │                          # (jsonschema Draft 2020-12 + format checker; never raises on bad output)
@@ -98,7 +115,8 @@ src/turbochickens/
 │   ├── model.py           # Pydantic v2 model, all 6 sections, extra="forbid"
 │   └── loader.py          # load_spec(), SpecValidationError (field-named issues), spec_hash()
 └── cli/main.py            # Typer app `tc`: run [--wait] | runs list/show/logs | results get |
-                           # jobs validate | daemon start/stop | status | schedule add/list/rm
+                           # jobs validate | daemon start/stop | status | schedule add/list/rm |
+                           # stats list/show (spec 08)
 tests/
 ├── test_spec_model.py     # pure-function seam: parser/model/hash
 ├── test_cli_validate.py   # CLI seam: tc jobs validate behavior
@@ -118,6 +136,10 @@ tests/
 ├── test_budgets.py        # spec 07: timeout hard-kill e2e (vibe-cli + mistral-api), injected-context
 │                          # cap failure at provisioning, at-cap boundary, manifest budget outcome via
 │                          # tc runs show, no-token-cap model check
+├── test_stats_retention.py # spec 08: pure seams (percentile/rollup math, months_before, schema v3
+│                          # migration), stats e2e over socket + CLI (API pricing + vibe-cli cost
+│                          # fallback), retention e2e (backdated runs, result.expired audit rows,
+│                          # quarantine expiry, custom TTL, startup sweep, audit log never deleted)
 ├── test_api_adapter.py    # spec 05: providers seam, MistralAPIAdapter contract seam (MockTransport:
                            # JSON-mode shape, exp backoff on 429/5xx, no retry on 4xx, Retry-After,
                            # timeout, missing credential), e2e via daemon thread + subprocess against
@@ -319,6 +341,27 @@ Spec-07 deliverables, concretely:
   never reached running, attested, audited, no result, workspace gone, `tc runs show` shows `context_cap`),
   exactly-at-cap success, success manifest `budget` block, and the pure no-token-cap model check.
 
+Spec-08 deliverables, concretely:
+
+- **Usage stats rollup** (`stats.py` + `runner.py`): every finalized run rolls its `usage_json` into
+  the mutable `job_usage_stats` row — n plus mean/p50/p95 of tokens in, out, and total (linear-
+  interpolation percentiles; pure seam in `stats.py`). `SCHEMA_VERSION` bumped to 3 with the new
+  percentile columns (`tokens_in_p50/p95`, `tokens_out_p50/p95`) added in place to existing v2 DBs.
+  Expected cost per run is derived from `providers.toml` pricing for the job's model
+  (`providers.cost_usd` over the mean tokens); when the model doesn't resolve (e.g. a vibe-cli
+  harness model), it falls back to the mean of the per-run `cost_usd` the harness reported.
+  Token usage stays telemetry — no `max_tokens` anywhere (still rejected by `extra="forbid"`).
+- **Inspection:** socket ops `stats_list` / `stats_show` + CLI `tc stats list` / `tc stats show
+  <job>` printing n, mean/p50/p95 tokens in+out, total p95, and `expected_cost_usd_per_run`.
+- **Retention** (`retention.py` + `daemon.py`): `sweep_expired_results` deletes on-disk artifacts
+  (`results/<run_id>/` and `quarantine/<run_id>/` — only ever paths inside those two dirs) whose run
+  finished more than `results_retention_months` ago (calendar-month arithmetic); every deletion is
+  audit-logged as `result.expired` (run_id, kind, artifacts_dir, retention_months). The append-only
+  `results` rows stay as the permanent index, and the audit log is **never** TTL-deleted
+  (`audit_retention` only accepts `"forever"`). The daemon sweeps at startup and hourly, plus an
+  on-demand `retention_sweep` socket op; `status` carries a `retention` block; `results_get` /
+  `tc results get` report expired artifacts (rc 1) instead of serving them.
+
 | Spec | Title | Status | Blocked by |
 | --- | --- | --- | --- |
 | 01 | Scaffold + job spec model + `tc jobs validate` | **done** (`f8b8061`) | — |
@@ -328,7 +371,18 @@ Spec-07 deliverables, concretely:
 | 05 | `mistral-api` adapter + `providers.toml` + backoff on 429/5xx | **done** (2026-11-12) | 03, 04 |
 | 06 | Cron scheduling (APScheduler) + `tc schedule add/list/rm` | **done** (2026-11-12) | 03 |
 | 07 | Run budgets: wall-clock hard kill + injected-context cap | **done** (2026-11-12) | 03 |
-| 08 | Usage stats + expected cost + retention TTLs | ready-for-agent | 04, 05 |
+| 08 | Usage stats + expected cost + retention TTLs | **done** (2026-11-12) | 04, 05 |
+| 00 | Design system — TurboChickens GUI | **settled** (2026-11-12; governs 12–18) | — |
+| 09 | Seat/subscription auth, no API key | ready-for-agent (backlog) | 05 |
+| 10 | Model discovery (`tc models list`) | ready-for-agent (backlog) | 05 |
+| 11 | TurboChickens GUI in the coop container (parent spec) | ready-for-agent | 02–08 |
+| 12 | Coop skeleton: daemon serves GUI (HTTP + auth + shell + Dashboard) | ready-for-agent | — |
+| 13 | Jobs / Audit / Settings views (read-only socket ops) | ready-for-agent | 12 |
+| 14 | Runs from the GUI (trigger, watch, results/quarantine) | ready-for-agent | 12 |
+| 15 | Upload + validate job specs from the browser | ready-for-agent | 14 |
+| 16 | Schedules from the GUI | ready-for-agent | 12, 13 |
+| 17 | Stats + retention from the GUI | ready-for-agent | 12 |
+| 18 | coop Docker container | ready-for-agent | 12 |
 
 ## 5. Non-negotiable invariants (baseline v0.2 — do not regress these)
 
@@ -385,13 +439,14 @@ tables deliberately excluded).
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 - **Version management is a human responsibility.** Coding agents can bump the
   last part of a version number (`0.0.X`) — every other bump (minor, major) is
-  human initiated. Current version: `0.0.7`.
+  human initiated. Current version: `0.0.8`.
 
-## 7. Next up — spec 08 (`specs/08-usage-stats-retention.md`)
+## 7. Next up — all MVP specs landed
 
-Usage stats + expected cost + retention TTLs (blocked by 04, 05 — both done).
-Spec 07 (run budgets) landed: wall-clock `timeout_sec` hard kill (attested +
-audited on both adapters) and the `max_context_mb` injected-context cap
-enforced at provisioning; every manifest now carries a `budget` outcome block
-(`ok` / `timeout` / `context_cap`). Token usage stays telemetry — no
-`max_tokens` anywhere.
+Spec 08 (usage stats + expected cost + retention TTLs) landed: per-job
+`job_usage_stats` rollups (n, mean/p50/p95 tokens in+out, expected cost per
+run from `providers.toml` pricing) surfaced via `tc stats list/show`, and
+settings-managed retention — result artifacts expire after
+`results_retention_months` (default 6) with every deletion audit-logged as
+`result.expired`, while the audit log is kept forever. The MVP spec pipeline
+(01–08) is complete; what remains is the post-MVP roadmap in baseline §13.
