@@ -8,7 +8,10 @@ both use it, so manual and cron runs flow through the same queue.
 Ops: ``ping``, ``status``, ``shutdown`` (spec 02) plus run submission and
 inspection (spec 03): ``enqueue``, ``runs_list``, ``runs_show``, ``runs_logs``,
 and validated results (spec 04): ``results_get`` — quarantined output is
-never returned as a valid result.
+never returned as a valid result. Spec 06 adds the internal cron scheduler
+(APScheduler): ``schedule_add``, ``schedule_list``, ``schedule_rm``; a firing
+cron schedule submits an ``enqueue`` with ``trigger="cron"`` over this same
+socket, so manual and cron runs share one queue and one admission path.
 Runs flow through one queue with resource-weight admission control; over-budget
 runs backlog in ``pending``, never rejected.
 """
@@ -31,6 +34,7 @@ from turbochickens.adapter import AdapterNotImplemented, ProviderConfigError, ru
 from turbochickens.audit import AuditLog
 from turbochickens.providers import ProvidersConfig, load_providers
 from turbochickens.runner import TERMINAL_STATES, RunPipeline
+from turbochickens.scheduler import CronScheduler
 from turbochickens.settings import Settings
 from turbochickens.spec.loader import SpecValidationError, load_spec, spec_hash
 from turbochickens.storage import init_db
@@ -54,6 +58,7 @@ class Daemon:
         self.audit: AuditLog | None = None
         self.pipeline: RunPipeline | None = None
         self.providers: ProvidersConfig | None = None
+        self.cron: CronScheduler | None = None
         self._server: asyncio.AbstractServer | None = None
         self._stop: asyncio.Event | None = None
         self._db_lock = asyncio.Lock()
@@ -94,9 +99,14 @@ class Daemon:
             if await self._socket_alive():
                 raise DaemonAlreadyRunning(f"daemon already running on {s.socket_path}")
             s.socket_path.unlink()  # stale socket from a dead daemon
+        self.pipeline = RunPipeline(s, self.db, self.audit, providers=self.providers)
+        # spec 06: internal cron scheduler; persisted schedules are re-registered
+        # before the socket accepts, so schedule ops never race scheduler setup
+        self.cron = CronScheduler(fire=self._cron_fire)
+        self.cron.start()
+        self._load_schedules()
         self._server = await asyncio.start_unix_server(self._handle_client, path=str(s.socket_path))
         os.chmod(s.socket_path, 0o600)
-        self.pipeline = RunPipeline(s, self.db, self.audit, providers=self.providers)
         serve_task = asyncio.create_task(self._server.serve_forever())
         stop_task = asyncio.create_task(self._stop.wait())
         self._sched_task = asyncio.create_task(self._scheduler())
@@ -108,6 +118,8 @@ class Daemon:
             stop_task.cancel()
             if self._sched_task is not None:
                 self._sched_task.cancel()
+            if self.cron is not None:
+                self.cron.stop()
             if self._run_tasks:  # graceful: let in-flight runs finish (bounded)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(
@@ -180,6 +192,12 @@ class Daemon:
             return self._runs_logs(req)
         if op == "results_get":
             return self._results_get(req)
+        if op == "schedule_add":
+            return await self._schedule_add(req)
+        if op == "schedule_list":
+            return self._schedule_list()
+        if op == "schedule_rm":
+            return await self._schedule_rm(req)
         if op == "shutdown":
             self.request_stop()
             return {"ok": True, "op": "shutdown", "protocol": PROTOCOL_VERSION, "message": "shutting down"}
@@ -226,8 +244,14 @@ class Daemon:
             "weight_budget": self.settings.weight_budget,
             "db_path": str(self.settings.db_path),
             "audit_log": str(self.settings.audit_log_path),
+            "schedules": self._schedule_count(),
             "alerts": self._alerts(),
         }
+
+    def _schedule_count(self) -> int:
+        if self.db is None:
+            return 0
+        return self.db.execute("SELECT COUNT(*) FROM schedules").fetchone()[0]
 
     # --- run submission (spec 03) ------------------------------------------
 
@@ -486,6 +510,172 @@ class Daemon:
             "output": json.loads(output_json),
             "artifacts_dir": artifacts_dir,
         }
+
+    # --- cron scheduling (spec 06) -------------------------------------------
+
+    async def _loopback_request(self, op: str, **payload: Any) -> dict[str, Any]:
+        """Send one JSON-lines request to the daemon's own socket. The cron
+        scheduler uses this so a firing schedule flows through the exact same
+        op path (validation, queue, admission, audit) as a CLI `tc run`."""
+        reader, writer = await asyncio.open_unix_connection(str(self.settings.socket_path))
+        try:
+            req = {"op": op, "protocol": PROTOCOL_VERSION, **payload}
+            writer.write(json.dumps(req, ensure_ascii=False).encode("utf-8") + b"\n")
+            await writer.drain()
+            line = await reader.readline()
+            if not line:
+                raise ConnectionError("loopback: daemon closed the connection without a response")
+            return json.loads(line.decode("utf-8"))
+        finally:
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
+
+    async def _cron_fire(self, job_id: str, spec_path: str, spec_hash: str) -> None:
+        """APScheduler callback: submit a cron-triggered run over the socket."""
+        assert self.audit is not None
+        try:
+            resp = await self._loopback_request(
+                "enqueue", spec_path=spec_path, spec_hash=spec_hash, trigger="cron"
+            )
+        except Exception as e:
+            self.audit.append(
+                {"event": "schedule.fire_failed", "job_id": job_id, "error": f"{type(e).__name__}: {e}"}
+            )
+            return
+        if resp.get("ok"):
+            self.audit.append(
+                {
+                    "event": "schedule.fired",
+                    "job_id": job_id,
+                    "run_id": resp.get("run_id"),
+                    "spec_hash": f"sha256:{spec_hash}",
+                    "trigger": "cron",
+                }
+            )
+        else:
+            self.audit.append(
+                {"event": "schedule.fire_failed", "job_id": job_id, "error": resp.get("error", "enqueue failed")}
+            )
+
+    def _load_schedules(self) -> None:
+        """Re-register every persisted schedule with APScheduler on daemon start."""
+        assert self.db is not None and self.cron is not None
+        rows = self.db.execute("SELECT job_id, spec_path, spec_hash, schedule FROM schedules").fetchall()
+        for job_id, spec_path, spec_hash, expr in rows:
+            self.cron.add(job_id, spec_path, spec_hash, expr)
+
+    async def _schedule_add(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Register a job's cron trigger (from its spec) with the scheduler."""
+        spec_path_raw = req.get("spec_path")
+        if not spec_path_raw:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "schedule_add requires spec_path"}
+        spec_path = Path(str(spec_path_raw))
+        try:
+            spec = load_spec(spec_path)
+        except SpecValidationError as e:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": "invalid job spec: " + "; ".join(str(i) for i in e.issues),
+            }
+        if spec.trigger.type != "cron" or not spec.trigger.schedule:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": f"job {spec.job.name!r} has trigger.type={spec.trigger.type!r}; only cron-triggered jobs carry a schedule",
+            }
+        digest = spec_hash(spec)
+        expected = req.get("spec_hash")
+        if expected and str(expected) != digest:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": f"spec hash mismatch: client sent sha256:{expected}, file is sha256:{digest}",
+            }
+        job_id = spec.job.name
+        expr = spec.trigger.schedule
+        resolved = str(spec_path.resolve())
+        async with self._db_lock:
+            assert self.db is not None
+            self.db.execute(
+                "INSERT OR IGNORE INTO job_specs (id, name, spec_hash, spec_toml, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (job_id, spec.job.name, digest, spec_path.read_text(encoding="utf-8"), utcnow_iso()),
+            )
+            self.db.execute(
+                "INSERT OR REPLACE INTO schedules (job_id, spec_path, schedule, spec_hash, added_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (job_id, resolved, expr, digest, utcnow_iso()),
+            )
+            self.db.commit()
+        assert self.cron is not None
+        next_run = self.cron.add(job_id, resolved, digest, expr)
+        assert self.audit is not None
+        self.audit.append(
+            {
+                "event": "schedule.added",
+                "job_id": job_id,
+                "schedule": expr,
+                "spec_hash": f"sha256:{digest}",
+                "next_run": next_run.isoformat() if next_run else None,
+            }
+        )
+        return {
+            "ok": True,
+            "op": "schedule_add",
+            "protocol": PROTOCOL_VERSION,
+            "job_id": job_id,
+            "schedule": expr,
+            "spec_hash": digest,
+            "next_run": next_run.isoformat() if next_run else None,
+        }
+
+    def _schedule_list(self) -> dict[str, Any]:
+        if self.db is None:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "db not ready"}
+        rows = self.db.execute(
+            "SELECT job_id, spec_path, schedule, spec_hash, added_at FROM schedules ORDER BY added_at, job_id"
+        ).fetchall()
+        schedules = []
+        for job_id, spec_path, expr, digest, added_at in rows:
+            next_run = self.cron.next_run(job_id) if self.cron is not None else None
+            schedules.append(
+                {
+                    "job_id": job_id,
+                    "spec_path": spec_path,
+                    "schedule": expr,
+                    "spec_hash": digest,
+                    "added_at": added_at,
+                    "next_run": next_run.isoformat() if next_run else None,
+                }
+            )
+        return {"ok": True, "op": "schedule_list", "protocol": PROTOCOL_VERSION, "schedules": schedules}
+
+    async def _schedule_rm(self, req: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(req.get("job_id", ""))
+        if not job_id:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "schedule_rm requires job_id"}
+        async with self._db_lock:
+            assert self.db is not None
+            row = self.db.execute(
+                "SELECT schedule, spec_hash FROM schedules WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return {
+                    "ok": False,
+                    "protocol": PROTOCOL_VERSION,
+                    "error": f"no schedule registered for job {job_id!r}",
+                }
+            self.db.execute("DELETE FROM schedules WHERE job_id = ?", (job_id,))
+            self.db.commit()
+        if self.cron is not None:
+            self.cron.remove(job_id)
+        assert self.audit is not None
+        self.audit.append(
+            {"event": "schedule.removed", "job_id": job_id, "schedule": row[0], "spec_hash": f"sha256:{row[1]}"}
+        )
+        return {"ok": True, "op": "schedule_rm", "protocol": PROTOCOL_VERSION, "job_id": job_id}
 
 
 async def run_daemon(settings: Settings) -> None:

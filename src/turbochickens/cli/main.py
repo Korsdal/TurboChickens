@@ -27,10 +27,12 @@ jobs_app = typer.Typer(help="Job spec commands.", no_args_is_help=True)
 daemon_app = typer.Typer(help="Daemon lifecycle commands.", no_args_is_help=True)
 runs_app = typer.Typer(help="Inspect runs.", no_args_is_help=True)
 results_app = typer.Typer(help="Fetch validated results.", no_args_is_help=True)
+schedule_app = typer.Typer(help="Manage cron schedules.", no_args_is_help=True)
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(runs_app, name="runs")
 app.add_typer(results_app, name="results")
+app.add_typer(schedule_app, name="schedule")
 
 err_console = Console(stderr=True)
 console = Console()
@@ -294,6 +296,70 @@ def results_get(
                 err_console.print(f"  quarantined artifacts: {resp['artifacts_dir']}")
         raise typer.Exit(code=1) from None
     typer.echo(json.dumps(resp["output"], indent=2, sort_keys=True, ensure_ascii=False))
+
+
+@schedule_app.command("add")
+def schedule_add(
+    spec_path: Path = typer.Argument(
+        ...,
+        help="Path to the job spec TOML file (its [trigger] must be cron with a schedule).",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+    ),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Register a job's cron trigger with the daemon's internal scheduler."""
+    try:
+        spec = load_spec(spec_path)
+    except SpecValidationError as e:
+        for issue in e.issues:
+            err_console.print(f"[bold red]error[/bold red] {issue}")
+        raise typer.Exit(code=1) from None
+    if spec.trigger.type != "cron" or not spec.trigger.schedule:
+        err_console.print(
+            f"[bold red]error[/bold red] job '{spec.job.name}' has trigger.type="
+            f"'{spec.trigger.type}'; only cron-triggered jobs carry a schedule"
+        )
+        raise typer.Exit(code=1)
+    digest = spec_hash(spec)
+    resp = _request_or_exit(
+        settings_path,
+        "schedule_add",
+        timeout=10.0,
+        spec_path=str(spec_path.resolve()),
+        spec_hash=digest,
+    )
+    typer.echo(
+        f"scheduled job '{resp['job_id']}' cron='{resp['schedule']}' "
+        f"spec=sha256:{resp['spec_hash']} next_run={resp.get('next_run') or '-'}"
+    )
+
+
+@schedule_app.command("list")
+def schedule_list(
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """List registered cron schedules with their next run time."""
+    resp = _request_or_exit(settings_path, "schedule_list")
+    if not resp["schedules"]:
+        typer.echo("no schedules")
+        return
+    for s in resp["schedules"]:
+        typer.echo(
+            f"{s['job_id']}  cron='{s['schedule']}'  next_run={s.get('next_run') or '-'}  "
+            f"added_at={s['added_at']}  spec=sha256:{s['spec_hash'][:12]}…"
+        )
+
+
+@schedule_app.command("rm")
+def schedule_rm(
+    job_id: str = typer.Argument(..., help="Job name (id) whose cron schedule to remove."),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Remove a job's cron schedule from the daemon's scheduler."""
+    resp = _request_or_exit(settings_path, "schedule_rm", job_id=job_id)
+    typer.echo(f"removed schedule for job '{resp['job_id']}'")
 
 
 @app.callback()

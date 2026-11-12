@@ -2,10 +2,10 @@
 
 Append-only tables (job_specs, run_events, results, teardown_attestations) are
 protected by triggers that abort any UPDATE or DELETE — the result store and
-attestations are append-only by construction. runs and job_usage_stats stay
-mutable (status transitions, stats rollups). The audit trail itself is the
-append-only JSONL file in audit.py. Trajectory tables are deliberately absent
-(post-MVP).
+attestations are append-only by construction. runs, job_usage_stats, and
+schedules stay mutable (status transitions, stats rollups, schedule add/rm —
+spec 06). The audit trail itself is the append-only JSONL file in audit.py.
+Trajectory tables are deliberately absent (post-MVP).
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _TABLES = [
     """
@@ -75,6 +75,15 @@ _TABLES = [
         tokens_p95 REAL,
         expected_cost REAL,
         updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS schedules (
+        job_id TEXT PRIMARY KEY REFERENCES job_specs(id),
+        spec_path TEXT NOT NULL,
+        schedule TEXT NOT NULL,
+        spec_hash TEXT NOT NULL,
+        added_at TEXT NOT NULL
     )
     """,
     """

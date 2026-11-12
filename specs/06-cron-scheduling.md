@@ -4,7 +4,7 @@
 
 **Blocked by:** 03 (run pipeline; scheduling only makes sense once manual runs work)
 
-**Status:** ready-for-agent
+**Status:** done (2026-11-12)
 
-- [ ] `tc schedule add` registers a cron schedule for a job; `tc schedule list` shows it; `tc schedule rm` removes it
-- [ ] A firing cron schedule enqueues a run that appears in `tc runs list` with trigger `cron` and flows through the identical pipeline (workspace, validation, store, attestation)
+- [x] `tc schedule add` registers a cron schedule for a job; `tc schedule list` shows it; `tc schedule rm` removes it
+- [x] A firing cron schedule enqueues a run that appears in `tc runs list` with trigger `cron` and flows through the identical pipeline (workspace, validation, store, attestation)

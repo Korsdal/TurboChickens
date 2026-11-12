@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 05 landed (111/111 tests green, e2e smoke verified).
+**Last updated:** 2026-11-12, after spec 06 landed (127/127 tests green, e2e smoke verified).
 
 ---
 
@@ -26,11 +26,11 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01, spec 02, spec 03, spec 04, and spec 05 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, and the spec-05 commit).
+**Spec 01, spec 02, spec 03, spec 04, spec 05, and spec 06 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, and the spec-06 commit).
 Verified this session:
 
 ```
-.venv/bin/python -m pytest -q          → 111 passed
+.venv/bin/python -m pytest -q          → 127 passed
 .venv/bin/tc --help                     → works, shows `run`, `runs`, `jobs`, `daemon`, `results`, `status`
 .venv/bin/tc jobs validate examples/weekly-incidents-digest/job.toml
                                         → OK … sha256:18efbd8c…80b959 (unchanged)
@@ -44,6 +44,11 @@ Verified this session:
 #   → tc run <mistral-api job> --wait → succeeded, weight=0.25; manifest harness.adapter=mistral-api,
 #     usage tokens + cost_usd from providers.toml pricing; tc results get → validated JSON, rc 0
 #   → 429 x2 then 200 → succeeded, retry/backoff warn lines in tc runs logs; 400 → failed, no retry
+# spec-06 smoke (fake vibe binary via $TURBOCHICKENS_VIBE_BIN, temp data_dir):
+#   → tc daemon start → tc schedule add <cron job> → "scheduled job '…' cron='0 7 * * 1' next_run=<next Monday 07:00>"
+#   → tc schedule list → row with cron + next_run; tc status → schedules count; tc schedule rm → "no schedules"
+#   → a cron expr firing at the next minute boundary enqueues a run with trigger=cron → succeeded, attested,
+#     result stored; audit shows schedule.fired + run.queued(trigger=cron); schedules survive a daemon restart
 ```
 
 What exists:
@@ -53,7 +58,8 @@ src/turbochickens/
 ├── __main__.py            # python -m turbochickens → CLI
 ├── util.py                # utcnow / utcnow_iso (UTC, ms precision, Z suffix)
 ├── settings.py            # Settings (Pydantic, extra=forbid) + load_settings(); defaults below
-├── storage.py             # init_db(): full MVP SQLite schema + append-only triggers + schema_meta
+├── storage.py             # init_db(): full MVP SQLite schema + `schedules` table (spec 06,
+│                          # schema_version=2) + append-only triggers + schema_meta
 ├── audit.py               # AuditLog: append-only JSONL (open "a" only, fsync per row)
 ├── adapter.py             # HarnessAdapter Protocol (prepare/execute/teardown) + CredentialProvider
 │                          # extension point + VibeCLIAdapter (headless subprocess pinned to the
@@ -67,9 +73,15 @@ src/turbochickens/
 ├── runner.py              # RunPipeline: lifecycle queued→…→succeeded/failed, fresh workspace +
 │                          # per-run env, manifest, run_events, spec-04 result store / quarantine
 │                          # at `collecting`, teardown attestation + audit rows
+├── scheduler.py           # spec 06: CronScheduler over APScheduler AsyncIOScheduler; standard
+│                          # POSIX cron semantics (aps_trigger resolves the day-of-week field via
+│                          # croniter because APScheduler numbers 0=Monday); schedules re-registered
+│                          # from the DB on daemon start; misfires coalesce (grace 300s)
 ├── daemon.py              # Daemon: asyncio process, Unix socket, JSON-lines ops
-│                          # ping/status/shutdown/enqueue/runs_list/runs_show/runs_logs/results_get;
-│                          # admission-control scheduler (over-budget backlogs, never rejects)
+│                          # ping/status/shutdown/enqueue/runs_list/runs_show/runs_logs/results_get/
+│                          # schedule_add/schedule_list/schedule_rm (spec 06);
+│                          # admission-control scheduler (over-budget backlogs, never rejects);
+│                          # a firing cron submits enqueue trigger=cron over the daemon's own socket
 ├── client.py              # request(socket, op, **payload) → parsed response; DaemonUnreachable
 ├── validate.py            # spec 04 pure seam: validate_output(raw, schema_path) → OutputValidation
 │                          # (jsonschema Draft 2020-12 + format checker; never raises on bad output)
@@ -77,7 +89,7 @@ src/turbochickens/
 │   ├── model.py           # Pydantic v2 model, all 6 sections, extra="forbid"
 │   └── loader.py          # load_spec(), SpecValidationError (field-named issues), spec_hash()
 └── cli/main.py            # Typer app `tc`: run [--wait] | runs list/show/logs | results get |
-                           # jobs validate | daemon start/stop | status
+                           # jobs validate | daemon start/stop | status | schedule add/list/rm
 tests/
 ├── test_spec_model.py     # pure-function seam: parser/model/hash
 ├── test_cli_validate.py   # CLI seam: tc jobs validate behavior
@@ -90,6 +102,10 @@ tests/
 │                          # nested error paths, format enforcement, fail-closed broken schemas
 └── test_results.py        # spec 04 e2e: valid → results row + artifacts + tc results get; invalid →
                            # failed + quarantine + schema errors, never returned as valid; subprocess e2e
+├── test_schedule.py       # spec 06: aps_trigger POSIX-cron parity seam (vs croniter), schedule
+│                          # add/list/rm over socket+CLI, manual-trigger rejection, hash/spec checks,
+│                          # replace-on-re-add, persistence across daemon restart, and a real cron firing
+│                          # (next-minute expression) driving a trigger=cron run through the full pipeline
 ├── test_api_adapter.py    # spec 05: providers seam, MistralAPIAdapter contract seam (MockTransport:
                            # JSON-mode shape, exp backoff on 429/5xx, no retry on 4xx, Retry-After,
                            # timeout, missing credential), e2e via daemon thread + subprocess against
@@ -98,8 +114,9 @@ examples/weekly-incidents-digest/   # baseline-format example job (job.toml, pro
 examples/hello-vibe-cli/            # manual vibe-cli example job (job.toml, prompt, schema)
 examples/providers.toml             # spec 05 reference provider registry (mistral presets + pricing,
                            # commented other-provider example) — copy to ~/.turbochickens/providers.toml
-pyproject.toml             # uv/hatchling, Python >=3.12, version 0.5.0, deps: pydantic, typer, rich, croniter,
-                           # jsonschema (+ rfc3339-validator for format checks), httpx; dev: pytest
+pyproject.toml             # uv/hatchling, Python >=3.12, version 0.6.0, deps: pydantic, typer, rich, croniter,
+                           # jsonschema (+ rfc3339-validator for format checks), httpx, apscheduler (spec 06);
+                           # dev: pytest
 ```
 
 Spec-02 deliverables, concretely:
@@ -238,6 +255,34 @@ Spec-05 deliverables, concretely:
   store, quarantine on invalid output, backoff visible in `tc runs logs`, 0.25-weight
   admission (4 API runs fit a budget of 1, the 5th backlogs).
 
+Spec-06 deliverables, concretely:
+
+- **Scheduler** (`scheduler.py`): `CronScheduler` wraps APScheduler's `AsyncIOScheduler` in the
+  daemon's event loop. `aps_trigger()` builds the `CronTrigger` from a **standard POSIX** 5-field
+  expression — APScheduler's own `from_crontab` numbers day-of-week 0=Monday, so the DOW field is
+  resolved via croniter into unambiguous day names (verified against croniter: `0 7 * * 1` → Monday
+  07:00). Misfires coalesce (grace 300s). Dependency `apscheduler` added to `pyproject.toml`.
+- **Persistence** (`storage.py`): new mutable `schedules` table (job_id PK, spec_path, schedule,
+  spec_hash, added_at) — `SCHEMA_VERSION` bumped to 2. On every daemon start, persisted schedules
+  are re-registered with APScheduler, so a restart loses no schedule.
+- **One queue, one IPC contract:** a firing cron does **not** touch the queue directly — it sends
+  `enqueue` with `trigger="cron"` over the daemon's own Unix socket (loopback), so cron runs go
+  through the exact same validation, queue, admission, pipeline, and audit path as `tc run`.
+  Manual and cron runs are indistinguishable downstream except for `runs.trigger` (`manual`/`cron`).
+  Audit events: `schedule.added` / `schedule.removed` / `schedule.fired` / `schedule.fire_failed`.
+- **Socket ops:** `schedule_add` (spec_path + optional spec_hash; re-validates the spec, requires
+  `trigger.type="cron"`, INSERT OR REPLACE so re-adding an edited spec updates the schedule),
+  `schedule_list` (rows + live `next_run` from APScheduler), `schedule_rm` (job_id; error if none).
+  `status` gains a `schedules` count.
+- **CLI:** `tc schedule add <job.toml>` (local validation first — invalid cron is a field-named
+  `trigger.schedule` error; manual-trigger jobs are refused), `tc schedule list`, `tc schedule rm
+  <job>` — all over the socket like every other command.
+- **Tests** (`test_schedule.py`): pure seam `aps_trigger` vs croniter next-fire parity
+  (incl. `0 7 * * 1`, `0 0 * * 0`/`7`, steps, ranges, names); add/list/rm over socket + CLI with DB
+  and audit assertions; manual-trigger and bad-spec rejection; hash mismatch; replace on re-add;
+  persistence across a daemon restart; and one real firing (cron at the next minute boundary)
+  producing a `trigger=cron` run that reaches `succeeded` with result store + attestation + audit.
+
 | Spec | Title | Status | Blocked by |
 | --- | --- | --- | --- |
 | 01 | Scaffold + job spec model + `tc jobs validate` | **done** (`f8b8061`) | — |
@@ -245,7 +290,7 @@ Spec-05 deliverables, concretely:
 | 03 | Manual run e2e via `vibe-cli` adapter (queue, admission, workspace, manifest, attestation, `tc run`/`tc runs`) | **done** (2026-11-12) | 02 |
 | 04 | Output validation + result store + quarantine + `tc results get` | **done** (2026-11-12) | 03 |
 | 05 | `mistral-api` adapter + `providers.toml` + backoff on 429/5xx | **done** (2026-11-12) | 03, 04 |
-| 06 | Cron scheduling (APScheduler) + `tc schedule add/list/rm` | ready-for-agent | 03 |
+| 06 | Cron scheduling (APScheduler) + `tc schedule add/list/rm` | **done** (2026-11-12) | 03 |
 | 07 | Run budgets: wall-clock hard kill + injected-context cap | ready-for-agent | 03 |
 | 08 | Usage stats + expected cost + retention TTLs | ready-for-agent | 04, 05 |
 
@@ -303,10 +348,9 @@ tables deliberately excluded).
   <vibe@mistral.ai>`.
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 
-## 7. Next up — spec 06 (`specs/06-cron-scheduling.md`)
+## 7. Next up — spec 07 (`specs/07-run-budgets.md`)
 
-Cron scheduling via APScheduler plus `tc schedule add/list/rm` (blocked by 03,
-done): cron-triggered jobs submit over the same socket queue as manual runs —
-manual and cron runs stay indistinguishable downstream. Spec 05 (the
-`mistral-api` adapter, `providers.toml`, backoff) landed; the API path is now
-fully wired into queue → validation → result store → attestation.
+Run budgets: wall-clock hard kill + injected-context cap (blocked by 03, done).
+Spec 06 (cron scheduling via APScheduler + `tc schedule add/list/rm`) landed:
+cron-triggered jobs submit over the same socket queue as manual runs — manual
+and cron runs stay indistinguishable downstream (`runs.trigger` aside).
