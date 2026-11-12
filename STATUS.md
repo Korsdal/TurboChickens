@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 04 landed (89/89 tests green, e2e smoke verified).
+**Last updated:** 2026-11-12, after spec 05 landed (111/111 tests green, e2e smoke verified).
 
 ---
 
@@ -26,20 +26,24 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01, spec 02, spec 03, and spec 04 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, and the spec-04 commit).
+**Spec 01, spec 02, spec 03, spec 04, and spec 05 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, and the spec-05 commit).
 Verified this session:
 
 ```
-.venv/bin/python -m pytest -q          → 89 passed
+.venv/bin/python -m pytest -q          → 111 passed
 .venv/bin/tc --help                     → works, shows `run`, `runs`, `jobs`, `daemon`, `results`, `status`
 .venv/bin/tc jobs validate examples/weekly-incidents-digest/job.toml
-                                        → OK … sha256:18efbd8c…80b959
+                                        → OK … sha256:18efbd8c…80b959 (unchanged)
 # e2e smoke (fake vibe binary via $TURBOCHICKENS_VIBE_BIN): tc daemon start (background)
 #   → tc run <valid-output job> --wait → succeeded, rc 0
 #   → tc results get <run> → validated JSON on stdout, rc 0; results row valid=1 + data/results/<run>/output.json
 #   → tc run <invalid-output job> --wait → failed "output failed schema validation", rc 1
 #   → tc results get <run> → rc 1 "quarantined" + schema errors; results row valid=0 + data/quarantine/<run>/{raw_output.txt,schema_errors.json}
 #   → tc runs list/show/logs → manifest + validator events + attestation; tc status → alerts: 0; tc daemon stop → rc 0
+# spec-05 smoke (hermetic fake OpenAI-compatible server on loopback via $TURBOCHICKENS_PROVIDERS):
+#   → tc run <mistral-api job> --wait → succeeded, weight=0.25; manifest harness.adapter=mistral-api,
+#     usage tokens + cost_usd from providers.toml pricing; tc results get → validated JSON, rc 0
+#   → 429 x2 then 200 → succeeded, retry/backoff warn lines in tc runs logs; 400 → failed, no retry
 ```
 
 What exists:
@@ -53,7 +57,13 @@ src/turbochickens/
 ├── audit.py               # AuditLog: append-only JSONL (open "a" only, fsync per row)
 ├── adapter.py             # HarnessAdapter Protocol (prepare/execute/teardown) + CredentialProvider
 │                          # extension point + VibeCLIAdapter (headless subprocess pinned to the
-│                          # workspace, sanitized streamed logs) + adapter weights (API 0.25 / CLI 1.0)
+│                          # workspace, sanitized streamed logs) + MistralAPIAdapter (spec 05:
+│                          # OpenAI-compatible HTTP via httpx, JSON mode, exp backoff on 429/5xx)
+│                          # + adapter weights (API 0.25 / CLI 1.0)
+├── providers.py           # spec 05: providers.toml registry — provider/model presets, base_url,
+│                          # credential env var, context_window, per-token pricing; resolution:
+│                          # settings.providers_path > $TURBOCHICKENS_PROVIDERS > <data_dir>/providers.toml
+│                          # > built-in mistral defaults (overlaid per provider)
 ├── runner.py              # RunPipeline: lifecycle queued→…→succeeded/failed, fresh workspace +
 │                          # per-run env, manifest, run_events, spec-04 result store / quarantine
 │                          # at `collecting`, teardown attestation + audit rows
@@ -80,10 +90,16 @@ tests/
 │                          # nested error paths, format enforcement, fail-closed broken schemas
 └── test_results.py        # spec 04 e2e: valid → results row + artifacts + tc results get; invalid →
                            # failed + quarantine + schema errors, never returned as valid; subprocess e2e
-examples/weekly-incidents-digest/   # baseline-format example job (job.toml, prompt, schema, csv)
+├── test_api_adapter.py    # spec 05: providers seam, MistralAPIAdapter contract seam (MockTransport:
+                           # JSON-mode shape, exp backoff on 429/5xx, no retry on 4xx, Retry-After,
+                           # timeout, missing credential), e2e via daemon thread + subprocess against
+                           # a hermetic loopback fake provider (result store, quarantine, weight 0.25)
+examples/weekly-incidents-digest/   # baseline-format example job (job.toml, prompt, schema, csv; mistral-api)
 examples/hello-vibe-cli/            # manual vibe-cli example job (job.toml, prompt, schema)
-pyproject.toml             # uv/hatchling, Python >=3.12, version 0.4.0, deps: pydantic, typer, rich, croniter,
-                           # jsonschema (+ rfc3339-validator for format checks); dev: pytest
+examples/providers.toml             # spec 05 reference provider registry (mistral presets + pricing,
+                           # commented other-provider example) — copy to ~/.turbochickens/providers.toml
+pyproject.toml             # uv/hatchling, Python >=3.12, version 0.5.0, deps: pydantic, typer, rich, croniter,
+                           # jsonschema (+ rfc3339-validator for format checks), httpx; dev: pytest
 ```
 
 Spec-02 deliverables, concretely:
@@ -138,8 +154,8 @@ Spec-03 deliverables, concretely:
   workspace, streams stdout/stderr as sanitized `run_events` (control chars stripped,
   length-capped), hard-kills on `timeout_sec`, and reads token usage from the
   harness `export.json` (telemetry only). Binary resolved via
-  `$TURBOCHICKENS_VIBE_BIN` else PATH. `mistral-api` is rejected at enqueue until
-  spec 05.
+  `$TURBOCHICKENS_VIBE_BIN` else PATH. (`mistral-api` was rejected at enqueue
+  until spec 05 landed it.)
 - **Pipeline** (`runner.py`): provisioning creates `<data_dir>/workspaces/<run_id>` and
   copies prompt + attachments in; lifecycle transitions are written to `runs.status`
   and mirrored as `run_events`; the manifest (spec hash, harness+version/provider/model/
@@ -193,13 +209,42 @@ Spec-01 deliverables, concretely:
 
 ## 4. Spec pipeline
 
+Spec-05 deliverables, concretely:
+
+- **Provider registry** (`providers.py`): `providers.toml` holds provider presets —
+  `base_url`, credential env var (`api_key_env`), and per-model `context_window`,
+  per-token pricing (`input_usd_per_mtok`/`output_usd_per_mtok`), and `json_mode` support.
+  Resolution: `settings.providers_path` > `$TURBOCHICKENS_PROVIDERS` >
+  `<data_dir>/providers.toml` > built-in mistral defaults, overlaid **per provider**
+  (a `[providers.X]` table replaces provider X wholesale). `extra="forbid"`; a job picks a
+  provider via `model = "provider/model"`, bare names use mistral. Reference file:
+  `examples/providers.toml`. Pricing feeds per-run `usage.cost_usd` telemetry now and
+  per-job expected-cost stats in spec 08.
+- **`MistralAPIAdapter`** (`adapter.py`): same `HarnessAdapter` protocol, so API runs flow
+  through the same queue (weight **0.25**), validation, result store, quarantine, and
+  teardown attestation as CLI runs. `POST {base_url}/chat/completions` via `httpx` with
+  `response_format: {"type": "json_object"}` where the model profile supports it; the
+  credential comes from the per-run env (`api_key_env`, added to the credential allowlist) —
+  no request is sent without it. **Exponential backoff** on 429/5xx and transport errors
+  (`base * 2^attempt`, capped, honoring `Retry-After`), each retry streamed as a warn line to
+  the run logs; other 4xx fail immediately without retry. The whole call (incl. backoff) is
+  bounded by the wall-clock `timeout_sec` hard kill. Usage (`tokens_in`/`tokens_out` +
+  `cost_usd` from pricing) lands in the manifest; the model/provider must resolve from
+  `providers.toml` or enqueue fails fast (`ProviderConfigError`).
+- **Tests** (`test_api_adapter.py`): providers pure seam; adapter contract seam over
+  `httpx.MockTransport` (request shape, backoff, Retry-After, 4xx no-retry, exhaustion,
+  transport error, missing credential, timeout, malformed 200); e2e through a real daemon
+  (thread + subprocess) against a hermetic loopback fake provider — validated result in the
+  store, quarantine on invalid output, backoff visible in `tc runs logs`, 0.25-weight
+  admission (4 API runs fit a budget of 1, the 5th backlogs).
+
 | Spec | Title | Status | Blocked by |
 | --- | --- | --- | --- |
 | 01 | Scaffold + job spec model + `tc jobs validate` | **done** (`f8b8061`) | — |
 | 02 | Daemon + Unix socket (JSON-lines) + SQLite schema + audit log + settings + `tc status` | **done** (2026-11-12) | 01 |
 | 03 | Manual run e2e via `vibe-cli` adapter (queue, admission, workspace, manifest, attestation, `tc run`/`tc runs`) | **done** (2026-11-12) | 02 |
 | 04 | Output validation + result store + quarantine + `tc results get` | **done** (2026-11-12) | 03 |
-| 05 | `mistral-api` adapter + `providers.toml` + backoff on 429/5xx | ready-for-agent | 03, 04 |
+| 05 | `mistral-api` adapter + `providers.toml` + backoff on 429/5xx | **done** (2026-11-12) | 03, 04 |
 | 06 | Cron scheduling (APScheduler) + `tc schedule add/list/rm` | ready-for-agent | 03 |
 | 07 | Run budgets: wall-clock hard kill + injected-context cap | ready-for-agent | 03 |
 | 08 | Usage stats + expected cost + retention TTLs | ready-for-agent | 04, 05 |
@@ -258,10 +303,10 @@ tables deliberately excluded).
   <vibe@mistral.ai>`.
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 
-## 7. Next up — spec 05 (`specs/05-mistral-api-adapter.md`)
+## 7. Next up — spec 06 (`specs/06-cron-scheduling.md`)
 
-The `mistral-api` adapter (blocked by 03+04, both done): OpenAI-compatible HTTP
-via `httpx` with JSON-mode structured responses, `providers.toml` for
-model/provider presets + pricing, and exponential backoff on 429/5xx. It plugs
-into the same `HarnessAdapter` protocol and the same `collecting` validation
-channel that spec 04 just built.
+Cron scheduling via APScheduler plus `tc schedule add/list/rm` (blocked by 03,
+done): cron-triggered jobs submit over the same socket queue as manual runs —
+manual and cron runs stay indistinguishable downstream. Spec 05 (the
+`mistral-api` adapter, `providers.toml`, backoff) landed; the API path is now
+fully wired into queue → validation → result store → attestation.

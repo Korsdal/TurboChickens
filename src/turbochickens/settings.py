@@ -37,6 +37,11 @@ class Settings(BaseModel):
     weight_budget_override: int | None = Field(default=None, gt=0)
     audit_retention: Literal["forever"] = "forever"  # MVP: the audit log is never TTL-deleted
     results_retention_months: int = Field(default=6, gt=0)
+    providers_path: Path | None = Field(
+        default=None,
+        description="Explicit providers.toml path (spec 05); else $TURBOCHICKENS_PROVIDERS, "
+        "else <data_dir>/providers.toml, else built-in defaults.",
+    )
 
     @property
     def socket_path(self) -> Path:

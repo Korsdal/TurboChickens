@@ -23,6 +23,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
+import httpx
+
+from turbochickens.providers import ProvidersConfig, ProvidersError, load_providers
 from turbochickens.spec.model import JobSpec
 
 ADAPTER_WEIGHTS: dict[str, float] = {"mistral-api": 0.25, "vibe-cli": 1.0}
@@ -52,6 +55,10 @@ DEFAULT_CREDENTIAL_ALLOWLIST = ("MISTRAL_API_KEY",)
 
 class AdapterNotImplemented(Exception):
     """The spec names an adapter that no implementation is registered for."""
+
+
+class ProviderConfigError(Exception):
+    """The job's model/provider cannot be resolved from providers.toml."""
 
 
 def run_weight(adapter_name: str) -> float:
@@ -321,10 +328,241 @@ class VibeCLIAdapter:
         )
 
 
-def make_adapter(spec: JobSpec, credential_provider: CredentialProvider | None = None) -> HarnessAdapter:
-    """Instantiate the adapter named by the spec. `mistral-api` lands in spec 05."""
+class MistralAPIAdapter:
+    """Spec 05: OpenAI-compatible HTTP adapter against the provider named by the
+    job's model (``"provider/model"`` or bare = mistral), configured entirely
+    through `providers.toml`.
+
+    Speaks ``POST {base_url}/chat/completions`` with JSON-mode structured
+    responses (``response_format: {"type": "json_object"}``) where the model
+    profile supports it, so raw output is easy to schema-validate downstream.
+    Exponential backoff on provider 429/5xx (and transport errors), honoring
+    ``Retry-After`` when present — every retry is streamed to the run logs.
+    The credential is the per-run env var named by the provider profile; no
+    request is ever sent without it. Token usage is measured telemetry; cost is
+    derived from providers.toml pricing, never a declared budget.
+    """
+
+    name = "mistral-api"
+
+    def __init__(
+        self,
+        spec: JobSpec,
+        providers: ProvidersConfig | None = None,
+        credential_provider: CredentialProvider | None = None,
+        client: httpx.AsyncClient | None = None,
+        backoff_base_sec: float = 1.0,
+        backoff_max_sec: float = 30.0,
+        max_retries: int = 5,
+    ) -> None:
+        self.providers = providers or load_providers()
+        self.provider_name, self.model, self.provider, self.model_profile = self.providers.resolve(
+            spec.harness.model
+        )
+        if credential_provider is None:
+            # the provider's key env var must be injectable per-run even for
+            # non-mistral providers
+            allowlist = tuple(dict.fromkeys((*DEFAULT_CREDENTIAL_ALLOWLIST, self.provider.api_key_env)))
+            credential_provider = EnvAllowlistCredentialProvider(allowlist)
+        self.credential_provider = credential_provider
+        self.client = client  # test seam: inject a client (e.g. MockTransport)
+        self.backoff_base_sec = backoff_base_sec
+        self.backoff_max_sec = backoff_max_sec
+        self.max_retries = max_retries
+
+    def prepare(self, run: RunContext) -> PreparedRun:
+        run.env = build_per_run_env(run, self.credential_provider.credentials(run))
+        return PreparedRun(
+            context=run,
+            harness={
+                "adapter": self.name,
+                "version": f"httpx/{httpx.__version__}",
+                "provider": self.provider_name,
+                "model": self.model,
+                "temperature": run.spec.harness.temperature,
+            },
+        )
+
+    def _messages(self, run: RunContext) -> list[dict[str, str]]:
+        """Injected context: prompt + attachments from the workspace, nothing else."""
+        prompt = (run.workspace / "prompt.txt").read_text(encoding="utf-8")
+        parts = [prompt]
+        for att in run.spec.input.attachments:
+            p = run.workspace / Path(att).name
+            if p.is_file():
+                parts.append(f"--- attachment: {att} ---\n{p.read_text(encoding='utf-8')}")
+        return [{"role": "user", "content": "\n\n".join(parts)}]
+
+    async def execute(
+        self,
+        prepared: PreparedRun,
+        event_sink: Callable[[str, str, str], Awaitable[None]],
+        timeout_sec: int,
+    ) -> HarnessResult:
+        run = prepared.context
+        api_key = run.env.get(self.provider.api_key_env)
+        if not api_key:
+            return HarnessResult(
+                exit_code=None,
+                raw_output="",
+                usage={},
+                error=f"missing credential: ${self.provider.api_key_env} is not set in the per-run env",
+            )
+        url = self.provider.base_url.rstrip("/") + "/chat/completions"
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": self._messages(run),
+            "temperature": run.spec.harness.temperature,
+        }
+        if self.model_profile.json_mode:
+            body["response_format"] = {"type": "json_object"}
+        headers = {"Authorization": f"Bearer {api_key}"}
+        owned = self.client is None
+        client = self.client or httpx.AsyncClient(timeout=httpx.Timeout(timeout_sec, connect=10.0))
+        try:
+            # wall-clock hard budget over the whole call incl. backoff sleeps
+            return await asyncio.wait_for(
+                self._post_with_backoff(client, url, body, headers, event_sink), timeout=timeout_sec
+            )
+        except asyncio.TimeoutError:
+            return HarnessResult(
+                exit_code=None,
+                raw_output="",
+                usage={},
+                timed_out=True,
+                error=f"timeout: no completed provider response after {timeout_sec}s",
+            )
+        finally:
+            if owned:
+                await client.aclose()
+
+    async def _post_with_backoff(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        body: dict[str, Any],
+        headers: dict[str, str],
+        event_sink: Callable[[str, str, str], Awaitable[None]],
+    ) -> HarnessResult:
+        await event_sink(
+            "harness",
+            "info",
+            f"POST {url} model={self.model} json_mode={str(self.model_profile.json_mode).lower()}",
+        )
+        delay = self.backoff_base_sec
+        attempt = 0
+        while True:
+            status: int | None = None
+            err: str | None = None
+            resp: httpx.Response | None = None
+            try:
+                resp = await client.post(url, json=body, headers=headers)
+                status = resp.status_code
+            except httpx.TransportError as e:
+                err = f"{type(e).__name__}: {e}"
+            if resp is not None and status == 200:
+                return await self._on_success(resp, event_sink)
+            retryable = status is None or status == 429 or status >= 500
+            if not retryable:
+                detail = self._error_detail(resp)
+                return HarnessResult(
+                    exit_code=status, raw_output="", usage={},
+                    error=f"provider http {status}: {detail} (not retryable)",
+                )
+            attempt += 1
+            if attempt > self.max_retries:
+                detail = err or self._error_detail(resp)
+                return HarnessResult(
+                    exit_code=status, raw_output="", usage={},
+                    error=f"provider {'http ' + str(status) if status else 'error'} gave up after {attempt} attempts: {detail}",
+                )
+            wait = min(delay, self.backoff_max_sec)
+            source = "backoff"
+            if resp is not None:
+                retry_after = self._retry_after(resp)
+                if retry_after is not None:
+                    wait = min(retry_after, self.backoff_max_sec)
+                    source = f"retry-after {retry_after:g}s"
+            await event_sink(
+                "harness",
+                "warn",
+                f"provider {'http ' + str(status) if status else 'transport error'}"
+                f" — retry {attempt}/{self.max_retries} in {wait:.3f}s ({source})",
+            )
+            await asyncio.sleep(wait)
+            delay *= 2  # exponential
+
+    @staticmethod
+    def _retry_after(resp: httpx.Response) -> float | None:
+        raw = resp.headers.get("retry-after")
+        if raw is None:
+            return None
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _error_detail(resp: httpx.Response | None) -> str:
+        if resp is None:
+            return "no response"
+        try:
+            data = resp.json()
+            msg = data.get("error", {}).get("message") if isinstance(data.get("error"), dict) else None
+            if msg:
+                return str(msg)
+        except ValueError:
+            pass
+        return resp.text[:200]
+
+    async def _on_success(self, resp: httpx.Response, event_sink: Callable[[str, str, str], Awaitable[None]]) -> HarnessResult:
+        try:
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            usage_raw = data.get("usage") or {}
+        except (ValueError, KeyError, IndexError, TypeError) as e:
+            return HarnessResult(
+                exit_code=200, raw_output="", usage={},
+                error=f"malformed provider response: {type(e).__name__}: {e}",
+            )
+        tokens_in = int(usage_raw.get("prompt_tokens", 0) or 0)
+        tokens_out = int(usage_raw.get("completion_tokens", 0) or 0)
+        usage: dict[str, Any] = {"tokens_in": tokens_in, "tokens_out": tokens_out}
+        cost = self.providers.cost_usd(self.model_profile, tokens_in, tokens_out)
+        if cost > 0:
+            usage["cost_usd"] = round(cost, 6)
+        await event_sink(
+            "harness", "info", f"provider http 200: tokens_in={tokens_in} tokens_out={tokens_out}"
+        )
+        return HarnessResult(exit_code=0, raw_output=content or "", usage=usage)
+
+    async def teardown(self, run: RunContext) -> TeardownReport:
+        """No subprocess to reap for a pure HTTP adapter; workspace gone + env
+        cleared are still verified, same attestation contract as vibe-cli."""
+        workspace_removed = True
+        if run.workspace.exists():
+            shutil.rmtree(run.workspace, ignore_errors=True)
+            workspace_removed = not run.workspace.exists()
+        run.env.clear()
+        return TeardownReport(
+            process_reaped=True,
+            workspace_removed=workspace_removed,
+            env_cleared=True,
+        )
+
+
+def make_adapter(
+    spec: JobSpec,
+    credential_provider: CredentialProvider | None = None,
+    providers: ProvidersConfig | None = None,
+) -> HarnessAdapter:
+    """Instantiate the adapter named by the spec. The model/provider must
+    resolve from providers.toml — unknown ones fail here, at enqueue time."""
     if spec.harness.adapter == "vibe-cli":
         return VibeCLIAdapter(credential_provider=credential_provider)
-    raise AdapterNotImplemented(
-        f"adapter {spec.harness.adapter!r} is not implemented yet (mistral-api arrives in spec 05)"
-    )
+    if spec.harness.adapter == "mistral-api":
+        try:
+            return MistralAPIAdapter(spec, providers=providers, credential_provider=credential_provider)
+        except ProvidersError as e:
+            raise ProviderConfigError(str(e)) from e
+    raise AdapterNotImplemented(f"adapter {spec.harness.adapter!r} is not implemented")

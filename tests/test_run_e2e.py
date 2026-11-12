@@ -361,11 +361,13 @@ def test_tc_run_invalid_spec_exits_1_and_enqueues_nothing(daemon, tmp_path) -> N
     assert st["queue_depth"] == 0
 
 
-def test_tc_run_unimplemented_adapter_rejected_at_enqueue(daemon, tmp_path) -> None:
+def test_tc_run_unresolvable_model_rejected_at_enqueue(daemon, tmp_path) -> None:
+    # mistral-api is implemented since spec 05; a model missing from
+    # providers.toml still fails fast at enqueue, before anything is queued
     spec_path = write_job(tmp_path, name="api-job", adapter="mistral-api")
     result = runner.invoke(app, ["run", str(spec_path)])
     assert result.exit_code == 1
-    assert "not implemented" in combined_output(result)
+    assert "not found in providers.toml" in combined_output(result)
     st = request(daemon.settings.socket_path, "status", timeout=2.0)
     assert st["queue_depth"] == 0
 

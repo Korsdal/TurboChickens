@@ -27,8 +27,9 @@ from pathlib import Path
 from typing import Any
 
 from turbochickens import __version__
-from turbochickens.adapter import AdapterNotImplemented, run_weight
+from turbochickens.adapter import AdapterNotImplemented, ProviderConfigError, run_weight
 from turbochickens.audit import AuditLog
+from turbochickens.providers import ProvidersConfig, load_providers
 from turbochickens.runner import TERMINAL_STATES, RunPipeline
 from turbochickens.settings import Settings
 from turbochickens.spec.loader import SpecValidationError, load_spec, spec_hash
@@ -52,6 +53,7 @@ class Daemon:
         self.db: sqlite3.Connection | None = None
         self.audit: AuditLog | None = None
         self.pipeline: RunPipeline | None = None
+        self.providers: ProvidersConfig | None = None
         self._server: asyncio.AbstractServer | None = None
         self._stop: asyncio.Event | None = None
         self._db_lock = asyncio.Lock()
@@ -77,6 +79,7 @@ class Daemon:
         s.data_dir.mkdir(parents=True, exist_ok=True)
         self.db = init_db(s.db_path)
         self.audit = AuditLog(s.audit_log_path)
+        self.providers = load_providers(s.providers_path, s.data_dir)
         self.started_at = utcnow()
         self._stop = asyncio.Event()
         self.audit.append(
@@ -93,7 +96,7 @@ class Daemon:
             s.socket_path.unlink()  # stale socket from a dead daemon
         self._server = await asyncio.start_unix_server(self._handle_client, path=str(s.socket_path))
         os.chmod(s.socket_path, 0o600)
-        self.pipeline = RunPipeline(s, self.db, self.audit)
+        self.pipeline = RunPipeline(s, self.db, self.audit, providers=self.providers)
         serve_task = asyncio.create_task(self._server.serve_forever())
         stop_task = asyncio.create_task(self._stop.wait())
         self._sched_task = asyncio.create_task(self._scheduler())
@@ -257,8 +260,9 @@ class Daemon:
         from turbochickens.adapter import make_adapter
 
         try:
-            make_adapter(spec)  # fail fast at enqueue if no implementation is registered
-        except AdapterNotImplemented as e:
+            # fail fast at enqueue: unregistered adapter or unresolvable model/provider
+            make_adapter(spec, providers=self.providers)
+        except (AdapterNotImplemented, ProviderConfigError) as e:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": str(e)}
         job_id = spec.job.name
         run_id = "run-" + uuid.uuid4().hex[:12]

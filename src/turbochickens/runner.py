@@ -28,6 +28,7 @@ from turbochickens.adapter import (
     sanitize_log_line,
 )
 from turbochickens.audit import AuditLog
+from turbochickens.providers import ProvidersConfig, load_providers
 from turbochickens.settings import Settings
 from turbochickens.spec.loader import load_spec
 from turbochickens.util import utcnow_iso
@@ -42,10 +43,17 @@ class RunPipeline:
     """Executes queued runs against the daemon's db/audit. One instance per
     daemon; DB writes are serialized through an asyncio lock."""
 
-    def __init__(self, settings: Settings, db: sqlite3.Connection, audit: AuditLog) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        db: sqlite3.Connection,
+        audit: AuditLog,
+        providers: ProvidersConfig | None = None,
+    ) -> None:
         self.settings = settings
         self.db = db
         self.audit = audit
+        self.providers = providers or load_providers(settings.providers_path, settings.data_dir)
         self._db_lock = asyncio.Lock()
 
     # --- db helpers -------------------------------------------------------
@@ -174,7 +182,7 @@ class RunPipeline:
         attestation and audit rows."""
         run_id = item["run_id"]
         spec = load_spec(item["spec_path"])
-        adapter = make_adapter(spec)
+        adapter = make_adapter(spec, providers=self.providers)
         ctx = RunContext(
             run_id=run_id,
             job_id=item["job_id"],

@@ -4,8 +4,8 @@
 
 **Blocked by:** 03 (adapter interface + run pipeline), 04 (validation + result store, so the API path is demoed fully validated)
 
-**Status:** ready-for-agent
+**Status:** done (2026-11-12)
 
-- [ ] A job with adapter `mistral-api` executes over HTTP and its schema-validated output lands in the result store
-- [ ] 429/5xx responses trigger exponential backoff, visible in the run logs
-- [ ] `providers.toml` supplies model presets and per-token pricing, consumed later for expected-cost stats
+- [x] A job with adapter `mistral-api` executes over HTTP and its schema-validated output lands in the result store
+- [x] 429/5xx responses trigger exponential backoff, visible in the run logs
+- [x] `providers.toml` supplies model presets and per-token pricing, consumed later for expected-cost stats

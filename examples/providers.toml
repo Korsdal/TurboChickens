@@ -1,0 +1,45 @@
+# Platform-level provider registry (spec 05).
+#
+# Copy to ~/.turbochickens/providers.toml (or point $TURBOCHICKENS_PROVIDERS /
+# settings `providers_path` at a file) to customize. A [providers.X] table
+# replaces the built-in provider X wholesale; providers not mentioned here
+# keep their built-in defaults. Prices are USD per million tokens and feed
+# per-run cost telemetry + per-job expected-cost stats (spec 08).
+#
+# A job selects a provider via its model name: "tensorx/foo" uses provider
+# "tensorx", model "foo"; a bare name uses the mistral provider.
+
+[providers.mistral]
+base_url = "https://api.mistral.ai/v1"
+api_key_env = "MISTRAL_API_KEY"
+
+[providers.mistral.models.mistral-large-latest]
+context_window = 256000
+input_usd_per_mtok = 2.0
+output_usd_per_mtok = 6.0
+json_mode = true
+
+[providers.mistral.models.mistral-small-latest]
+context_window = 128000
+input_usd_per_mtok = 0.2
+output_usd_per_mtok = 0.6
+json_mode = true
+
+[providers.mistral.models.ministral-8b-latest]
+context_window = 128000
+input_usd_per_mtok = 0.4
+output_usd_per_mtok = 0.4
+json_mode = true
+
+# Example: any other OpenAI-compatible provider is a config change, not a code
+# change. The job then uses model = "tensorx/example-model".
+#
+# [providers.tensorx]
+# base_url = "https://api.tensorx.example/v1"
+# api_key_env = "TENSORX_API_KEY"
+#
+# [providers.tensorx.models.example-model]
+# context_window = 128000
+# input_usd_per_mtok = 1.0
+# output_usd_per_mtok = 3.0
+# json_mode = true
