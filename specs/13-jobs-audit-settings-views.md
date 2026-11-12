@@ -6,10 +6,10 @@
 
 **Blocked by:** 12 (coop skeleton: HTTP server, auth, shell)
 
-**Status:** ready-for-agent (2026-11-12)
+**Status:** done (2026-11-12, 226/226 tests green)
 
-- [ ] The three socket ops work standalone over the Unix socket (jobs_list / audit_tail / settings_get)
-- [ ] HTTP mirrors return identical payloads under the same auth rules as ticket 12
-- [ ] Jobs view lists registered specs with hashes; Audit view is mono, newest first, filterable by event type; Settings view shows effective settings rows
-- [ ] All three views render a clean daemon-down / empty state
-- [ ] Tests: socket + HTTP parity on a temp daemon; empty-state and filter behaviour over HTTP
+- [x] The three socket ops work standalone over the Unix socket (jobs_list / audit_tail / settings_get)
+- [x] HTTP mirrors return identical payloads under the same auth rules as ticket 12
+- [x] Jobs view lists registered specs with hashes; Audit view is mono, newest first, filterable by event type; Settings view shows effective settings rows
+- [x] All three views render a clean daemon-down / empty state
+- [x] Tests: socket + HTTP parity on a temp daemon; empty-state and filter behaviour over HTTP

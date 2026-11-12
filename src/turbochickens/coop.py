@@ -3,7 +3,9 @@
 When ``coop_enabled`` is set (``tc coop start``, or ``tc daemon start`` with
 ``coop_enabled = true`` — the coop container's CMD), the daemon process also
 runs a small aiohttp server **in the same asyncio event loop**, serving the
-static SPA at ``/`` and a JSON API under ``/api``.
+static SPA at ``/`` and a JSON API under ``/api`` — ``/api/ping`` +
+``/api/status`` (spec 12) and the spec 13 read-only mirrors ``/api/jobs``,
+``/api/audit?limit=&event=``, ``/api/settings``.
 
 Transport seam: every API handler is a thin client of the existing Unix-socket
 protocol — it calls ``request(op, **payload)`` over the socket (spec 12) and
@@ -129,6 +131,10 @@ class CoopServer:
         app = web.Application(middlewares=[self._auth_middleware])
         app.router.add_get("/api/ping", self._api_ping)
         app.router.add_get("/api/status", self._api_status)
+        # spec 13: read-only mirrors of the GUI socket ops
+        app.router.add_get("/api/jobs", self._api_jobs)
+        app.router.add_get("/api/audit", self._api_audit)
+        app.router.add_get("/api/settings", self._api_settings)
         app.router.add_get("/", self._index)
         app.router.add_get("/{tail:.*}", self._static_file)
         self._runner = web.AppRunner(app)
@@ -169,16 +175,43 @@ class CoopServer:
             )
         return web.json_response(resp)
 
-    async def _api_status(self, request: web.Request) -> web.Response:
+    async def _mirror(self, op: str, **payload: Any) -> web.Response:
+        """Forward one socket op over the transport seam. When the daemon socket
+        is unreachable, answer 200 with a structured `daemon.up=false` payload so
+        the SPA renders a clear empty state/banner instead of a broken page
+        (spec 11, story 24)."""
         try:
-            resp = await self.transport.request("status")
+            resp = await self.transport.request(op, **payload)
         except DaemonUnreachable as e:
-            # graceful degradation: structured daemon.up=false so the SPA can
-            # render a clear banner instead of a broken page (spec 11, story 24)
-            return web.json_response(
-                {"ok": False, "op": "status", "daemon": {"up": False}, "error": str(e)}
-            )
+            return web.json_response({"ok": False, "op": op, "daemon": {"up": False}, "error": str(e)})
         return web.json_response(resp)
+
+    async def _api_status(self, request: web.Request) -> web.Response:
+        return await self._mirror("status")
+
+    # --- spec 13: Jobs / Audit / Settings mirrors -----------------------------
+
+    async def _api_jobs(self, request: web.Request) -> web.Response:
+        return await self._mirror("jobs_list")
+
+    async def _api_audit(self, request: web.Request) -> web.Response:
+        raw_limit = request.query.get("limit")
+        payload: dict[str, Any] = {}
+        if raw_limit is not None:
+            try:
+                payload["limit"] = int(raw_limit)
+            except ValueError:
+                return web.json_response(
+                    {"ok": False, "op": "audit_tail", "error": f"limit must be an integer, got {raw_limit!r}"},
+                    status=400,
+                )
+        event = request.query.get("event")
+        if event:
+            payload["event"] = event
+        return await self._mirror("audit_tail", **payload)
+
+    async def _api_settings(self, request: web.Request) -> web.Response:
+        return await self._mirror("settings_get")
 
     # --- static SPA ----------------------------------------------------------
 

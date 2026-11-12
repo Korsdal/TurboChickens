@@ -15,6 +15,11 @@ socket, so manual and cron runs share one queue and one admission path.
 Runs flow through one queue with resource-weight admission control; over-budget
 runs backlog in ``pending``, never rejected.
 
+Spec 13 adds three read-only ops for the GUI: ``jobs_list`` (registered job
+specs with hashes), ``audit_tail`` (last N audit rows, newest first, optional
+event-type filter), ``settings_get`` (effective settings, never the coop auth
+token).
+
 Spec 12 (coop): when ``coop_enabled`` is set, the same process also serves the
 TurboChickens GUI over HTTP (aiohttp, same event loop) — static SPA at ``/``
 and ``/api/ping`` + ``/api/status`` under ``/api``, thin mirrors of the socket
@@ -50,6 +55,10 @@ from turbochickens.util import utcnow, utcnow_iso
 
 #: how often the retention sweeper re-runs after the startup sweep (spec 08)
 RETENTION_SWEEP_INTERVAL_SEC = 3600.0
+
+#: spec 13 `audit_tail` bounds: default page size and the hard cap
+AUDIT_TAIL_DEFAULT = 100
+AUDIT_TAIL_MAX = 1000
 
 PROTOCOL_VERSION = 1
 
@@ -244,6 +253,12 @@ class Daemon:
             return self._schedule_list()
         if op == "schedule_rm":
             return await self._schedule_rm(req)
+        if op == "jobs_list":
+            return self._jobs_list()
+        if op == "audit_tail":
+            return self._audit_tail(req)
+        if op == "settings_get":
+            return self._settings_get()
         if op == "shutdown":
             self.request_stop()
             return {"ok": True, "op": "shutdown", "protocol": PROTOCOL_VERSION, "message": "shutting down"}
@@ -676,6 +691,73 @@ class Daemon:
             "protocol": PROTOCOL_VERSION,
             "audit_retention": self.settings.audit_retention,
             **self._last_retention,
+        }
+
+    # --- read-only inspection for the GUI (spec 13) --------------------------
+
+    def _jobs_list(self) -> dict[str, Any]:
+        """Registered job specs (the append-only `job_specs` table) with their
+        spec hashes — the Jobs view (spec 13)."""
+        if self.db is None:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "db not ready"}
+        rows = self.db.execute(
+            "SELECT id, name, spec_hash, created_at FROM job_specs ORDER BY created_at, id"
+        ).fetchall()
+        jobs = [
+            {
+                "job_id": r[0],
+                "name": r[1],
+                "spec_hash": r[2],
+                "registered_at": r[3],
+            }
+            for r in rows
+        ]
+        return {"ok": True, "op": "jobs_list", "protocol": PROTOCOL_VERSION, "jobs": jobs}
+
+    def _audit_tail(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Last N audit rows, newest first, optional event-type filter (spec 13).
+        Read-only: the log itself stays append-only."""
+        if self.audit is None:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "audit log not ready"}
+        raw_limit = req.get("limit", AUDIT_TAIL_DEFAULT)
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": f"audit_tail limit must be an integer between 1 and {AUDIT_TAIL_MAX}, got {raw_limit!r}",
+            }
+        if not 1 <= limit <= AUDIT_TAIL_MAX:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": f"audit_tail limit must be between 1 and {AUDIT_TAIL_MAX}, got {limit}",
+            }
+        event = req.get("event")
+        if event is not None and not isinstance(event, str):
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "audit_tail event must be a string"}
+        event = event or None
+        events = self.audit.tail(limit, event)
+        return {
+            "ok": True,
+            "op": "audit_tail",
+            "protocol": PROTOCOL_VERSION,
+            "limit": limit,
+            "event": event,
+            "count": len(events),
+            "events": events,
+        }
+
+    def _settings_get(self) -> dict[str, Any]:
+        """Effective settings for the Settings view (spec 13). The coop auth
+        token is never included — `public_dict()` omits it, and the coop block
+        carries only enabled/url/auth_required."""
+        return {
+            "ok": True,
+            "op": "settings_get",
+            "protocol": PROTOCOL_VERSION,
+            "settings": {**self.settings.public_dict(), "coop": self._coop_block()},
         }
 
     # --- cron scheduling (spec 06) -------------------------------------------

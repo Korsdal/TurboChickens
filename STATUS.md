@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 12 landed (213/213 tests green, e2e smoke verified).
+**Last updated:** 2026-11-12, after spec 13 landed (226/226 tests green, e2e smoke verified).
 
 ---
 
@@ -26,7 +26,7 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10 and spec 12 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, and the spec-12 commit). Spec 11 is the parent GUI spec; its first slice (spec 12, the skeleton) is landed, the rest of its stories land via specs 13–18.
+**Spec 01 through spec 10 and specs 12–13 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, and the spec-13 commit). Spec 11 is the parent GUI spec; its first two slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views) are landed, the rest of its stories land via specs 14–18.
 
 **Spec 19 (auth & access management UI) is backlogged** — `specs/19-auth-access-management-ui.md`, status ready-for-agent, not started. Note spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality.
 Verified this session:
@@ -101,6 +101,19 @@ Verified this session:
 #     tc daemon stop → rc 0, HTTP port refuses connections afterwards, audit has coop.started/coop.stopped
 #   → daemon-socket-unreachable seam (CoopServer with dead-socket transport): /api/status → 200 with
 #     daemon.up=false, /api/ping → 503 — the SPA renders a banner, not a broken page
+# spec-13 smoke (temp settings, coop_enabled=true, `tc coop start` subprocess, fake vibe binary):
+#   → GET /api/jobs → jobs=[] before, then one row {job_id, name, spec_hash, registered_at} after
+#     `tc run <job.toml>` (jobs_list mirrors the socket op exactly; HTTP payload == socket payload)
+#   → GET /api/audit?limit=3 → newest-first tail of audit.jsonl; ?event=run.queued filters;
+#     ?limit=abc → 400; ?limit=0 → ok:false from the socket op; parity with audit_tail over the socket
+#   → GET /api/settings → effective settings incl. coop block {enabled,url,auth_required};
+#     coop_auth_token never appears in the payload (asserted with a configured token)
+#   → auth-required mode (0.0.0.0 + token): /api/jobs|/api/audit|/api/settings → 401 without bearer,
+#     200 with; /api/ping stays open; dead-socket transport → 200 {ok:false, daemon.up=false} on all
+#     three + 503 ping — the SPA renders empty states, not broken pages
+#   → GET / serves the SPA with the Jobs table (jobs-tbody), Audit mono tail + event chips
+#     (audit-chips/audit-log) and Settings rows (settings-list); app.js polls /api/jobs, /api/audit,
+#     /api/settings every 2 s on the active view
 ```
 
 What exists:
@@ -110,21 +123,27 @@ src/turbochickens/
 ├── __main__.py            # python -m turbochickens → CLI
 ├── util.py                # utcnow / utcnow_iso (UTC, ms precision, Z suffix)
 ├── settings.py            # Settings (Pydantic, extra=forbid) + load_settings(); defaults below;
-│                          # spec 12: coop_enabled/coop_host/coop_port/coop_auth_token + coop_url
+│                          # spec 12: coop_enabled/coop_host/coop_port/coop_auth_token + coop_url;
+│                          # spec 13: public_dict() — effective settings for the GUI, coop_auth_token omitted
 ├── coop.py                # spec 12: CoopServer — aiohttp HTTP server inside the daemon's event loop;
 │                          # /api/ping (unauthenticated healthcheck) + /api/status (bearer unless loopback+
 │                          # no token; ephemeral token minted+printed once when non-loopback and none
-│                          # configured); static SPA at /; transport seam = client.request_async over the
+│                          # configured); spec 13: /api/jobs + /api/audit?limit=&event= + /api/settings —
+│                          # thin mirrors of the socket ops, 200 {daemon.up=false} when the socket is dead;
+│                          # static SPA at /; transport seam = client.request_async over the
 │                          # daemon socket (web layer never opens DB/artifacts); pure coop_auth() seam
 │   └── coop_static/       # the dependency-free SPA (index.html + app.js + styles.css + lucide icons as
 │                          # local SVGs, no build step, no runtime CDN): 240px sidebar shell, wordmark +
 │                          # egg dot, nav, login card (sessionStorage bearer, no cookies), Dashboard with
-│                          # stat row + pulsing flock diagram, 2 s polling, flash-on-change, daemon-down
-│                          # banner — built to specs/00-design-system.md
+│                          # stat row + pulsing flock diagram, spec 13: Jobs table, Audit mono tail with
+│                          # event-type chips, Settings read-only rows — each view polls its /api/* every
+│                          # 2 s, flash-on-change, daemon-down banner + per-view empty states — built to
+│                          # specs/00-design-system.md
 ├── storage.py             # init_db(): full MVP SQLite schema + `schedules` table (spec 06) +
 │                          # `job_usage_stats` percentile columns (spec 08, schema_version=3, with
 │                          # in-place migration of v2 DBs) + append-only triggers + schema_meta
-├── audit.py               # AuditLog: append-only JSONL (open "a" only, fsync per row) — never TTL-deleted
+├── audit.py               # AuditLog: append-only JSONL (open "a" only, fsync per row) — never TTL-deleted;
+│                          # spec 13: tail(limit, event) — last N rows newest first, defensive read
 ├── stats.py               # spec 08 pure seam: percentile (linear interpolation) + rollup_usage
 │                          # (n, mean/p50/p95 tokens in/out/total over a job's finished runs)
 ├── retention.py           # spec 08: sweep_expired_results — deletes on-disk result/quarantine
@@ -162,7 +181,9 @@ src/turbochickens/
 ├── daemon.py              # Daemon: asyncio process, Unix socket, JSON-lines ops
 │                          # ping/status/shutdown/enqueue/runs_list/runs_show/runs_logs/results_get/
 │                          # schedule_add/schedule_list/schedule_rm (spec 06)/stats_list/stats_show/
-│                          # retention_sweep (spec 08); admission-control scheduler (over-budget
+│                          # retention_sweep (spec 08)/jobs_list/audit_tail/settings_get (spec 13,
+│                          # read-only GUI ops; settings_get never includes the coop token);
+│                          # admission-control scheduler (over-budget
 │                          # backlogs, never rejects); a firing cron submits enqueue trigger=cron over
 │                          # the daemon's own socket; retention sweep at startup + hourly (spec 08);
 │                          # results_get reports expired artifacts; status carries a retention block
@@ -227,6 +248,12 @@ tests/
 │                          # token never in status/audit, ephemeral token printed once, shutdown tears HTTP
 │                          # down, coop-disabled status block, daemon-down payload via dead-socket transport),
 │                          # and subprocess e2e of `tc coop start` (open + non-loopback ephemeral-token modes)
+└── test_coop_views.py     # spec 13: the jobs_list/audit_tail/settings_get socket ops standalone (empty →
+                           # registered after enqueue, newest-first tail, event filter, limit bounds,
+                           # token never served), AuditLog.tail pure seam, HTTP parity with the socket ops
+                           # (/api/jobs, /api/audit?limit=&event=, /api/settings), auth-required mode,
+                           # empty-state + filter behaviour over HTTP, dead-socket daemon-down payloads,
+                           # and the served SPA markup for the three views
 ├── test_api_adapter.py    # spec 05: providers seam, MistralAPIAdapter contract seam (MockTransport:
                            # JSON-mode shape, exp backoff on 429/5xx, no retry on 4xx, Retry-After,
                            # timeout, missing credential), e2e via daemon thread + subprocess against
@@ -491,7 +518,34 @@ Spec-12 deliverables, concretely:
 | 10 | Model discovery (`tc models list`) | **done** (2026-11-12) | 05 |
 | 11 | TurboChickens GUI in the coop container (parent spec) | in progress — skeleton slice landed via 12 | 02–08 |
 | 12 | Coop skeleton: daemon serves GUI (HTTP + auth + shell + Dashboard) | **done** (2026-11-12) | — |
-| 13 | Jobs / Audit / Settings views (read-only socket ops) | ready-for-agent | 12 |
+
+Spec-13 deliverables, concretely:
+
+- **Socket ops** (`daemon.py`): `jobs_list` (registered rows of the append-only `job_specs` table:
+  `job_id`, `name`, `spec_hash`, `registered_at`), `audit_tail` (last N rows of the audit log, newest
+  first, optional `event` filter; `limit` defaults to 100, must be an int in 1..1000 — otherwise an
+  error response; read-only, the log stays append-only), `settings_get` (the effective settings via
+  `Settings.public_dict()` plus the `coop` status block — `coop_auth_token` is never included).
+  `AuditLog.tail(limit, event)` (audit.py) is the defensive read seam: blank/torn lines skipped,
+  newest-first slice.
+- **HTTP mirrors** (`coop.py`): `GET /api/jobs`, `GET /api/audit?limit=&event=`, `GET /api/settings` —
+  thin mirrors over the transport seam (`_mirror` helper), identical payloads to the socket ops under
+  the same auth rules as spec 12 (401 without bearer when required; `/api/ping` stays open; non-integer
+  `limit` → 400). When the daemon socket is unreachable all three answer 200 with
+  `{ok: false, daemon: {up: false}, error}` so the SPA renders empty states, not broken pages.
+- **SPA** (`coop_static/`): Jobs view = surface table (job, mono spec hash truncated with the full
+  `sha256:…` in the title, registered-at); Audit view = event-type filter chips (built from an
+  unfiltered tail) + mono log tail, newest first, `?event=` filter on the rows; Settings view =
+  read-only label/value rows of the effective settings incl. the coop line. Each view polls its
+  `/api/*` endpoint every 2 s while active, flashes its card once on change, and renders a clear
+  daemon-down/empty state. Built to `specs/00-design-system.md` (mono data, muted labels, surface
+  panels, chips are outlined — the one filled yolk button per view stays reserved).
+- **Tests** (`test_coop_views.py`, 13): socket ops standalone (empty → registered after `enqueue`;
+  newest-first tail vs the on-disk log; event filter; limit bounds; `settings_get` contents and token
+  absence), the `AuditLog.tail` pure seam (incl. a torn final line), HTTP/socket payload parity for
+  all three mirrors, auth-required mode (401/200), empty-state and filter behaviour over HTTP,
+  dead-socket daemon-down payloads (200 structured + 503 ping), and the served SPA markup.
+| 13 | Jobs / Audit / Settings views (read-only socket ops) | **done** (2026-11-12) | 12 |
 | 14 | Runs from the GUI (trigger, watch, results/quarantine) | ready-for-agent | 12 |
 | 15 | Upload + validate job specs from the browser | ready-for-agent | 14 |
 | 16 | Schedules from the GUI | ready-for-agent | 12, 13 |
@@ -571,11 +625,16 @@ in the SPA, no cookies), the design-system shell (240px sidebar, wordmark + egg
 dot, nav, login card) and the Dashboard (stat row + flock diagram, 2 s polling)
 per `specs/00-design-system.md`; `tc coop start` runs the same thing locally.
 
-Next backlog item is **spec 13** (Jobs / Audit / Settings views — the three new
-read-only socket ops `jobs_list` / `audit_tail` / `settings_get` plus their
-`/api` mirrors), then 14–18, with **spec 19** (auth & access management UI)
-queued behind 12. The MVP spec pipeline (01–10) is complete; what remains
-beyond the GUI is the post-MVP roadmap in baseline §13.
+Spec 13 (Jobs / Audit / Settings views) landed: the read-only socket ops
+`jobs_list` / `audit_tail` / `settings_get` plus their `/api` mirrors
+(`/api/jobs`, `/api/audit?limit=&event=`, `/api/settings`) and the SPA views
+(Jobs table, Audit mono tail with event-type chips, Settings rows, each polling
+every 2 s with daemon-down/empty states).
+
+Next backlog item is **spec 14** (Runs from the GUI), then 15–18, with
+**spec 19** (auth & access management UI) queued behind 12. The MVP spec
+pipeline (01–10) is complete; what remains beyond the GUI is the post-MVP
+roadmap in baseline §13.
 
 **Deferred (backlog notes):**
 - *Async seat broker:* `SeatBroker` does its HTTP synchronously (httpx.Client)

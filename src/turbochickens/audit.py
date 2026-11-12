@@ -41,3 +41,22 @@ class AuditLog:
                 if line:
                     rows.append(json.loads(line))
         return rows
+
+    def tail(self, limit: int, event: str | None = None) -> list[dict[str, Any]]:
+        """Last `limit` rows, newest first, optionally filtered by event type
+        (spec 13 `audit_tail`). Defensive read: blank or unparseable lines (e.g.
+        a torn final line after a crash) are skipped, never fatal."""
+        rows: list[dict[str, Any]] = []
+        if self.path.exists():
+            with open(self.path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event is None or row.get("event") == event:
+                        rows.append(row)
+        return rows[-limit:][::-1] if limit > 0 else []

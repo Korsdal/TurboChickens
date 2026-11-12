@@ -94,6 +94,32 @@ class Settings(BaseModel):
             return self.weight_budget_override
         return default_weight_budget()
 
+    def public_dict(self) -> dict:
+        """The effective settings as served to the GUI (spec 13 `settings_get`).
+
+        Every field except secrets: `coop_auth_token` is deliberately omitted —
+        it is never served, printed (beyond the one-time startup line), logged,
+        or audited. Paths are included as strings so the payload is JSON-safe.
+        """
+        return {
+            "data_dir": str(self.data_dir),
+            "socket_path": str(self.socket_path),
+            "db_path": str(self.db_path),
+            "audit_log_path": str(self.audit_log_path),
+            "results_dir": str(self.results_dir),
+            "quarantine_dir": str(self.quarantine_dir),
+            "seats_dir": str(self.seats_dir),
+            "providers_path": str(self.providers_path) if self.providers_path else None,
+            "weight_budget_override": self.weight_budget_override,
+            "weight_budget": self.weight_budget,
+            "audit_retention": self.audit_retention,
+            "results_retention_months": self.results_retention_months,
+            "coop_enabled": self.coop_enabled,
+            "coop_host": self.coop_host,
+            "coop_port": self.coop_port,
+            "coop_url": self.coop_url,
+        }
+
 
 def default_weight_budget() -> int:
     """max(1, min(vCPU, floor(RAM_GB / 1.5))) — Linux MVP."""

@@ -7,6 +7,8 @@
   const TOKEN_KEY = "tc.coop.token";
   const POLL_MS = 2000;
   const VIEWS = ["dashboard", "runs", "jobs", "schedules", "stats", "audit", "settings"];
+  /* views with a live /api loader (runs/schedules/stats land in specs 14/16/17) */
+  const VIEW_LOADERS = { dashboard: loadStatus, jobs: loadJobs, audit: loadAudit, settings: loadSettings };
 
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -14,6 +16,7 @@
   let token = sessionStorage.getItem(TOKEN_KEY);
   let pollTimer = null;
   let lastStats = {};
+  let auditFilter = null; // active event-type filter chip, null = all
 
   /* --- API --- */
 
@@ -95,8 +98,12 @@
       if (a.dataset.view === view) a.setAttribute("aria-current", "page");
       else a.removeAttribute("aria-current");
     });
-    if (view === "dashboard") startPolling();
-    else stopPolling();
+    stopPolling();
+    const loader = VIEW_LOADERS[view];
+    if (loader) {
+      loader();
+      pollTimer = setInterval(loader, POLL_MS);
+    }
   }
 
   window.addEventListener("hashchange", () => {
@@ -105,15 +112,48 @@
 
   /* --- dashboard --- */
 
-  function startPolling() {
-    stopPolling();
-    loadStatus();
-    pollTimer = setInterval(loadStatus, POLL_MS);
-  }
-
   function stopPolling() {
     if (pollTimer !== null) clearInterval(pollTimer);
     pollTimer = null;
+  }
+
+  /* --- shared view helpers --- */
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function flashCard(card) {
+    card.classList.remove("flash");
+    void card.offsetWidth; /* restart the one-shot flash */
+    card.classList.add("flash");
+  }
+
+  /* A payload is "down" when the network failed or the mirror reported the
+     daemon socket unreachable — the view then renders its empty state. */
+  function payloadDown(data) {
+    return !data || data.__networkError || data.ok === false || (data.daemon && data.daemon.up === false);
+  }
+
+  function showEmpty(emptySel, cardSel, msg) {
+    const card = $(cardSel);
+    const empty = $(emptySel);
+    if (card) card.hidden = true;
+    if (empty) {
+      empty.hidden = false;
+      const p = empty.querySelector("p");
+      if (p && msg) p.textContent = msg;
+    }
+  }
+
+  function showCard(emptySel, cardSel) {
+    const card = $(cardSel);
+    const empty = $(emptySel);
+    if (empty) empty.hidden = true;
+    if (card) card.hidden = false;
   }
 
   function fmtUptime(sec) {
@@ -195,6 +235,149 @@
     setDiagram("#dg-queue", data.queue_depth != null ? data.queue_depth : 0);
     setDiagram("#dg-schedules", data.schedules != null ? data.schedules : 0);
     setDiagram("#dg-inflight", inFlight.length);
+  }
+
+  /* --- jobs view (spec 13): registered specs table --- */
+
+  function shortHash(hash) {
+    const full = "sha256:" + hash;
+    return full.length > 27 ? full.slice(0, 27) + "…" : full;
+  }
+
+  async function loadJobs() {
+    const data = await api("/api/jobs");
+    if (data === null) return; /* 401 → login view shown */
+    if (payloadDown(data)) {
+      showEmpty("#jobs-empty", "#jobs-card", "Jobs unavailable — " + (data.error || "the supervisor is not reachable") + ".");
+      return;
+    }
+    const jobs = data.jobs || [];
+    if (!jobs.length) {
+      showEmpty("#jobs-empty", "#jobs-card", "No registered jobs yet — run tc run <job.toml> once to register one.");
+      return;
+    }
+    showCard("#jobs-empty", "#jobs-card");
+    const tbody = $("#jobs-tbody");
+    const card = $("#jobs-card");
+    const sig = JSON.stringify(jobs);
+    if (tbody.dataset.sig !== sig) {
+      tbody.dataset.sig = sig;
+      tbody.replaceChildren();
+      for (const j of jobs) {
+        const tr = el("tr");
+        tr.appendChild(el("td", "mono job-name", j.name));
+        const hashTd = el("td", "mono hash", shortHash(j.spec_hash));
+        hashTd.title = "sha256:" + j.spec_hash;
+        tr.appendChild(hashTd);
+        tr.appendChild(el("td", "mono muted", j.registered_at || "—"));
+        tbody.appendChild(tr);
+      }
+      flashCard(card);
+    }
+  }
+
+  /* --- audit view (spec 13): mono tail, newest first, event filter chips --- */
+
+  function renderAuditChips(types) {
+    const row = $("#audit-chips");
+    row.replaceChildren();
+    const mk = (label, value) => {
+      const b = el("button", "chip", label);
+      b.type = "button";
+      b.setAttribute("aria-pressed", String(auditFilter === value));
+      b.addEventListener("click", () => {
+        auditFilter = value;
+        renderAuditChips(types);
+        loadAudit();
+      });
+      row.appendChild(b);
+    };
+    mk("all", null);
+    for (const t of types) mk(t, t);
+  }
+
+  function auditLine(row) {
+    const line = el("div", "log-line mono");
+    line.appendChild(el("span", "ts", row.ts || "—"));
+    line.appendChild(el("span", "ev", row.event || "?"));
+    const rest = { ...row };
+    delete rest.ts;
+    delete rest.event;
+    line.appendChild(el("span", "detail", JSON.stringify(rest)));
+    return line;
+  }
+
+  async function loadAudit() {
+    // chips always come from an unfiltered tail; rows honor the active filter
+    const chipData = await api("/api/audit?limit=200");
+    if (chipData === null) return; /* 401 → login view shown */
+    const types = [...new Set((chipData.events || []).map((e) => e.event).filter(Boolean))].sort();
+    renderAuditChips(types);
+    const data = auditFilter
+      ? await api("/api/audit?limit=100&event=" + encodeURIComponent(auditFilter))
+      : chipData;
+    if (data === null) return;
+    if (payloadDown(data)) {
+      showEmpty("#audit-empty", "#audit-card", "Audit unavailable — " + (data.error || "the supervisor is not reachable") + ".");
+      return;
+    }
+    const events = data.events || [];
+    if (!events.length) {
+      showEmpty("#audit-empty", "#audit-card", auditFilter ? "No audit events of type '" + auditFilter + "' yet." : "The audit log is empty.");
+      return;
+    }
+    showCard("#audit-empty", "#audit-card");
+    const log = $("#audit-log");
+    const card = $("#audit-card");
+    const sig = JSON.stringify(events);
+    if (log.dataset.sig !== sig) {
+      log.dataset.sig = sig;
+      log.replaceChildren();
+      for (const e of events) log.appendChild(auditLine(e));
+      flashCard(card);
+    }
+  }
+
+  /* --- settings view (spec 13): read-only rows of the effective settings --- */
+
+  async function loadSettings() {
+    const data = await api("/api/settings");
+    if (data === null) return; /* 401 → login view shown */
+    if (payloadDown(data)) {
+      showEmpty("#settings-empty", "#settings-card", "Settings unavailable — " + (data.error || "the supervisor is not reachable") + ".");
+      return;
+    }
+    const s = data.settings || {};
+    const coop = s.coop || {};
+    const rows = [
+      ["data_dir", s.data_dir],
+      ["socket_path", s.socket_path],
+      ["db_path", s.db_path],
+      ["audit_log_path", s.audit_log_path],
+      ["results_dir", s.results_dir],
+      ["quarantine_dir", s.quarantine_dir],
+      ["seats_dir", s.seats_dir],
+      ["providers_path", s.providers_path || "—"],
+      ["weight_budget", String(s.weight_budget) + (s.weight_budget_override != null ? " (override)" : " (derived)")],
+      ["audit_retention", s.audit_retention],
+      ["results_retention_months", s.results_retention_months != null ? s.results_retention_months + " months" : "—"],
+      ["coop", coop.enabled ? coop.url + " · auth " + (coop.auth_required ? "required" : "open") : "disabled"],
+    ];
+    showCard("#settings-empty", "#settings-card");
+    const list = $("#settings-list");
+    const card = $("#settings-card");
+    const sig = JSON.stringify(rows);
+    if (list.dataset.sig !== sig) {
+      list.dataset.sig = sig;
+      list.replaceChildren();
+      for (const [k, v] of rows) {
+        const row = el("div", "settings-row");
+        row.appendChild(el("dt", null, k));
+        row.appendChild(el("dd", null, v == null ? "—" : String(v)));
+        list.appendChild(row);
+      }
+      flashCard(card);
+    }
   }
 
   /* restart the diagram pulses on hover (CSS restarts on a new animation-name) */

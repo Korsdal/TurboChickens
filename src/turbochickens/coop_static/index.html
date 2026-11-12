@@ -126,10 +126,18 @@
           <header class="view-header" data-enter>
             <div>
               <h2 id="jobs-heading">Jobs</h2>
-              <p class="intro">Registered job specs, validated uploads.</p>
+              <p class="intro">Registered job specs and their spec hashes.</p>
             </div>
           </header>
-          <div class="card empty-state"><p>Job upload and validation from the browser land next — <span class="mono">tc jobs validate</span> works today.</p></div>
+          <div class="card table-card" id="jobs-card" hidden>
+            <table class="data-table">
+              <thead>
+                <tr><th scope="col">Job</th><th scope="col">Spec hash</th><th scope="col">Registered at</th></tr>
+              </thead>
+              <tbody id="jobs-tbody"></tbody>
+            </table>
+          </div>
+          <div class="card empty-state" id="jobs-empty"><p>No registered jobs yet — run <span class="mono">tc run &lt;job.toml&gt;</span> once to register one.</p></div>
         </section>
 
         <section class="view" id="view-schedules" hidden aria-labelledby="schedules-heading">
@@ -156,10 +164,14 @@
           <header class="view-header" data-enter>
             <div>
               <h2 id="audit-heading">Audit</h2>
-              <p class="intro">The append-only event log, newest first.</p>
+              <p class="intro">The append-only event log, newest first — polling every 2&nbsp;s.</p>
             </div>
+            <div class="view-actions chip-row" id="audit-chips" role="group" aria-label="Filter by event type"></div>
           </header>
-          <div class="card empty-state"><p>The audit tail from the browser lands next — the log itself stays append-only under the data dir.</p></div>
+          <div class="card log-card" id="audit-card" hidden>
+            <div class="log" id="audit-log"></div>
+          </div>
+          <div class="card empty-state" id="audit-empty"><p>The audit log is empty.</p></div>
         </section>
 
         <section class="view" id="view-settings" hidden aria-labelledby="settings-heading">
@@ -169,7 +181,10 @@
               <p class="intro">The effective settings, read-only.</p>
             </div>
           </header>
-          <div class="card empty-state"><p>The settings view lands next — <span class="mono">tc status</span> prints the same fields today.</p></div>
+          <div class="card settings-card" id="settings-card" hidden>
+            <dl class="settings-list" id="settings-list"></dl>
+          </div>
+          <div class="card empty-state" id="settings-empty"><p>Settings unavailable.</p></div>
         </section>
       </div>
     </main>
