@@ -66,6 +66,12 @@ class Settings(BaseModel):
         return self.data_dir / "quarantine"
 
     @property
+    def seats_dir(self) -> Path:
+        """Seat/subscription auth sessions (spec 09) — secrets at rest, kept
+        out of job specs and the audit log; files are created 0600."""
+        return self.data_dir / "seats"
+
+    @property
     def weight_budget(self) -> int:
         """Effective resource-weight budget (baseline v0.2, decision 2)."""
         if self.weight_budget_override is not None:

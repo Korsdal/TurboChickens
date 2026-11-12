@@ -24,11 +24,13 @@ from turbochickens.adapter import (
     HarnessResult,
     RunContext,
     TeardownReport,
+    auth_telemetry_of,
     make_adapter,
     sanitize_log_line,
 )
 from turbochickens.audit import AuditLog
 from turbochickens.providers import ProvidersConfig, ProvidersError, load_providers
+from turbochickens.seat import SeatBroker
 from turbochickens.settings import Settings
 from turbochickens.spec.loader import load_spec
 from turbochickens.spec.model import JobSpec
@@ -51,11 +53,16 @@ class RunPipeline:
         db: sqlite3.Connection,
         audit: AuditLog,
         providers: ProvidersConfig | None = None,
+        credential_provider: Any = None,
     ) -> None:
         self.settings = settings
         self.db = db
         self.audit = audit
         self.providers = providers or load_providers(settings.providers_path, settings.data_dir)
+        # spec 09: the credential broker behind the CredentialProvider seam —
+        # seat providers get broker-minted tokens, api-key providers keep the
+        # env-allowlist behavior
+        self.credential_provider = credential_provider or SeatBroker(settings, self.providers)
         self._db_lock = asyncio.Lock()
 
     # --- db helpers -------------------------------------------------------
@@ -153,14 +160,18 @@ class RunPipeline:
         self, spec: JobSpec, usages: list[dict[str, Any]], mean_in: float, mean_out: float
     ) -> float | None:
         """Expected cost per run derived from `providers.toml` pricing for the
-        job's model (cost is predicted telemetry, never a budget). If the
-        model does not resolve (e.g. a vibe-cli harness model), fall back to
-        the mean of the per-run `cost_usd` the harness itself reported."""
+        job's model (cost is predicted telemetry, never a budget). Seat-auth
+        providers (spec 09) bill via the seat, not per token → zero, never a
+        fabricated per-token price. If the model does not resolve (e.g. a
+        vibe-cli harness model), fall back to the mean of the per-run
+        `cost_usd` the harness itself reported."""
         try:
-            _, _, _, profile = self.providers.resolve(spec.harness.model)
+            _, _, provider, profile = self.providers.resolve(spec.harness.model)
         except ProvidersError:
             costs = [float(u["cost_usd"]) for u in usages if isinstance(u.get("cost_usd"), (int, float))]
             return sum(costs) / len(costs) if costs else None
+        if provider.auth == "seat":
+            return 0.0
         return self.providers.cost_usd(profile, int(round(mean_in)), int(round(mean_out)))
 
     async def _rollup_usage_stats(self, job_id: str, spec: JobSpec) -> None:
@@ -207,6 +218,7 @@ class RunPipeline:
         status: str,
         reason: str,
         budget: dict[str, Any],
+        auth: dict[str, Any],
     ) -> dict[str, Any]:
         spec = ctx.spec
         return {
@@ -216,6 +228,8 @@ class RunPipeline:
             "spec_hash": f"sha256:{ctx.spec_hash}",
             "trigger": ctx.trigger,
             "harness": harness,
+            # spec 09: non-secret auth telemetry — mode + token expiry only
+            "auth": auth,
             "resources": {
                 "timeout_sec": spec.resources.timeout_sec,
                 "max_context_mb": spec.resources.max_context_mb,
@@ -246,7 +260,7 @@ class RunPipeline:
         attestation and audit rows."""
         run_id = item["run_id"]
         spec = load_spec(item["spec_path"])
-        adapter = make_adapter(spec, providers=self.providers)
+        adapter = make_adapter(spec, credential_provider=self.credential_provider, providers=self.providers)
         ctx = RunContext(
             run_id=run_id,
             job_id=item["job_id"],
@@ -272,6 +286,9 @@ class RunPipeline:
             "context_exceeded": False,
             "outcome": "ok",
         }
+        # spec 09: auth telemetry for the manifest/audit — mode + token expiry,
+        # never a token. Refreshed from the credential provider when available.
+        auth: dict[str, Any] = auth_telemetry_of(self.credential_provider, ctx)
         try:
             await self._set_status(run_id, "provisioning")
             injected_bytes = self._provision(ctx)
@@ -292,6 +309,17 @@ class RunPipeline:
             else:
                 prepared = adapter.prepare(ctx)
                 harness = prepared.harness
+                auth = prepared.auth or auth
+                # audit the mode per run (non-secret: mode + expiry only)
+                self.audit.append(
+                    {
+                        "event": "auth.resolved",
+                        "run_id": run_id,
+                        "job_id": ctx.job_id,
+                        "mode": auth.get("mode"),
+                        "token_expires_at": auth.get("token_expires_at"),
+                    }
+                )
                 await self._set_status(run_id, "running")
                 result = await adapter.execute(
                     prepared,
@@ -337,7 +365,7 @@ class RunPipeline:
             with contextlib.suppress(Exception):
                 await self._event(run_id, "supervisor", "error", sanitize_log_line(str(e)))
         finally:
-            await self._finalize(item, ctx, harness, result, status, reason, adapter, budget)
+            await self._finalize(item, ctx, harness, result, status, reason, adapter, budget, auth)
 
     async def _finalize(
         self,
@@ -349,11 +377,12 @@ class RunPipeline:
         reason: str,
         adapter: Any,
         budget: dict[str, Any],
+        auth: dict[str, Any],
     ) -> None:
         """Manifest + terminal status + teardown attestation + audit rows.
         Runs for every path out of `execute`, including exceptions."""
         run_id = ctx.run_id
-        manifest = self._manifest(item, ctx, harness, result, status, reason, budget)
+        manifest = self._manifest(item, ctx, harness, result, status, reason, budget, auth)
         # teardown first: destruction is verified, not assumed
         try:
             report: TeardownReport = await adapter.teardown(ctx)
@@ -388,7 +417,16 @@ class RunPipeline:
                 "env_cleared": report.env_cleared,
             }
         )
-        self.audit.append({"event": "run.finished", "run_id": run_id, "job_id": ctx.job_id, "status": status, "reason": reason})
+        self.audit.append(
+            {
+                "event": "run.finished",
+                "run_id": run_id,
+                "job_id": ctx.job_id,
+                "status": status,
+                "reason": reason,
+                "auth_mode": (auth or {}).get("mode"),
+            }
+        )
         await self._event(run_id, "supervisor", "info", f"run {status}: {reason}")
         # spec 08: roll the run's token usage up into the per-job stats
         with contextlib.suppress(Exception):

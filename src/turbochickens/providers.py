@@ -29,9 +29,9 @@ import copy
 import os
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 PROVIDERS_ENVVAR = "TURBOCHICKENS_PROVIDERS"
 DEFAULT_DATA_DIR = Path("~/.turbochickens").expanduser()
@@ -56,13 +56,41 @@ class ModelProfile(BaseModel):
 
 
 class ProviderProfile(BaseModel):
-    """One OpenAI-compatible provider: endpoint, credential env var, models."""
+    """One OpenAI-compatible provider: endpoint, credential env var, models.
+
+    Auth (spec 09): `auth = "api-key"` (default, unchanged spec-05 behavior)
+    injects the `api_key_env` var from the daemon environment. `auth = "seat"`
+    bills via a seat/subscription (OAuth device flow): the credential broker
+    (seat.py) keeps a session under the data dir, mints/refreshes short-lived
+    access tokens, and injects the token under the same `api_key_env` name, so
+    adapters need no seat-specific code. The `oauth_*` fields locate the
+    provider's device-authorization and token endpoints and are required for
+    `auth = "seat"`, rejected for `auth = "api-key"`.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     base_url: str = Field(min_length=1, description="OpenAI-compatible base, e.g. https://api.mistral.ai/v1")
     api_key_env: str = Field(default="MISTRAL_API_KEY", min_length=1)
+    auth: Literal["api-key", "seat"] = "api-key"
+    oauth_device_url: str | None = Field(default=None, description="OAuth device-authorization endpoint (seat auth)")
+    oauth_token_url: str | None = Field(default=None, description="OAuth token endpoint (seat auth)")
+    oauth_client_id: str | None = Field(default=None, description="OAuth client id registered with the provider (seat auth)")
+    oauth_scope: str | None = Field(default=None, description="OAuth scope to request (seat auth)")
     models: dict[str, ModelProfile]
+
+    @model_validator(mode="after")
+    def _check_auth_fields(self) -> "ProviderProfile":
+        oauth_fields = ("oauth_device_url", "oauth_token_url", "oauth_client_id", "oauth_scope")
+        if self.auth == "seat":
+            missing = [f for f in oauth_fields[:3] if not getattr(self, f)]
+            if missing:
+                raise ValueError(f"auth='seat' requires: {', '.join(missing)}")
+        else:
+            present = [f for f in oauth_fields if getattr(self, f)]
+            if present:
+                raise ValueError(f"{', '.join(present)} only valid with auth='seat' (this provider is auth='api-key')")
+        return self
 
 
 class ProvidersConfig(BaseModel):

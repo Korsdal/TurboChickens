@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 08 landed (145/145 tests green, e2e smoke verified).
+**Last updated:** 2026-11-12, after spec 09 landed (166/166 tests green, e2e smoke verified).
 
 ---
 
@@ -26,9 +26,9 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 08 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, and the spec-08 commit).
+**Spec 01 through spec 09 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, and the spec-08 commit; spec 09 in the working tree).
 
-**Spec 09 (seat/subscription auth, no API key) and spec 10 (model discovery — `tc models list` against live provider catalogs) are backlogged** — `specs/09-seat-based-auth.md` and `specs/10-model-discovery.md`, both status ready-for-agent, not started. Both adapters currently require an API key; the vibe-cli harness is limited to vibe's own model catalog (mistral-medium-3.5 only in vibe 3.1.2); see those tickets.
+**Spec 10 (model discovery — `tc models list` against live provider catalogs) is backlogged** — `specs/10-model-discovery.md`, status ready-for-agent, not started. The vibe-cli harness is limited to vibe's own model catalog (mistral-medium-3.5 only in vibe 3.1.2); see that ticket. Note spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough.
 Verified this session:
 
 ```
@@ -65,6 +65,18 @@ Verified this session:
 #   → backdate runs.finished_at 400d, retention_sweep op → result.expired audit row, artifacts dir gone,
 #     append-only results row kept, tc results get <run> → rc 1 "expired"; audit log untouched; tc status
 #     prints retention: audit_log=forever results_retention_months=6; sweep fires automatically on daemon start
+# spec-09 smoke (loopback fake OAuth + fake provider via $TURBOCHICKENS_PROVIDERS, no *_API_KEY in env):
+#   → tc auth login seatco → device flow against fake OAuth server, session stored at
+#     <data_dir>/seats/seatco.json (0600); tc auth status shows mode=seat + expiry, never tokens
+#   → tc run <seatco/seat-model job> --wait → succeeded; provider saw "Bearer seat-access-1";
+#     manifest.auth={mode: seat, token_expires_at: …}, env_keys has SEATCO_TOKEN, no token in manifest/audit;
+#     audit has auth.resolved(mode=seat) + run.finished(auth_mode=seat); usage cost_usd=0.0 billed_via=seat;
+#     stats expected_cost_usd=0.0
+#   → expired session → refresh grant → run succeeds with the NEW bearer token, session rotated on disk
+#   → revoked refresh (400 invalid_grant) → run failed "SeatError … tc auth login seatco", zero API requests,
+#     session file deleted, teardown still attested (1,1,1)
+#   → vibe-cli job with no MISTRAL_API_KEY → succeeded; manifest.auth.mode=none; fake vibe saw home=set,
+#     mistral_api_key=unset (browser-auth profile in ~/.vibe/config.toml is vibe's own mechanism)
 ```
 
 What exists:
@@ -83,20 +95,29 @@ src/turbochickens/
 ├── retention.py           # spec 08: sweep_expired_results — deletes on-disk result/quarantine
 │                          # artifacts older than results_retention_months (calendar months),
 │                          # audit-logs every deletion as result.expired; never touches the audit log
+├── seat.py                # spec 09: SeatBroker — the CredentialProvider impl for providers with
+│                          # auth="seat": OAuth device-flow login (tc auth login), session stored
+│                          # 0600 under <data_dir>/seats/, refresh of expired tokens (fail-closed on
+│                          # revoked), token injected per-run under the provider's api_key_env;
+│                          # auth_telemetry() exposes only mode + token expiry (never tokens)
 ├── adapter.py             # HarnessAdapter Protocol (prepare/execute/teardown) + CredentialProvider
 │                          # extension point + VibeCLIAdapter (headless subprocess pinned to the
 │                          # workspace, sanitized streamed logs) + MistralAPIAdapter (spec 05:
 │                          # OpenAI-compatible HTTP via httpx, JSON mode, exp backoff on 429/5xx)
-│                          # + adapter weights (API 0.25 / CLI 1.0)
+│                          # + adapter weights (API 0.25 / CLI 1.0); PreparedRun carries non-secret
+│                          # auth telemetry (spec 09); seat runs report cost_usd=0.0 billed_via=seat
 ├── providers.py           # spec 05: providers.toml registry — provider/model presets, base_url,
 │                          # credential env var, context_window, per-token pricing; resolution:
 │                          # settings.providers_path > $TURBOCHICKENS_PROVIDERS > <data_dir>/providers.toml
-│                          # > built-in mistral defaults (overlaid per provider)
+│                          # > built-in mistral defaults (overlaid per provider). Spec 09: ProviderProfile
+│                          # gains auth="api-key"|"seat" + oauth_* endpoints (required for seat)
 ├── runner.py              # RunPipeline: lifecycle queued→…→succeeded/failed, fresh workspace +
-│                          # per-run env, manifest (+ spec-07 `budget` outcome block), run_events,
-│                          # spec-04 result store / quarantine at `collecting`, spec-07 context cap
-│                          # at `provisioning`, teardown attestation + audit rows, spec-08 per-job
-│                          # usage-stats rollup at finalize (expected cost from providers.toml pricing)
+│                          # per-run env, manifest (+ spec-07 `budget` outcome block, spec-09 `auth`
+│                          # telemetry block), run_events, spec-04 result store / quarantine at
+│                          # `collecting`, spec-07 context cap at `provisioning`, teardown attestation
+│                          # + audit rows (incl. spec-09 auth.resolved + auth_mode), spec-08 per-job
+│                          # usage-stats rollup at finalize; spec 09: builds the SeatBroker and hands
+│                          # it to make_adapter as the CredentialProvider
 ├── scheduler.py           # spec 06: CronScheduler over APScheduler AsyncIOScheduler; standard
 │                          # POSIX cron semantics (aps_trigger resolves the day-of-week field via
 │                          # croniter because APScheduler numbers 0=Monday); schedules re-registered
@@ -116,7 +137,7 @@ src/turbochickens/
 │   └── loader.py          # load_spec(), SpecValidationError (field-named issues), spec_hash()
 └── cli/main.py            # Typer app `tc`: run [--wait] | runs list/show/logs | results get |
                            # jobs validate | daemon start/stop | status | schedule add/list/rm |
-                           # stats list/show (spec 08)
+                           # stats list/show (spec 08) | auth login/status/logout (spec 09, local)
 tests/
 ├── test_spec_model.py     # pure-function seam: parser/model/hash
 ├── test_cli_validate.py   # CLI seam: tc jobs validate behavior
@@ -140,6 +161,11 @@ tests/
 │                          # migration), stats e2e over socket + CLI (API pricing + vibe-cli cost
 │                          # fallback), retention e2e (backdated runs, result.expired audit rows,
 │                          # quarantine expiry, custom TTL, startup sweep, audit log never deleted)
+├── test_seat_auth.py      # spec 09: provider auth-field seams, SeatStore perms/fail-closed, broker +
+│                          # adapter contract over MockTransport (seat token, refresh, revoked,
+│                          # no session), device flow over loopback fake OAuth, tc auth CLI, and
+│                          # daemon e2e: seat run with no *_API_KEY, expired→refresh, revoked→fail
+│                          # closed, vibe-cli via HOME passthrough
 ├── test_api_adapter.py    # spec 05: providers seam, MistralAPIAdapter contract seam (MockTransport:
                            # JSON-mode shape, exp backoff on 429/5xx, no retry on 4xx, Retry-After,
                            # timeout, missing credential), e2e via daemon thread + subprocess against
@@ -362,6 +388,16 @@ Spec-08 deliverables, concretely:
   on-demand `retention_sweep` socket op; `status` carries a `retention` block; `results_get` /
   `tc results get` report expired artifacts (rc 1) instead of serving them.
 
+Spec-09 deliverables, concretely:
+
+- **Provider profiles** (`providers.py`): `ProviderProfile` gains `auth: "api-key" | "seat"` (default `api-key`, unchanged) plus `oauth_device_url` / `oauth_token_url` / `oauth_client_id` / `oauth_scope`. A validator requires the three OAuth endpoints when `auth = "seat"` and rejects the fields for `api-key`; `extra="forbid"` still rejects unknown keys. Built-in defaults stay `api-key`.
+- **Credential broker** (`seat.py`): `SeatBroker` implements the existing `CredentialProvider` protocol. `tc auth login <provider>` runs the OAuth device flow (prints verification URI + user code, polls the token endpoint with `authorization_pending`/`slow_down` handling) and stores the session via `SeatStore` — one 0600 JSON file per provider under `<data_dir>/seats/` (dir 0700; `Settings.seats_dir`). Sessions are never written to job specs, manifests, or the audit log. Before a run, `credentials()` refreshes an expired token (30s leeway) via the refresh grant and injects the access token under the provider's usual `api_key_env` — so `build_per_run_env`'s allowlist discipline and both adapters are untouched. Fail-closed: no session, unreadable session, or revoked refresh → `SeatError` with a `tc auth login` hint; the run fails before any HTTP request. `auth_telemetry()` exposes only `{mode, token_expires_at}`.
+- **Adapter/runner wiring**: `RunPipeline` builds the broker and passes it to `make_adapter`; `PreparedRun` gains an `auth` block. The run manifest gains top-level `auth: {mode: "api-key"|"seat"|"none", token_expires_at}`; the audit log gains `auth.resolved` (mode + expiry) per run and `auth_mode` on `run.finished`. No token ever appears in either. `mistral-api` sends the seat-derived bearer exactly like an API key; missing credential still fails closed.
+- **vibe-cli**: no code needed — `HOME`/`XDG_CONFIG_HOME` already pass through `BASE_ENV_KEYS`, so a browser-auth provider registered in vibe's own `~/.vibe/config.toml` (`browser_auth_base_url`/`browser_auth_api_base_url`) is used by the vibe binary itself; the manifest records `auth.mode = "none"` when no env credential was injected (e2e-tested with a fake vibe binary).
+- **Cost/stats** (spec 08 intact): seat runs record `usage.cost_usd = 0.0` + `usage.billed_via = "seat"` (never a fabricated per-token price); `job_usage_stats.expected_cost_usd` is 0.0 for seat providers.
+- **CLI**: `tc auth login <provider>` / `tc auth status` / `tc auth logout <provider>` — local (no daemon), never print or log tokens.
+- **Tests** (`test_seat_auth.py`, 21): provider auth-field seams; store round-trip/perms/corrupt-fail-closed; broker + adapter contract over `MockTransport` (seat bearer sent, expired→refresh→new token, revoked→fail closed + session deleted, no session→no request, api-key passthrough unchanged); device flow over a loopback fake OAuth server (auto-approve, pending-then-success, api-key provider rejected); CLI login/status/logout; and four daemon e2e cases over loopback fake OAuth+API servers with no `*_API_KEY` in the environment.
+
 | Spec | Title | Status | Blocked by |
 | --- | --- | --- | --- |
 | 01 | Scaffold + job spec model + `tc jobs validate` | **done** (`f8b8061`) | — |
@@ -373,7 +409,7 @@ Spec-08 deliverables, concretely:
 | 07 | Run budgets: wall-clock hard kill + injected-context cap | **done** (2026-11-12) | 03 |
 | 08 | Usage stats + expected cost + retention TTLs | **done** (2026-11-12) | 04, 05 |
 | 00 | Design system — TurboChickens GUI | **settled** (2026-11-12; governs 12–18) | — |
-| 09 | Seat/subscription auth, no API key | ready-for-agent (backlog) | 05 |
+| 09 | Seat/subscription auth, no API key | **done** (2026-11-12) | 05 |
 | 10 | Model discovery (`tc models list`) | ready-for-agent (backlog) | 05 |
 | 11 | TurboChickens GUI in the coop container (parent spec) | ready-for-agent | 02–08 |
 | 12 | Coop skeleton: daemon serves GUI (HTTP + auth + shell + Dashboard) | ready-for-agent | — |
@@ -439,14 +475,22 @@ tables deliberately excluded).
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 - **Version management is a human responsibility.** Coding agents can bump the
   last part of a version number (`0.0.X`) — every other bump (minor, major) is
-  human initiated. Current version: `0.0.8`.
+  human initiated. Current version: `0.0.9`.
 
-## 7. Next up — all MVP specs landed
+## 7. Next up — spec 10, then the coop GUI roadmap
 
-Spec 08 (usage stats + expected cost + retention TTLs) landed: per-job
-`job_usage_stats` rollups (n, mean/p50/p95 tokens in+out, expected cost per
-run from `providers.toml` pricing) surfaced via `tc stats list/show`, and
-settings-managed retention — result artifacts expire after
-`results_retention_months` (default 6) with every deletion audit-logged as
-`result.expired`, while the audit log is kept forever. The MVP spec pipeline
-(01–08) is complete; what remains is the post-MVP roadmap in baseline §13.
+Spec 09 (seat/subscription auth) landed: providers can declare
+`auth = "seat"` with OAuth endpoints in `providers.toml`; `tc auth login
+<provider>` runs the device flow and stores the session 0600 under
+`<data_dir>/seats/`; the `SeatBroker` credential provider refreshes expired
+tokens before a run and injects them per-run under the provider's `api_key_env`
+(allowlist discipline unchanged); manifests/audit record only the auth mode +
+token expiry; seat usage reports `cost_usd = 0.0` (`billed_via = "seat"`),
+never a fabricated per-token price. vibe-cli needs no key either: a
+browser-auth provider in `~/.vibe/config.toml` is picked up by the vibe binary
+via HOME passthrough.
+
+Next backlog item is **spec 10** (`tc models list` against live provider
+catalogs), then the coop GUI roadmap (specs 11–18, governed by spec 00).
+The MVP spec pipeline (01–09) is complete; what remains beyond 10 is the
+post-MVP roadmap in baseline §13.

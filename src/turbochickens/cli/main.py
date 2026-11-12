@@ -13,7 +13,9 @@ from rich.table import Table
 
 from turbochickens.client import DaemonUnreachable, request
 from turbochickens.daemon import DaemonAlreadyRunning, run_daemon
+from turbochickens.providers import ProvidersError, load_providers
 from turbochickens.runner import TERMINAL_STATES
+from turbochickens.seat import SeatBroker, SeatError
 from turbochickens.settings import SettingsError, load_settings
 from turbochickens.spec.loader import SpecValidationError, load_spec, spec_hash
 
@@ -29,12 +31,14 @@ runs_app = typer.Typer(help="Inspect runs.", no_args_is_help=True)
 results_app = typer.Typer(help="Fetch validated results.", no_args_is_help=True)
 schedule_app = typer.Typer(help="Manage cron schedules.", no_args_is_help=True)
 stats_app = typer.Typer(help="Per-job usage statistics (spec 08).", no_args_is_help=True)
+auth_app = typer.Typer(help="Seat/subscription auth (spec 09) — local, no daemon needed.", no_args_is_help=True)
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(runs_app, name="runs")
 app.add_typer(results_app, name="results")
 app.add_typer(schedule_app, name="schedule")
 app.add_typer(stats_app, name="stats")
+app.add_typer(auth_app, name="auth")
 
 err_console = Console(stderr=True)
 console = Console()
@@ -421,6 +425,74 @@ def stats_show(
     typer.echo(f"tokens_total_p95: {_fmt_stat(s['tokens_p95'])}")
     typer.echo(f"expected_cost_usd_per_run: {_fmt_stat(s['expected_cost_usd'])}")
     typer.echo(f"updated_at: {s['updated_at']}")
+
+
+def _seat_broker(settings_path: Path | None) -> tuple[SeatBroker, object]:
+    """Load settings + providers and build the seat broker (local, no daemon)."""
+    settings = load_settings(settings_path)
+    providers = load_providers(settings.providers_path, settings.data_dir)
+    return SeatBroker(settings, providers), settings
+
+
+@auth_app.command("login")
+def auth_login(
+    provider: str = typer.Argument(..., help="Provider name from providers.toml with auth = \"seat\"."),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Run the OAuth device flow for a seat provider and store the session under the data dir."""
+    try:
+        broker, _ = _seat_broker(settings_path)
+        session = broker.login(provider, notify=typer.echo)
+    except (SettingsError, ProvidersError, SeatError) as e:
+        err_console.print(f"[bold red]error[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+    from turbochickens.seat import _iso
+
+    typer.echo(
+        f"seat session stored for provider '{provider}' "
+        f"(token expires { _iso(session.expires_at) }) — tokens are never printed or logged"
+    )
+
+
+@auth_app.command("status")
+def auth_status(
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Show each provider's auth mode and stored seat session expiry (no tokens)."""
+    try:
+        broker, _ = _seat_broker(settings_path)
+        rows = broker.status()
+    except (SettingsError, ProvidersError, SeatError) as e:
+        err_console.print(f"[bold red]error[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+    if not rows:
+        typer.echo("no providers configured")
+        return
+    for r in rows:
+        line = f"provider={r['provider']}  auth={r['mode']}"
+        if r.get("session"):
+            s = r["session"]
+            line += f"  seat session: expires_at={s['expires_at']} expired={s['expired']}"
+        elif r.get("session_error"):
+            line += f"  seat session: UNREADABLE ({r['session_error']})"
+        elif r["mode"] == "seat":
+            line += "  seat session: none (run `tc auth login " + r["provider"] + "`)"
+        typer.echo(line)
+
+
+@auth_app.command("logout")
+def auth_logout(
+    provider: str = typer.Argument(..., help="Provider whose stored seat session to delete."),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Delete a provider's stored seat session (tokens are removed, not revoked)."""
+    try:
+        broker, _ = _seat_broker(settings_path)
+        broker.logout(provider)
+    except (SettingsError, ProvidersError, SeatError) as e:
+        err_console.print(f"[bold red]error[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+    typer.echo(f"removed seat session for provider '{provider}'")
 
 
 @app.callback()

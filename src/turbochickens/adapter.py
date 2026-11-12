@@ -96,10 +96,15 @@ class RunContext:
 
 @dataclass
 class PreparedRun:
-    """Result of `prepare`: the pinned harness identity plus the per-run env."""
+    """Result of `prepare`: the pinned harness identity plus the per-run env.
+
+    `auth` is non-secret auth telemetry (spec 09): ``{"mode": "api-key" |
+    "seat" | "none", "token_expires_at": iso|None}`` — recorded in the run
+    manifest and audit log; never a token."""
 
     context: RunContext
     harness: dict[str, Any]  # adapter, version, provider, model, temperature
+    auth: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -136,6 +141,26 @@ class EnvAllowlistCredentialProvider:
 
     def credentials(self, run: RunContext) -> dict[str, str]:
         return {k: v for k in self.allowlist if (v := os.environ.get(k)) is not None}
+
+    def auth_telemetry(self, run: RunContext) -> dict[str, Any]:
+        """Spec 09: non-secret auth mode for the manifest/audit. An env
+        credential present → "api-key"; absent → "none" (a subprocess harness
+        like vibe-cli may then use its own profile, e.g. browser auth from
+        ~/.vibe/config.toml, which is outside this platform's knowledge)."""
+        present = any(os.environ.get(k) is not None for k in self.allowlist)
+        return {"mode": "api-key" if present else "none", "token_expires_at": None}
+
+
+def auth_telemetry_of(provider: CredentialProvider, run: RunContext) -> dict[str, Any]:
+    """Best-effort auth telemetry from a credential provider; the default is
+    plain api-key env injection."""
+    tele = getattr(provider, "auth_telemetry", None)
+    if callable(tele):
+        try:
+            return tele(run) or {"mode": "api-key", "token_expires_at": None}
+        except Exception:
+            pass
+    return {"mode": "api-key", "token_expires_at": None}
 
 
 def build_per_run_env(run: RunContext, credentials: dict[str, str]) -> dict[str, str]:
@@ -220,6 +245,10 @@ class VibeCLIAdapter:
                 "model": run.spec.harness.model,
                 "temperature": run.spec.harness.temperature,
             },
+            # spec 09: non-secret auth telemetry (mode + token expiry, never a
+            # token). A seat-configured vibe profile is handled by the vibe
+            # binary itself via HOME passthrough, hence "none" when no env key.
+            auth=auth_telemetry_of(self.credential_provider, run),
         )
 
     async def execute(
@@ -381,6 +410,9 @@ class MistralAPIAdapter:
                 "model": self.model,
                 "temperature": run.spec.harness.temperature,
             },
+            # spec 09: "seat" providers inject the broker's access token under
+            # api_key_env (same var), so the bearer header below is unchanged
+            auth=auth_telemetry_of(self.credential_provider, run),
         )
 
     def _messages(self, run: RunContext) -> list[dict[str, str]]:
@@ -528,9 +560,15 @@ class MistralAPIAdapter:
         tokens_in = int(usage_raw.get("prompt_tokens", 0) or 0)
         tokens_out = int(usage_raw.get("completion_tokens", 0) or 0)
         usage: dict[str, Any] = {"tokens_in": tokens_in, "tokens_out": tokens_out}
-        cost = self.providers.cost_usd(self.model_profile, tokens_in, tokens_out)
-        if cost > 0:
-            usage["cost_usd"] = round(cost, 6)
+        if self.provider.auth == "seat":
+            # spec 09: seat billing is not per-token — report zero cost plus
+            # seat-pool telemetry, never a fabricated per-token price
+            usage["cost_usd"] = 0.0
+            usage["billed_via"] = "seat"
+        else:
+            cost = self.providers.cost_usd(self.model_profile, tokens_in, tokens_out)
+            if cost > 0:
+                usage["cost_usd"] = round(cost, 6)
         await event_sink(
             "harness", "info", f"provider http 200: tokens_in={tokens_in} tokens_out={tokens_out}"
         )

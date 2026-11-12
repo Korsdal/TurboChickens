@@ -43,3 +43,25 @@ json_mode = true
 # input_usd_per_mtok = 1.0
 # output_usd_per_mtok = 3.0
 # json_mode = true
+
+# Example: seat/subscription auth (spec 09) instead of an API key. Declare
+# auth = "seat" plus the OAuth endpoints, run `tc auth login <provider>` once
+# (device flow — the session is stored under <data_dir>/seats/, 0600), and
+# runs get a broker-minted bearer token with no *_API_KEY in the environment.
+# Seat usage reports cost_usd = 0.0 (billed via the seat), never a fabricated
+# per-token price.
+#
+# [providers.lechat]
+# base_url = "https://api.mistral.ai/v1"
+# api_key_env = "MISTRAL_API_KEY"   # the seat access token is injected under this name
+# auth = "seat"
+# oauth_device_url = "https://auth.mistral.ai/oauth/device/authorize"
+# oauth_token_url = "https://auth.mistral.ai/oauth/token"
+# oauth_client_id = "your-registered-client-id"
+# oauth_scope = "openid profile"
+#
+# [providers.lechat.models.mistral-large-latest]
+# context_window = 256000
+# input_usd_per_mtok = 0.0
+# output_usd_per_mtok = 0.0
+# json_mode = true
