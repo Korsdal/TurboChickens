@@ -69,6 +69,20 @@
             <div class="card stat"><span class="stat-label">Schedules</span><span class="stat-value mono" data-stat="schedules">—</span></div>
             <div class="card stat"><span class="stat-label">Retention</span><span class="stat-value mono stat-value-small" data-stat="retention">—</span></div>
           </div>
+          <div class="card retention-card" id="retention-card">
+            <div class="retention-head">
+              <div>
+                <h3>Retention</h3>
+                <p class="muted" id="retention-summary">—</p>
+              </div>
+              <button type="button" class="btn btn-primary" id="sweep-now">Sweep now</button>
+            </div>
+            <p class="field-error view-error" id="sweep-error" hidden></p>
+            <div class="sweep-outcome" id="sweep-outcome" hidden>
+              <p class="muted" id="sweep-summary"></p>
+              <ul class="mono sweep-list" id="sweep-list"></ul>
+            </div>
+          </div>
           <div class="card diagram-card" id="diagram-card">
             <div class="diagram-head">
               <h3>The flock</h3>
@@ -253,10 +267,18 @@
           <header class="view-header" data-enter>
             <div>
               <h2 id="stats-heading">Stats</h2>
-              <p class="intro">Per-job usage and expected cost per run.</p>
+              <p class="intro">Per-job usage and expected cost per run — polling every 2&nbsp;s.</p>
             </div>
           </header>
-          <div class="card empty-state"><p>Stats from the browser land next — <span class="mono">tc stats list</span> works today.</p></div>
+          <div class="stats-grid" id="stats-grid" hidden></div>
+          <div class="card empty-state" id="stats-empty"><p>No usage stats yet — run a job to completion and its rollup lands here.</p></div>
+          <div class="card detail-card stats-detail" id="stats-detail" hidden>
+            <div class="detail-head">
+              <span class="mono detail-title" id="stats-detail-title">job</span>
+              <button type="button" class="linklike" id="stats-detail-close">Close</button>
+            </div>
+            <dl class="settings-list" id="stats-detail-list"></dl>
+          </div>
         </section>
 
         <section class="view" id="view-audit" hidden aria-labelledby="audit-heading">

@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 16 landed (259/259 tests green, e2e smoke verified).
+**Last updated:** 2026-11-12, after spec 18 landed (272/272 tests green, coop container smoke verified on a real Docker daemon).
 
 ---
 
@@ -26,7 +26,7 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10 and specs 12–16 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, and the spec-16 commit). Spec 11 is the parent GUI spec; its first five slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules) are landed, the rest of its stories land via specs 17–18.
+**Spec 01 through spec 10 and specs 12–18 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, and the spec-18 commit). Spec 11 is the parent GUI spec; its first six slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
 
 **Spec 19 (auth & access management UI) is backlogged** — `specs/19-auth-access-management-ui.md`, status ready-for-agent, not started. Note spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality.
 Verified this session:
@@ -159,6 +159,32 @@ Verified this session:
 #   → GET / serves the Schedules view (sched-form with spec select + "Add schedule" primary button,
 #     sched-error inline error, schedules table with mono cron + next run + per-row Remove, empty
 #     state); app.js polls /api/schedule + /api/jobs every 2 s, flash on change; no host paths in assets
+# spec-17 smoke (temp settings, coop_enabled=true, `tc coop start` subprocess, fake vibe binary):
+#   → POST /api/runs → succeeded → GET /api/stats == socket stats_list (n=1, tokens_in p95=12,
+#     tokens_out p95=34, tokens_total_p95=46, expected_cost_usd=0.001 fallback); GET /api/stats/<job>
+#     == stats_show; unknown job → 404 "no usage stats"; `tc stats list/show` print the same numbers
+#   → backdate runs.finished_at 7-8 months → POST /api/retention/sweep → 200 {ok, deleted, expired[]}
+#     with kind=result/quarantine; artifacts dirs gone; audit result.expired per deletion; results rows
+#     kept append-only; re-sweep → deleted=0; GET /api/results/<run> → 200 {ok:false, expired:true},
+#     payload never served; `tc results get` rc 1 expired; status.retention.last_sweep carries the outcome
+#   → auth-required mode: /api/stats|/api/stats/{job}|/api/retention/sweep → 401 without bearer, 200/404
+#     with; /api/ping open; dead-socket transport → 200 {ok:false, daemon.up=false} on all three (POST
+#     included, never 500)
+#   → GET / serves the Stats view (stats-grid cards + stats-empty + stats-detail) and the Dashboard
+#     retention card (retention-summary + "Sweep now" + sweep-outcome/sweep-list of result.expired
+#     entries); app.js polls /api/stats every 2 s, loadStatsDetail uses /api/stats/{job}, flash on
+#     change; no host paths in assets
+# spec-18 smoke (real Docker daemon this session): docker build -t coop . → image built from
+#   Dockerfile + .dockerignore; docker run -p 8737:8737 -v coop-data:/data coop → container
+#   healthy (HEALTHCHECK GET http://127.0.0.1:8737/api/ping), GET / serves TurboChickens,
+#   exactly one "coop auth token:" line in docker logs per start; /api/ping 200 unauthenticated,
+#   /api/status 401 without bearer / 200 with bearer (token never in the payload or audit log)
+#   → POST /api/jobs/validate {files} → stored under /data/uploads/<job>-<hash>/; POST /api/runs
+#   → run succeeded; GET /api/results/<run> → 200 validated JSON; POST /api/schedule → smoke-cron
+#   with live next_run; docker rm -f coop + re-run on the same coop-data volume → healthy again,
+#   fresh ephemeral token printed once, jobs + runs + result + schedule all still there over HTTP
+#   and via `docker exec coop tc schedule list` / `tc runs list`; docker compose -f
+#   docker/compose.yaml config → valid
 ```
 
 What exists:
@@ -191,7 +217,11 @@ src/turbochickens/
 │                          # spec_path or {files} bundle → store+validate+schedule_add; 200 ok / 422
 │                          # daemon-refused with the inline error / 413 cap / 400 malformed), DELETE
 │                          # /api/schedule/{job_id} (schedule_rm; 404 unknown job) — 200 {daemon.up=false}
-│                          # when the socket is dead on all three
+│                          # when the socket is dead on all three;
+│                          # spec 17: GET /api/stats (stats_list mirror), GET /api/stats/{job_id}
+│                          # (stats_show mirror; 404 "no usage stats" when the job has none), POST
+│                          # /api/retention/sweep (retention_sweep; 200 with the expired/deleted
+│                          # summary, 422 refused, 200 {daemon.up=false} when the socket is dead)
 │   └── coop_static/       # the dependency-free SPA (index.html + app.js + styles.css + lucide icons as
 │                          # local SVGs, no build step, no runtime CDN): 240px sidebar shell, wordmark +
 │                          # egg dot, nav, login card (sessionStorage bearer, no cookies), Dashboard with
@@ -207,8 +237,13 @@ src/turbochickens/
 │                          # Validate→"Run job" button that re-POSTs the bundle to /api/runs);
 │                          # spec 16: Schedules view (pick-a-spec select fed by /api/jobs' spec_path +
 │                          # one "Add schedule" primary button + inline error, table with mono cron +
-│                          # live next_run + per-row Remove, 2 s polling) — built to
-│                          # specs/00-design-system.md
+│                          # live next_run + per-row Remove, 2 s polling);
+│                          # spec 17: Stats view (per-job cards from /api/stats — n, mean/p50/p95 tokens
+│                          # in+out, total p95, expected cost per run — card click opens a detail card
+│                          # from /api/stats/{job}, 2 s polling, flash on change) + Dashboard retention
+│                          # card ("Sweep now" primary button → POST /api/retention/sweep, outcome lists
+│                          # the result.expired entries inline; last sweep also shown from
+│                          # status.retention.last_sweep) — built to specs/00-design-system.md
 ├── storage.py             # init_db(): full MVP SQLite schema + `schedules` table (spec 06) +
 │                          # `job_usage_stats` percentile columns (spec 08, schema_version=3→4 migration)
 │                          # + `job_specs.spec_path` (spec 16, schema_version=4, in-place ALTER migration
@@ -359,6 +394,21 @@ tests/
                            # socket parity, auth 401s, dead-socket daemon-down payloads), served SPA upload
                            # form + no host paths in assets, and a subprocess e2e creating + running a
                            # brand-new job entirely over HTTP with the fake vibe binary
+└── test_coop_stats.py     # spec 17: GET /api/stats + /api/stats/{job} + POST /api/retention/sweep against a
+                           # thread daemon (HTTP == socket parity, CLI parity with tc stats list/show, 404
+                           # unknown job, sweep over HTTP with backdated runs → result.expired audit rows +
+                           # artifacts gone + expired over /api/results + idempotent re-sweep + stats
+                           # unaffected + status last_sweep, auth-required 401s, dead-socket daemon-down
+                           # payloads on all three, served SPA Stats view + Dashboard retention card), and
+                           # a subprocess e2e (`tc coop start` + fake vibe) running + sweeping over HTTP
+├── test_coop_container.py # spec 18: the shipped docker/settings.toml defaults (data_dir=/data, coop
+                           # 0.0.0.0:8737, no fixed token, all stateful paths under /data), the
+                           # Dockerfile contract (base, EXPOSE, VOLUME, loopback /api/ping HEALTHCHECK,
+                           # ENV, CMD), .dockerignore, compose example + docs coverage, and a subprocess
+                           # e2e of the container CMD (`tc daemon start` with the shipped settings,
+                           # data_dir/port redirected) — GUI served, ephemeral token printed exactly
+                           # once, ping 200 + 401/200 bearer, run over HTTP to succeeded with result,
+                           # and jobs/runs/results/schedules surviving a daemon restart on the data dir
 ├── test_api_adapter.py    # spec 05: providers seam, MistralAPIAdapter contract seam (MockTransport:
                            # JSON-mode shape, exp backoff on 429/5xx, no retry on 4xx, Retry-After,
                            # timeout, missing credential), e2e via daemon thread + subprocess against
@@ -370,6 +420,17 @@ examples/providers.toml             # spec 05 reference provider registry (mistr
 pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.12, deps: pydantic, typer, rich, croniter,
                            # jsonschema (+ rfc3339-validator for format checks), httpx, apscheduler (spec 06),
                            # aiohttp (spec 12, coop web server); dev: pytest
+Dockerfile                 # spec 18: the coop image — python:3.12-slim, pip install . (the wheel ships
+                           # the SPA), ships docker/settings.toml → /etc/turbochickens/settings.toml via
+                           # $TURBOCHICKENS_SETTINGS, PYTHONUNBUFFERED=1, VOLUME ["/data"], EXPOSE 8737,
+                           # HEALTHCHECK GET /api/ping on loopback, CMD ["tc", "daemon", "start"]
+.dockerignore              # spec 18: build context trimmed to pyproject.toml + src/ + docker/
+docker/settings.toml       # spec 18: shipped container defaults — data_dir="/data", coop_enabled=true,
+                           # coop_host="0.0.0.0", coop_port=8737, no fixed coop_auth_token (ephemeral,
+                           # printed once at startup)
+docker/compose.yaml        # spec 18: compose example — image coop, 8737:8737, named volume coop-data:/data
+docs/coop-container.md     # spec 18: build/run/compose docs, /data volume map, token handling,
+                           # healthcheck + settings overrides, reverse-proxy (TLS) note, manual smoke
 ```
 
 Spec-02 deliverables, concretely:
@@ -773,12 +834,87 @@ Spec-16 deliverables, concretely:
   no host paths; and a subprocess e2e (`tc coop start` + fake vibe) doing
   add/list/rm entirely over HTTP.
 
+Spec-17 deliverables, concretely:
+
+- **HTTP** (`coop.py`): `GET /api/stats` (mirror of `stats_list` — per-job n,
+  mean/p50/p95 tokens in+out, total p95, expected cost per run, updated_at),
+  `GET /api/stats/{job_id}` (mirror of `stats_show`; 404 when the job has no
+  stats yet via the shared "no usage stats" resource-missing mapping), and
+  `POST /api/retention/sweep` (the on-demand `retention_sweep` op: 200 with
+  `{ok, cutoff, results_retention_months, audit_retention, expired[], deleted}`,
+  422 when the daemon refuses, 200 structured `daemon.up=false` when the socket
+  is dead — POST included, never a 500). Same bearer rules as every `/api/*`
+  route; `/api/ping` stays open.
+- **SPA Stats view** (`coop_static/`): per-job cards from `/api/stats` — job
+  name (button) + job id, then stat numerals: runs n, tokens in mean·p50·p95,
+  tokens out mean·p50·p95, tokens total p95, expected cost per run, updated —
+  card click opens a detail card fed by `GET /api/stats/{job_id}` (label/value
+  rows, incl. the 404 "no usage stats" case); empty state when no job has
+  finished runs; polls `/api/stats` every 2 s, flashes the grid once on change,
+  daemon-down empty state. Numbers formatted like the CLI (`%.6g`).
+- **SPA Dashboard retention card** (`coop_static/`): summary line (audit
+  retention, results TTL months, last sweep deleted count) from
+  `status.retention`, the view's one filled primary "Sweep now" button →
+  `POST /api/retention/sweep`; the response's `expired` entries (run id, kind,
+  finished_at — the `result.expired` outcomes) are listed inline under the
+  card, and the polled `status.retention.last_sweep` keeps the last sweep's
+  outcome visible; inline error on daemon-down/refusal. The Runs view's
+  Result tab keeps showing the expired state for swept runs (spec 14 seam).
+- **Tests** (`test_coop_stats.py`, 7): HTTP==socket parity for
+  `/api/stats` + `/api/stats/{job}` (404 unknown) + CLI parity
+  (`tc stats list/show` print the same numbers) after runs triggered over
+  HTTP with the fake vibe binary (n, tokens 12/34/46, expected_cost 0.001
+  fallback); sweep over HTTP with backdated runs (valid + quarantined) →
+  deleted=2, `result.expired` audit rows, artifacts gone, append-only results
+  rows kept, idempotent re-sweep, `/api/results/{run}` → 200 expired (payload
+  never served) + `tc results get` rc 1, stats unaffected, status carries the
+  last sweep; auth-required 401s on all three routes; dead-socket
+  daemon-down payloads on all three (never 500); served SPA markup for the
+  Stats view + retention card with no host paths in assets; and a subprocess
+  e2e (`tc coop start` + fake vibe) running a job and sweeping entirely over
+  HTTP.
+
+Spec-18 deliverables, concretely:
+
+- **`Dockerfile`** (repo root, `python:3.12-slim`): `pip install .` from a trimmed
+  context (`.dockerignore` keeps only `pyproject.toml`, `src/`, `docker/`), ships
+  `docker/settings.toml` to `/etc/turbochickens/settings.toml` with
+  `ENV TURBOCHICKENS_SETTINGS` pointing at it and `PYTHONUNBUFFERED=1` (so the
+  one-time token line hits `docker logs` immediately), `VOLUME ["/data"]`,
+  `EXPOSE 8737`, `HEALTHCHECK` doing `GET http://127.0.0.1:8737/api/ping`, and
+  `CMD ["tc", "daemon", "start"]` (exec form: SIGTERM reaches the daemon for a
+  graceful stop). With the shipped settings that CMD is exactly "daemon with
+  coop enabled on 0.0.0.0:8737" — the container adds no UI of its own.
+- **`docker/settings.toml`**: `data_dir = "/data"`, `coop_enabled = true`,
+  `coop_host = "0.0.0.0"`, `coop_port = 8737`, no fixed `coop_auth_token` —
+  everything stateful (socket, db, audit, results, quarantine, uploads, seats)
+  lives under the data dir, so the `/data` volume carries it all.
+- **`docker/compose.yaml`**: example service (image `coop`, build from the repo
+  root, `8737:8737`, named volume `coop-data:/data`, `restart: unless-stopped`).
+- **`docs/coop-container.md`**: build (`docker build -t coop .`), run
+  (`docker run -p 8737:8737 -v coop-data:/data coop`), compose, the `/data`
+  volume map, token handling (ephemeral token printed once via `docker logs`,
+  bearer in sessionStorage, how to pin a fixed token via a mounted settings
+  file, loopback-open mode), healthcheck + port-override note, settings
+  overrides, a reverse-proxy note (TLS termination is a proxy's job; `/api/ping`
+  stays open), `docker exec coop tc …` usage, and the manual smoke steps.
+- **Tests** (`test_coop_container.py`, 6): shipped-settings defaults + token
+  absence from `public_dict()`; the Dockerfile/.dockerignore/compose/docs
+  contracts; and a subprocess e2e running the container CMD with the shipped
+  settings (data_dir/port redirected to the sandbox) — GUI served, ephemeral
+  token printed exactly once per start, `/api/ping` 200 on loopback, 401/200
+  bearer auth, a run over HTTP to `succeeded` with the validated result served,
+  and jobs/runs/results/schedules surviving a daemon restart on the same data
+  dir. The real image smoke (build, healthy container, token-once, full HTTP
+  flow, container replacement over the volume) ran on a real Docker daemon
+  2026-11-12 and is documented step-by-step in the docs.
+
 | 13 | Jobs / Audit / Settings views (read-only socket ops) | **done** (2026-11-12) | 12 |
 | 14 | Runs from the GUI (trigger, watch, results/quarantine) | **done** (2026-11-12) | 12 |
 | 15 | Upload + validate job specs from the browser | **done** (2026-11-12) | 14 |
 | 16 | Schedules from the GUI | **done** (2026-11-12) | 12, 13 |
-| 17 | Stats + retention from the GUI | ready-for-agent | 12 |
-| 18 | coop Docker container | ready-for-agent | 12 |
+| 17 | Stats + retention from the GUI | **done** (2026-11-12) | 12 |
+| 18 | coop Docker container | **done** (2026-11-12) | 12 |
 | 19 | Auth & access management UI (seat sessions, provider auth modes, access scope for tools/data/MCP/connectors) | ready-for-agent (backlog) | 09, 12 |
 
 ## 5. Non-negotiable invariants (baseline v0.2 — do not regress these)
@@ -890,10 +1026,29 @@ structured `daemon.up=false` when down); the SPA Schedules view is the table
 errors, polling every 2 s. A schedule added over HTTP fires a `trigger=cron`
 run through the normal pipeline (verified e2e with a next-minute cron).
 
-Next backlog item is **spec 17** (stats + retention from the GUI), then 18,
-with **spec 19** (auth & access management UI) queued behind 12. The
-MVP spec pipeline (01–10) is complete; what remains beyond the GUI is the
-post-MVP roadmap in baseline §13.
+Spec 17 (stats + retention from the GUI) landed: `GET /api/stats` +
+`GET /api/stats/{job_id}` mirror `stats_list`/`stats_show` over the transport
+seam (404 on a job with no stats yet), `POST /api/retention/sweep` runs the
+on-demand sweep and answers with the `result.expired` outcome list; the Stats
+view renders per-job cards (n, mean/p50/p95 tokens in+out, total p95,
+expected cost per run, with a per-job detail card), and the Dashboard gained a
+retention card whose "Sweep now" button lists the expired runs inline (verified
+e2e with backdated runs over HTTP).
+
+Spec 18 (the coop Docker container) landed: `Dockerfile` on `python:3.12-slim`
+shipping `docker/settings.toml` (data_dir=/data, coop on 0.0.0.0:8737, no fixed
+token) with `VOLUME ["/data"]`, `EXPOSE 8737`, a loopback `/api/ping`
+`HEALTHCHECK`, and `CMD ["tc", "daemon", "start"]`; plus `.dockerignore`,
+`docker/compose.yaml`, `docs/coop-container.md` (build/run/compose/token/
+reverse-proxy/manual smoke), and `tests/test_coop_container.py`. Verified on a
+real Docker daemon: image builds, container goes healthy, the ephemeral token
+prints exactly once per start, the GUI + full upload→run→result→schedule flow
+work over HTTP, and jobs/runs/results/schedules survive container replacement
+on the same volume.
+
+Next backlog item is **spec 19** (auth & access management UI), queued behind
+09 + 12. The MVP spec pipeline (01–10) is complete; what remains beyond the
+GUI is the post-MVP roadmap in baseline §13.
 
 **Deferred (backlog notes):**
 - *Async seat broker:* `SeatBroker` does its HTTP synchronously (httpx.Client)

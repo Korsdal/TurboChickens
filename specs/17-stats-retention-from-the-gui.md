@@ -6,9 +6,9 @@
 
 **Blocked by:** 12 (coop skeleton)
 
-**Status:** ready-for-agent (2026-11-12)
+**Status:** done (2026-11-12)
 
-- [ ] Stats endpoints mirror the socket ops; the Stats view renders cards for jobs whose runs were produced over HTTP
-- [ ] Sweep via HTTP deletes expired artifacts, audit-logs each as `result.expired`, and the UI lists what expired
-- [ ] Runs/Results views show the "expired" state for swept runs (ties into ticket 14's result view)
-- [ ] Tests: HTTP against a temp daemon with backdated runs; CLI parity with `tc stats list/show`
+- [x] Stats endpoints mirror the socket ops; the Stats view renders cards for jobs whose runs were produced over HTTP
+- [x] Sweep via HTTP deletes expired artifacts, audit-logs each as `result.expired`, and the UI lists what expired
+- [x] Runs/Results views show the "expired" state for swept runs (ties into ticket 14's result view)
+- [x] Tests: HTTP against a temp daemon with backdated runs; CLI parity with `tc stats list/show`

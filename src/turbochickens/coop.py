@@ -16,7 +16,11 @@ base64-encoded files, size-capped) and the bundle form of ``POST /api/runs``
 Spec 16 adds the schedule path: ``GET /api/schedule`` (schedule_list mirror),
 ``POST /api/schedule`` (schedule_add by in-container spec path or by a files
 bundle — stored first, then scheduled by the stored path), and
-``DELETE /api/schedule/{job_id}`` (schedule_rm).
+``DELETE /api/schedule/{job_id}`` (schedule_rm). Spec 17 adds the stats path —
+``GET /api/stats`` (stats_list mirror), ``GET /api/stats/{job_id}``
+(stats_show mirror, 404 when the job has no stats yet) — and
+``POST /api/retention/sweep`` (the on-demand retention_sweep op, whose
+response lists every deletion as a ``result.expired`` entry).
 
 Transport seam: every API handler is a thin client of the existing Unix-socket
 protocol — it calls ``request(op, **payload)`` over the socket (spec 12) and
@@ -164,6 +168,10 @@ class CoopServer:
         app.router.add_get("/api/schedule", self._api_schedule_list)
         app.router.add_post("/api/schedule", self._api_schedule_add)
         app.router.add_delete("/api/schedule/{job_id}", self._api_schedule_rm)
+        # spec 17: stats + retention from the GUI
+        app.router.add_get("/api/stats", self._api_stats_list)
+        app.router.add_get("/api/stats/{job_id}", self._api_stats_show)
+        app.router.add_post("/api/retention/sweep", self._api_retention_sweep)
         app.router.add_get("/", self._index)
         app.router.add_get("/{tail:.*}", self._static_file)
         self._runner = web.AppRunner(app)
@@ -383,7 +391,9 @@ class CoopServer:
             return down
         assert resp is not None
         error = str(resp.get("error", ""))
-        if not resp.get("ok") and ("unknown run" in error or "no result stored" in error):
+        if not resp.get("ok") and (
+            "unknown run" in error or "no result stored" in error or "no usage stats" in error
+        ):
             return web.json_response(resp, status=404)
         return web.json_response(resp)
 
@@ -461,6 +471,33 @@ class CoopServer:
         if not resp.get("ok") and "no schedule registered" in str(resp.get("error", "")):
             return web.json_response(resp, status=404)
         return web.json_response(resp)
+
+    # --- spec 17: stats + retention from the GUI --------------------------------
+
+    async def _api_stats_list(self, request: web.Request) -> web.Response:
+        """GET /api/stats — per-job usage stats (mirror of the stats_list
+        socket op): n, mean/p50/p95 tokens in+out, total p95, expected cost
+        per run, per registered job with finished runs."""
+        return await self._mirror("stats_list")
+
+    async def _api_stats_show(self, request: web.Request) -> web.Response:
+        """GET /api/stats/{job_id} — one job's usage stats (mirror of the
+        stats_show socket op); 404 when the job has no stats yet, 200 with
+        the structured daemon-down payload when the socket is dead."""
+        return await self._mirror_resource("stats_show", job_id=request.match_info["job_id"])
+
+    async def _api_retention_sweep(self, request: web.Request) -> web.Response:
+        """POST /api/retention/sweep — run the on-demand retention sweep over
+        the transport seam (the retention_sweep socket op): deletes expired
+        on-disk artifacts, audit-logs each as result.expired, and answers 200
+        with the summary (cutoff, expired entries, deleted count). A refused
+        sweep is a 422 carrying the socket response; a dead socket gets the
+        structured daemon-down payload (200), never a 500."""
+        resp, down = await self._call("retention_sweep")
+        if down is not None:
+            return down
+        assert resp is not None
+        return web.json_response(resp, status=200 if resp.get("ok") else 422)
 
     # --- static SPA ----------------------------------------------------------
 

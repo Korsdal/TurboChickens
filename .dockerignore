@@ -1,0 +1,17 @@
+# Keep the build context to what the image needs: pyproject.toml + src/
+# (pip install .) and docker/settings.toml (the shipped default settings).
+# Everything below stays out of the context and the image layers.
+.git
+.venv
+.uv
+.pytest_cache
+**/__pycache__
+*.py[cod]
+dist
+*.egg-info
+tests
+specs
+examples
+docs
+STATUS.md
+uv.lock

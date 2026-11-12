@@ -7,8 +7,7 @@
   const TOKEN_KEY = "tc.coop.token";
   const POLL_MS = 2000;
   const VIEWS = ["dashboard", "runs", "jobs", "schedules", "stats", "audit", "settings"];
-  /* views with a live /api loader (stats lands in spec 17) */
-  const VIEW_LOADERS = { dashboard: loadStatus, runs: loadRuns, jobs: loadJobs, schedules: loadSchedules, audit: loadAudit, settings: loadSettings };
+  const VIEW_LOADERS = { dashboard: loadStatus, runs: loadRuns, jobs: loadJobs, schedules: loadSchedules, stats: loadStats, audit: loadAudit, settings: loadSettings };
 
   const RUN_STATUSES = ["queued", "provisioning", "running", "collecting", "finalizing", "succeeded", "failed"];
 
@@ -283,7 +282,83 @@
     setDiagram("#dg-queue", data.queue_depth != null ? data.queue_depth : 0);
     setDiagram("#dg-schedules", data.schedules != null ? data.schedules : 0);
     setDiagram("#dg-inflight", inFlight.length);
+
+    renderRetentionCard(retention);
   }
+
+  /* --- dashboard retention card (spec 17): summary + last sweep outcome ------ */
+
+  function sweepError(msg) {
+    const p = $("#sweep-error");
+    if (!msg) {
+      p.hidden = true;
+      p.textContent = "";
+      return;
+    }
+    p.textContent = msg;
+    p.hidden = false;
+  }
+
+  function renderSweepOutcome(sweep) {
+    const outcome = $("#sweep-outcome");
+    const summary = $("#sweep-summary");
+    const list = $("#sweep-list");
+    if (!sweep) {
+      outcome.hidden = true;
+      list.replaceChildren();
+      return;
+    }
+    const expired = sweep.expired || [];
+    summary.textContent =
+      "Sweep at " + (sweep.cutoff || "—") + " (results older than " +
+      (sweep.results_retention_months != null ? sweep.results_retention_months + " months" : "—") +
+      ") — " + (sweep.deleted || 0) + " expired" + (expired.length ? ":" : ".");
+    const sig = JSON.stringify(expired);
+    if (list.dataset.sig !== sig) {
+      list.dataset.sig = sig;
+      list.replaceChildren();
+      for (const e of expired) {
+        const li = el("li");
+        li.appendChild(el("span", "run", e.run_id + " "));
+        li.appendChild(el("span", "kind", "(" + (e.kind || "result") + ", finished " + (e.finished_at || "—") + ")"));
+        list.appendChild(li);
+      }
+    }
+    outcome.hidden = false;
+  }
+
+  function renderRetentionCard(retention) {
+    const months = retention.results_retention_months;
+    const sweep = retention.last_sweep;
+    $("#retention-summary").textContent =
+      "audit log " + (retention.audit_retention || "forever") +
+      " · results expire after " + (months != null ? months + " months" : "—") +
+      (sweep ? " · last sweep deleted " + (sweep.deleted || 0) : " · no sweep yet");
+    renderSweepOutcome(sweep || null);
+  }
+
+  $("#sweep-now").addEventListener("click", async () => {
+    sweepError("");
+    const btn = $("#sweep-now");
+    btn.disabled = true;
+    const resp = await apiPost("/api/retention/sweep", {});
+    btn.disabled = false;
+    if (resp === null) return; /* 401 → login view shown */
+    if (resp.__networkError) {
+      sweepError("The GUI could not reach the coop server.");
+      return;
+    }
+    if (resp.daemon && resp.daemon.up === false) {
+      sweepError("The supervisor is not reachable — " + (resp.error || "") + ".");
+      return;
+    }
+    if (!resp.ok) {
+      sweepError(resp.error || "sweep refused");
+      return;
+    }
+    renderSweepOutcome(resp); // the result.expired entries of this sweep, listed inline
+    loadStatus();
+  });
 
   /* --- jobs view (spec 13): registered specs table --- */
 
@@ -923,6 +998,125 @@
     }
     loadSchedules();
   }
+
+  /* --- stats view (spec 17): per-job cards + per-job detail ------------------- */
+
+  let statsDetailJob = null; // job whose detail card is open
+
+  function fmtNum(v) {
+    if (v == null) return "—";
+    const n = Number(v);
+    if (!isFinite(n)) return String(v);
+    return n.toPrecision(6).replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+  }
+
+  function fmtCost(v) {
+    return v == null ? "—" : "$" + fmtNum(v);
+  }
+
+  function statsTriple(mean, p50, p95) {
+    return fmtNum(mean) + " · " + fmtNum(p50) + " · " + fmtNum(p95);
+  }
+
+  function renderStatsCards(stats) {
+    if (!stats.length) {
+      showEmpty("#stats-empty", "#stats-grid", "No usage stats yet — run a job to completion and its rollup lands here.");
+      return;
+    }
+    showCard("#stats-empty", "#stats-grid");
+    const grid = $("#stats-grid");
+    const sig = JSON.stringify(stats);
+    if (grid.dataset.sig === sig) return;
+    grid.dataset.sig = sig;
+    grid.replaceChildren();
+    for (const s of stats) {
+      const card = el("div", "card stat-card");
+      const head = el("button", "job-head");
+      head.type = "button";
+      head.setAttribute("aria-label", "Show stats for " + s.job_id);
+      head.appendChild(el("span", "job-name", s.job_name || s.job_id));
+      head.appendChild(el("span", "job-id mono", s.job_id));
+      head.addEventListener("click", () => selectStatsJob(s.job_id));
+      card.appendChild(head);
+      const nums = el("div", "stat-numerals");
+      const cell = (label, value, small) => {
+        const n = el("div", "num");
+        n.appendChild(el("span", "num-label", label));
+        n.appendChild(el("span", "num-value mono" + (small ? " small" : ""), value));
+        return n;
+      };
+      nums.appendChild(cell("runs", fmtNum(s.n_runs)));
+      nums.appendChild(cell("tokens in mean·p50·p95", statsTriple(s.tokens_in_mean, s.tokens_in_p50, s.tokens_in_p95), true));
+      nums.appendChild(cell("tokens out mean·p50·p95", statsTriple(s.tokens_out_mean, s.tokens_out_p50, s.tokens_out_p95), true));
+      nums.appendChild(cell("tokens total p95", fmtNum(s.tokens_p95)));
+      nums.appendChild(cell("expected cost / run", fmtCost(s.expected_cost_usd)));
+      nums.appendChild(cell("updated", s.updated_at || "—", true));
+      card.appendChild(nums);
+      grid.appendChild(card);
+    }
+    flashCard(grid);
+  }
+
+  async function selectStatsJob(jobId) {
+    statsDetailJob = jobId;
+    await loadStatsDetail();
+  }
+
+  async function loadStatsDetail() {
+    const detail = $("#stats-detail");
+    if (!statsDetailJob) {
+      detail.hidden = true;
+      return;
+    }
+    const data = await api("/api/stats/" + encodeURIComponent(statsDetailJob));
+    if (data === null) return; /* 401 → login view shown */
+    if (data.__networkError || (data.daemon && data.daemon.up === false)) {
+      detail.hidden = true;
+      return;
+    }
+    const s = data.stats;
+    detail.hidden = false;
+    $("#stats-detail-title").textContent = (s && (s.job_name || s.job_id)) || statsDetailJob;
+    const rows = s
+      ? [
+          ["job_id", s.job_id],
+          ["runs n", fmtNum(s.n_runs)],
+          ["tokens_in mean / p50 / p95", statsTriple(s.tokens_in_mean, s.tokens_in_p50, s.tokens_in_p95)],
+          ["tokens_out mean / p50 / p95", statsTriple(s.tokens_out_mean, s.tokens_out_p50, s.tokens_out_p95)],
+          ["tokens_total_p95", fmtNum(s.tokens_p95)],
+          ["expected_cost_usd_per_run", fmtCost(s.expected_cost_usd)],
+          ["updated_at", s.updated_at || "—"],
+        ]
+      : [["error", data.error || "no usage stats for this job yet"]];
+    const list = $("#stats-detail-list");
+    const sig = JSON.stringify(rows);
+    if (list.dataset.sig !== sig) {
+      list.dataset.sig = sig;
+      list.replaceChildren();
+      for (const [k, v] of rows) {
+        const row = el("div", "settings-row");
+        row.appendChild(el("dt", null, k));
+        row.appendChild(el("dd", null, v == null ? "—" : String(v)));
+        list.appendChild(row);
+      }
+    }
+  }
+
+  async function loadStats() {
+    const data = await api("/api/stats");
+    if (data === null) return; /* 401 → login view shown */
+    if (payloadDown(data)) {
+      showEmpty("#stats-empty", "#stats-grid", "Stats unavailable — " + (data.error || "the supervisor is not reachable") + ".");
+      return;
+    }
+    renderStatsCards(data.stats || []);
+    if (statsDetailJob) await loadStatsDetail();
+  }
+
+  $("#stats-detail-close").addEventListener("click", () => {
+    statsDetailJob = null;
+    $("#stats-detail").hidden = true;
+  });
 
   /* --- audit view (spec 13): mono tail, newest first, event filter chips --- */
 

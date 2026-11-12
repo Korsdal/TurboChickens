@@ -1,0 +1,22 @@
+# Default settings shipped in the coop container image (spec 18).
+# The Dockerfile copies this to /etc/turbochickens/settings.toml and sets
+# TURBOCHICKENS_SETTINGS to that path, so `tc daemon start` (the image CMD)
+# picks it up with no flags.
+#
+# Everything stateful lives under data_dir (/data) — socket, db, audit log,
+# results, quarantine, uploads, seat sessions — so a Docker volume on /data
+# carries the whole coop memory across container replacement.
+
+data_dir = "/data"
+
+# The container's whole point: the daemon serves the TurboChickens GUI over
+# HTTP in the same process, bound on all interfaces.
+coop_enabled = true
+coop_host = "0.0.0.0"
+coop_port = 8737
+
+# coop_auth_token is deliberately unset: bound non-loopback, the daemon mints
+# an ephemeral token at startup and prints it exactly once to stdout — grab it
+# with `docker logs <container>`. To pin a fixed token instead, mount your own
+# settings file over /etc/turbochickens/settings.toml (or point
+# TURBOCHICKENS_SETTINGS at a mounted file) with coop_auth_token = "...".

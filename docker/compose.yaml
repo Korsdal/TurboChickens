@@ -1,0 +1,23 @@
+# Compose example for the coop container (spec 18). From the repo root:
+#
+#   docker compose -f docker/compose.yaml up -d --build
+#   docker logs -f <container>     # the one-time GUI auth token
+#   open http://localhost:8737
+#
+# State lives in the named volume `coop-data` mounted at /data, so
+# `docker compose down && up` (or plain container replacement) keeps jobs,
+# runs, results and schedules.
+services:
+  coop:
+    image: coop
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8737:8737"
+    volumes:
+      - coop-data:/data
+    restart: unless-stopped
+
+volumes:
+  coop-data:
