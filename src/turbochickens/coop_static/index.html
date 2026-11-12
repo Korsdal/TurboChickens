@@ -170,9 +170,50 @@
           <header class="view-header" data-enter>
             <div>
               <h2 id="jobs-heading">Jobs</h2>
-              <p class="intro">Registered job specs and their spec hashes.</p>
+              <p class="intro">Upload a job spec bundle to validate and run it, or register one with <span class="mono">tc run &lt;job.toml&gt;</span>.</p>
             </div>
           </header>
+
+          <div class="card upload-card" id="upload-card">
+            <div class="upload-head">
+              <h3>Upload a job spec</h3>
+              <p class="muted">A bundle is the job TOML plus the files it references — prompt, schema, attachments — sent base64-encoded, capped at 10&nbsp;MiB total.</p>
+            </div>
+            <form class="upload-form" id="upload-form" novalidate>
+              <div class="upload-grid">
+                <div class="upload-field">
+                  <label for="up-job">Job spec (job.toml)</label>
+                  <input id="up-job" type="file" accept=".toml" required>
+                  <p class="field-error" id="up-job-error" hidden></p>
+                </div>
+                <div class="upload-field">
+                  <label for="up-prompt">Prompt file</label>
+                  <input id="up-prompt" type="file" required>
+                  <label class="path-label" for="up-prompt-path">Bundle path</label>
+                  <input id="up-prompt-path" class="mono" type="text" autocomplete="off" spellcheck="false">
+                  <p class="field-error" id="up-prompt-error" hidden></p>
+                </div>
+                <div class="upload-field">
+                  <label for="up-schema">Schema file</label>
+                  <input id="up-schema" type="file" required>
+                  <label class="path-label" for="up-schema-path">Bundle path</label>
+                  <input id="up-schema-path" class="mono" type="text" autocomplete="off" spellcheck="false">
+                  <p class="field-error" id="up-schema-error" hidden></p>
+                </div>
+                <div class="upload-field">
+                  <label for="up-attachments">Attachments (optional)</label>
+                  <input id="up-attachments" type="file" multiple>
+                  <p class="field-error" id="up-attachments-error" hidden></p>
+                </div>
+              </div>
+              <p class="field-error upload-error" id="upload-error" hidden></p>
+              <div class="upload-actions">
+                <button type="submit" class="btn btn-primary" id="upload-submit">Validate</button>
+                <span class="mono muted" id="upload-result" hidden></span>
+              </div>
+            </form>
+          </div>
+
           <div class="card table-card" id="jobs-card" hidden>
             <table class="data-table">
               <thead>
@@ -181,7 +222,7 @@
               <tbody id="jobs-tbody"></tbody>
             </table>
           </div>
-          <div class="card empty-state" id="jobs-empty"><p>No registered jobs yet — run <span class="mono">tc run &lt;job.toml&gt;</span> once to register one.</p></div>
+          <div class="card empty-state" id="jobs-empty"><p>No registered jobs yet — upload a bundle above, or run <span class="mono">tc run &lt;job.toml&gt;</span> once to register one.</p></div>
         </section>
 
         <section class="view" id="view-schedules" hidden aria-labelledby="schedules-heading">

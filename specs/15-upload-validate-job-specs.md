@@ -6,10 +6,10 @@
 
 **Blocked by:** 14 (runs path over HTTP, so an uploaded spec can be enqueued)
 
-**Status:** ready-for-agent (2026-11-12)
+**Status:** done (2026-11-12)
 
-- [ ] A valid bundle uploads, validates OK with its spec hash, lands under `uploads/<job>-<hash>/`, and is enqueueable via `POST /api/runs` by that stored path
-- [ ] An invalid bundle returns field-named errors rendered under the form; nothing is registered as a job
-- [ ] The size cap is enforced with a clear error
-- [ ] E2e: create and run a brand-new job entirely over HTTP with the fake vibe binary, result fetched over HTTP
-- [ ] Tests: HTTP-level upload/validate/enqueue, cap enforcement, error shapes; no host paths ever enter the UI
+- [x] A valid bundle uploads, validates OK with its spec hash, lands under `uploads/<job>-<hash>/`, and is enqueueable via `POST /api/runs` by that stored path
+- [x] An invalid bundle returns field-named errors rendered under the form; nothing is registered as a job
+- [x] The size cap is enforced with a clear error
+- [x] E2e: create and run a brand-new job entirely over HTTP with the fake vibe binary, result fetched over HTTP
+- [x] Tests: HTTP-level upload/validate/enqueue, cap enforcement, error shapes; no host paths ever enter the UI

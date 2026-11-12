@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 14 landed (236/236 tests green, e2e smoke verified).
+**Last updated:** 2026-11-12, after spec 15 landed (250/250 tests green, e2e smoke verified).
 
 ---
 
@@ -26,7 +26,7 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10 and specs 12–14 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, and the spec-14 commit). Spec 11 is the parent GUI spec; its first three slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs) are landed, the rest of its stories land via specs 15–18.
+**Spec 01 through spec 10 and specs 12–15 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, and the spec-15 commit). Spec 11 is the parent GUI spec; its first four slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate) are landed, the rest of its stories land via specs 16–18.
 
 **Spec 19 (auth & access management UI) is backlogged** — `specs/19-auth-access-management-ui.md`, status ready-for-agent, not started. Note spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality.
 Verified this session:
@@ -129,6 +129,18 @@ Verified this session:
 #     dead-socket transport → 200 {ok:false, daemon.up=false} on all of them (POST included, not 500)
 #   → GET / serves the Runs view (run-form, runs-tbody, filter chips, run-detail with Manifest/Logs/Result
 #     tabs, copy buttons); app.js polls /api/runs (+ open run's show/logs/results) every 2 s, row flash on change
+# spec-15 smoke (temp settings, coop_enabled=true, `tc coop start` subprocess, fake vibe binary):
+#   → POST /api/jobs/validate {files: {job.toml, prompts/…, schemas/… (base64)}} → 200 {ok, valid, job_id,
+#     spec_hash, spec_path=<data_dir>/uploads/<job>-<spec_hash>/job.toml}; files on disk with exact contents
+#   → POST /api/runs {spec_path: <stored path>} → 200 run queued; also POST /api/runs {files: <bundle>}
+#     → store+validate+enqueue in one call → run succeeded, GET /api/results/{run_id} over HTTP == socket
+#   → invalid bundle (cron without schedule, schema missing from bundle, prompt missing) → 422 with
+#     field-named errors (trigger.schedule: …, output.schema_file: …) — nothing stored, no job registered;
+#     >10 MiB decoded → 413 "bundle too large"; malformed body → 400; ../ paths → rejected; staging paths
+#     rewritten to <bundle> so no host path leaves the daemon
+#   → auth-required mode: both POSTs 401 without bearer, 200 with; dead-socket transport → 200
+#     {ok:false, daemon.up=false} (never 500); GET / serves the Jobs upload form (48px fields, labels,
+#     per-field errors, one primary Validate→Run job button), no host paths in the assets
 ```
 
 What exists:
@@ -139,7 +151,10 @@ src/turbochickens/
 ├── util.py                # utcnow / utcnow_iso (UTC, ms precision, Z suffix)
 ├── settings.py            # Settings (Pydantic, extra=forbid) + load_settings(); defaults below;
 │                          # spec 12: coop_enabled/coop_host/coop_port/coop_auth_token + coop_url;
-│                          # spec 13: public_dict() — effective settings for the GUI, coop_auth_token omitted
+│                          # spec 13: public_dict() — effective settings for the GUI, coop_auth_token omitted;
+│                          # spec 15: uploads_dir + UPLOAD_MAX_BYTES (10 MiB bundle cap),
+│                          # UPLOAD_MAX_HTTP_BODY (aiohttp client_max_size backstop),
+│                          # SOCKET_STREAM_LIMIT (one JSON-lines request may carry a whole bundle)
 ├── coop.py                # spec 12: CoopServer — aiohttp HTTP server inside the daemon's event loop;
 │                          # /api/ping (unauthenticated healthcheck) + /api/status (bearer unless loopback+
 │                          # no token; ephemeral token minted+printed once when non-loopback and none
@@ -149,7 +164,11 @@ src/turbochickens/
 │                          # /api/runs/{id}/logs, /api/results/{run_id} (200 with quarantined/expired flags,
 │                          # 404 unknown resource) — thin mirrors of the socket ops, 200 {daemon.up=false}
 │                          # when the socket is dead; static SPA at /; transport seam = client.request_async
-│                          # over the daemon socket (web layer never opens DB/artifacts); coop_auth() seam
+│                          # over the daemon socket (web layer never opens DB/artifacts); coop_auth() seam;
+│                          # spec 15: POST /api/jobs/validate (bundle {files: {path: base64}} → daemon
+│                          # jobs_upload; 200 valid+stored / 422 field-named errors / 413 cap / 400 malformed)
+│                          # and POST /api/runs also accepts {files: …} (store+validate+enqueue by the stored
+│                          # path); client_max_size backstop from UPLOAD_MAX_HTTP_BODY
 │   └── coop_static/       # the dependency-free SPA (index.html + app.js + styles.css + lucide icons as
 │                          # local SVGs, no build step, no runtime CDN): 240px sidebar shell, wordmark +
 │                          # egg dot, nav, login card (sessionStorage bearer, no cookies), Dashboard with
@@ -159,7 +178,11 @@ src/turbochickens/
 │                          # in-flight pulsing amber, succeeded green, failed red, quarantined amber — and a
 │                          # detail pane with Manifest/Logs/Result-or-Quarantine tabs, copy buttons, quarantine
 │                          # + expired states) — each view polls its /api/* every 2 s, flash-on-change,
-│                          # daemon-down banner + per-view empty states — built to specs/00-design-system.md
+│                          # daemon-down banner + per-view empty states; spec 15: Jobs view upload form
+│                          # (job.toml + prompt + schema + attachments file inputs with bundle-path fields,
+│                          # 48px fields, per-field errors rendered under their fields, one primary
+│                          # Validate→"Run job" button that re-POSTs the bundle to /api/runs) — built to
+│                          # specs/00-design-system.md
 ├── storage.py             # init_db(): full MVP SQLite schema + `schedules` table (spec 06) +
 │                          # `job_usage_stats` percentile columns (spec 08, schema_version=3, with
 │                          # in-place migration of v2 DBs) + append-only triggers + schema_meta
@@ -207,6 +230,12 @@ src/turbochickens/
 │                          # spec 14: runs_list takes optional job=/status= filters + result_valid per row;
 │                          # results_get returns quarantined raw_output + schema_errors (never valid) and
 │                          # reports expired for artifacts the retention sweep removed (valid or quarantined);
+│                          # spec 15: jobs_upload op — validate a base64-file bundle with the existing spec
+│                          # loader (field-named errors like `tc jobs validate`, staging paths rewritten to
+│                          # <bundle>), cap UPLOAD_MAX_BYTES decoded, safe bundle-relative paths only, and
+│                          # store valid bundles under uploads/<job>-<spec_hash>/ (audit job.uploaded /
+│                          # job.upload_rejected, never file contents); socket streams raised to
+│                          # SOCKET_STREAM_LIMIT so one request line can carry a bundle;
 │                          # admission-control scheduler (over-budget
 │                          # backlogs, never rejects); a firing cron submits enqueue trigger=cron over
 │                          # the daemon's own socket; retention sweep at startup + hourly (spec 08);
@@ -216,7 +245,8 @@ src/turbochickens/
 │                          # the same loop and shutdown tears it down (audit coop.started/stopped)
 ├── client.py              # request(socket, op, **payload) → parsed response; DaemonUnreachable;
 │                          # spec 12: request_async(...) — the same exchange awaitable inside a running
-│                          # loop (used by the coop web layer's SocketTransport)
+│                          # loop (used by the coop web layer's SocketTransport); spec 15: the stream
+│                          # limit is SOCKET_STREAM_LIMIT (bundle-sized request lines)
 ├── models.py              # spec 10: model discovery, on-demand per invocation (no daemon state) —
 │                          # fetch_models (GET {base_url}/models, bearer from the allowlisted env var
 │                          # or the seat session token; token never printed/logged), list_provider_catalogs
@@ -286,6 +316,13 @@ tests/
                            # 401s; dead-socket daemon-down payloads incl. POST; served Runs SPA markup; and a
                            # subprocess e2e (`tc coop start` + fake vibe): HTTP-triggered run → succeeded →
                            # validated result over HTTP + CLI
+└── test_coop_upload.py    # spec 15: jobs_upload socket op standalone (valid bundle stored under
+                           # uploads/<job>-<hash>/ + enqueueable by that path; invalid → field-named errors,
+                           # nothing stored/registered; cap, unsafe paths, base64, shape), POST
+                           # /api/jobs/validate + POST /api/runs {files} over HTTP (200/422/413/400, HTTP ==
+                           # socket parity, auth 401s, dead-socket daemon-down payloads), served SPA upload
+                           # form + no host paths in assets, and a subprocess e2e creating + running a
+                           # brand-new job entirely over HTTP with the fake vibe binary
 ├── test_api_adapter.py    # spec 05: providers seam, MistralAPIAdapter contract seam (MockTransport:
                            # JSON-mode shape, exp backoff on 429/5xx, no retry on 4xx, Retry-After,
                            # timeout, missing credential), e2e via daemon thread + subprocess against
@@ -616,9 +653,49 @@ Spec-14 deliverables, concretely:
   daemon-down payloads; served Runs SPA markup; subprocess e2e with the fake vibe
   binary (HTTP-triggered run → succeeded → validated result over HTTP + CLI).
 
+Spec-15 deliverables, concretely:
+
+- **Socket op** (`daemon.py`): `jobs_upload` takes `{"files": {bundle-path: base64}}`,
+  requires a root `job.toml`, rejects unsafe bundle paths (absolute, `..`, empty
+  segments, backslash/NUL) and non-base64 content with field-named errors, caps the
+  total decoded size at `UPLOAD_MAX_BYTES` (10 MiB, `too_large` flag), stages under
+  `uploads/.staging-<uuid>/`, validates with the existing `load_spec` (+ the prompt
+  and attachments the spec references must be in the bundle; + `model_issues` against
+  the daemon's providers, no vibe probe), and only when valid stores the bundle at
+  `uploads/<job>-<spec_hash>/` and returns `{ok, valid, job_id, spec_hash,
+  spec_path, size_bytes, files, warnings}`. Errors come back as
+  `[{field, message}]` exactly like `tc jobs validate` (`trigger.schedule: …`),
+  with staging paths rewritten to `<bundle>` so no host path leaves the daemon.
+  Invalid bundles are never stored, never register a job; audit gets
+  `job.uploaded` / `job.upload_rejected` (field names only, never contents).
+  Socket streams raised to `SOCKET_STREAM_LIMIT` (one JSON-lines request can carry a
+  whole bundle; over-limit lines get one error response, not a dead connection).
+- **HTTP** (`coop.py`): `POST /api/jobs/validate` mirrors `jobs_upload` — 200 valid
+  (with the stored in-container `spec_path`), 422 field-named errors, 413 over the
+  cap (both the daemon's decoded cap and the aiohttp `client_max_size` backstop
+  `UPLOAD_MAX_HTTP_BODY`), 400 malformed, 200 structured `daemon.up=false` when the
+  socket is dead. `POST /api/runs` now also accepts `{"files": …}` — store + validate
+  + enqueue by the stored path in one call, so the browser never needs a path. Same
+  bearer rules as every `/api/*` route.
+- **SPA Jobs view** (`coop_static/`): upload card with file inputs for job.toml,
+  prompt, schema (each with its bundle path) and attachments, 48px fields with
+  visible labels, per-field errors rendered under their fields (mapped by dotted
+  field prefix: `input.prompt_file` → prompt, `output.schema_file` → schema,
+  `input.attachments` → attachments, everything else → job.toml), one primary
+  button that reads "Validate" and becomes "Run job" once the bundle validated —
+  clicking it re-POSTs the bundle to `/api/runs` and opens the new run in the Runs
+  view. No host paths enter the UI (the stored path stays server-side).
+- **Tests** (`test_coop_upload.py`, 14): socket op standalone (store layout + exact
+  contents + hash, enqueue by stored path to a succeeded run, invalid → field-named
+  errors + nothing stored/registered + no path leaks, missing prompt/schema,
+  cap/unsafe-path/base64/shape), HTTP (validate + runs-bundle, HTTP == socket parity,
+  422/413/400 shapes, auth 401s, dead-socket payloads, served SPA markup, no host
+  paths in assets), and a subprocess e2e creating + running a brand-new job entirely
+  over HTTP with the fake vibe binary, result fetched over HTTP + CLI parity.
+
 | 13 | Jobs / Audit / Settings views (read-only socket ops) | **done** (2026-11-12) | 12 |
 | 14 | Runs from the GUI (trigger, watch, results/quarantine) | **done** (2026-11-12) | 12 |
-| 15 | Upload + validate job specs from the browser | ready-for-agent | 14 |
+| 15 | Upload + validate job specs from the browser | **done** (2026-11-12) | 14 |
 | 16 | Schedules from the GUI | ready-for-agent | 12, 13 |
 | 17 | Stats + retention from the GUI | ready-for-agent | 12 |
 | 18 | coop Docker container | ready-for-agent | 12 |
@@ -713,8 +790,16 @@ shows schema errors + raw output (never a valid result), expired artifacts show
 an expired state. `runs_list` gained the `job`/`status` filters + `result_valid`;
 `results_get` gained the quarantined `raw_output` and the `expired` report.
 
-Next backlog item is **spec 15** (upload + validate job specs from the browser),
-then 16–18, with **spec 19** (auth & access management UI) queued behind 12. The
+Spec 15 (upload + validate job specs from the browser) landed: `jobs_upload`
+validates a base64-file bundle with the existing spec loader (field-named errors
+like `tc jobs validate`, 10 MiB cap, safe paths only) and stores valid bundles
+under `uploads/<job>-<spec_hash>/`; `POST /api/jobs/validate` mirrors it and
+`POST /api/runs` also takes a bundle (store + enqueue in one call); the Jobs view
+gained the upload form (file inputs, per-field errors, one Validate → "Run job"
+button).
+
+Next backlog item is **spec 16** (schedules from the GUI), then 17–18, with
+**spec 19** (auth & access management UI) queued behind 12. The
 MVP spec pipeline (01–10) is complete; what remains beyond the GUI is the
 post-MVP roadmap in baseline §13.
 

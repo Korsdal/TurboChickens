@@ -25,6 +25,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 SETTINGS_ENVVAR = "TURBOCHICKENS_SETTINGS"
 DEFAULT_DATA_DIR = Path("~/.turbochickens").expanduser()
 
+#: spec 15: size cap for a job-spec bundle uploaded over HTTP (decoded bytes,
+#: job TOML + prompt + schema + attachments). The coop HTTP layer sets its
+#: aiohttp client_max_size backstop from UPLOAD_MAX_HTTP_BODY (base64 expands
+#: ~4/3), and the daemon's JSON-lines socket gets SOCKET_STREAM_LIMIT so one
+#: request line can carry a whole bundle at the cap.
+UPLOAD_MAX_BYTES = 10 * 1024 * 1024
+UPLOAD_MAX_HTTP_BODY = UPLOAD_MAX_BYTES * 4 // 3 + 2 * 1024 * 1024
+SOCKET_STREAM_LIMIT = UPLOAD_MAX_HTTP_BODY + 1024 * 1024
+
 
 class SettingsError(Exception):
     """Settings file missing, unreadable, or invalid."""
@@ -88,6 +97,12 @@ class Settings(BaseModel):
         return self.data_dir / "seats"
 
     @property
+    def uploads_dir(self) -> Path:
+        """Job-spec bundles uploaded over HTTP (spec 15), stored under
+        `<job>-<spec_hash>/` so each is enqueueable by an in-container path."""
+        return self.data_dir / "uploads"
+
+    @property
     def weight_budget(self) -> int:
         """Effective resource-weight budget (baseline v0.2, decision 2)."""
         if self.weight_budget_override is not None:
@@ -109,6 +124,7 @@ class Settings(BaseModel):
             "results_dir": str(self.results_dir),
             "quarantine_dir": str(self.quarantine_dir),
             "seats_dir": str(self.seats_dir),
+            "uploads_dir": str(self.uploads_dir),
             "providers_path": str(self.providers_path) if self.providers_path else None,
             "weight_budget_override": self.weight_budget_override,
             "weight_budget": self.weight_budget,

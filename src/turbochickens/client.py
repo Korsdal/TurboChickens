@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from turbochickens.daemon import PROTOCOL_VERSION
+from turbochickens.settings import SOCKET_STREAM_LIMIT
 
 
 class DaemonUnreachable(Exception):
@@ -22,7 +23,7 @@ async def request_async(
     the coop web layer calls the daemon over this socket from the daemon's own
     loop), return the parsed response object."""
     try:
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await asyncio.open_unix_connection(str(socket_path), limit=SOCKET_STREAM_LIMIT)
         try:
             req = {"op": op, "protocol": PROTOCOL_VERSION, **payload}
             writer.write(json.dumps(req).encode("utf-8") + b"\n")

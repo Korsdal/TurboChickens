@@ -387,6 +387,43 @@ html, body {
 .data-table .mono { font-size: 13px; }
 .data-table .hash { overflow-wrap: anywhere; }
 
+/* --- jobs view upload form (spec 15): 48px fields, labels, errors under fields --- */
+
+.upload-card { padding: 20px 24px; margin-bottom: 24px; }
+.upload-head h3 { margin: 0 0 4px; font-size: 20px; font-weight: 500; letter-spacing: -0.01em; }
+.upload-head p { margin: 0 0 18px; font-size: 14px; color: var(--p-muted); }
+.upload-form { margin: 0; }
+.upload-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px 24px; }
+.upload-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.upload-field > label { font-size: 13px; font-weight: 500; color: var(--p-muted); }
+.upload-field .path-label { font-size: 13px; color: var(--p-muted); margin-top: 4px; }
+.upload-field input[type="text"] {
+  height: 48px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-s);
+  background: var(--p-bg);
+  color: var(--p-ink);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 0 14px;
+  width: 100%;
+}
+.upload-field input[type="file"] {
+  height: 48px;
+  width: 100%;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-s);
+  background: var(--p-bg);
+  color: var(--p-ink);
+  font-size: 13px;
+  padding: 12px 14px;
+  cursor: pointer;
+}
+.upload-field input:focus-visible { outline: 2px solid var(--p-action); outline-offset: 1px; }
+.upload-error { margin: 12px 0 0; white-space: pre-line; }
+.upload-actions { display: flex; align-items: center; gap: 14px; margin-top: 18px; flex-wrap: wrap; }
+#upload-result { font-size: 13px; }
+
 /* --- runs view (spec 14): run form, filters, egg-dot table, detail pane --- */
 
 .run-form { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; padding-bottom: 6px; }

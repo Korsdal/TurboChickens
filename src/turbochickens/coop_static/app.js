@@ -304,6 +304,174 @@
     }
   }
 
+  /* --- jobs view upload (spec 15): validate a bundle, then run it ---------- */
+
+  let uploadValid = false; // the currently shown bundle passed validation
+  let uploadSig = ""; // signature of the bundle that was validated
+  let uploadBundle = null; // {files: {path: base64}} of the validated bundle
+
+  function readFileB64(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => {
+        const bytes = new Uint8Array(r.result);
+        let bin = "";
+        const CH = 0x8000;
+        for (let i = 0; i < bytes.length; i += CH) {
+          bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+        }
+        resolve(btoa(bin));
+      };
+      r.onerror = () => reject(r.error);
+      r.readAsArrayBuffer(file);
+    });
+  }
+
+  function bundlePath(pathInput, file) {
+    // in-bundle path: the typed path when sane, else the file's own name
+    const typed = (pathInput && pathInput.value || "").trim().replace(/^\/+/, "");
+    const parts = typed.split("/").filter((p) => p && p !== "." && p !== "..");
+    return parts.length ? parts.join("/") : (file.webkitRelativePath || file.name);
+  }
+
+  async function buildBundle() {
+    const jobFile = $("#up-job").files[0];
+    const promptFile = $("#up-prompt").files[0];
+    const schemaFile = $("#up-schema").files[0];
+    if (!jobFile) return { error: "job.toml: choose the job spec file first." };
+    if (!promptFile) return { error: "input.prompt_file: choose the prompt file." };
+    if (!schemaFile) return { error: "output.schema_file: choose the schema file." };
+    const files = {};
+    for (const f of Array.from($("#up-attachments").files)) {
+      files[f.webkitRelativePath || f.name] = await readFileB64(f);
+    }
+    files[bundlePath($("#up-prompt-path"), promptFile)] = await readFileB64(promptFile);
+    files[bundlePath($("#up-schema-path"), schemaFile)] = await readFileB64(schemaFile);
+    files["job.toml"] = await readFileB64(jobFile); // job.toml always wins the root key
+    return { files };
+  }
+
+  function bundleSignature() {
+    // names + sizes + mtimes of the chosen files + typed bundle paths
+    const sig = [];
+    for (const id of ["up-job", "up-prompt", "up-schema", "up-attachments"]) {
+      for (const f of Array.from($(id).files)) sig.push(id + ":" + f.name + ":" + f.size + ":" + f.lastModified);
+    }
+    sig.push($("#up-prompt-path").value, $("#up-schema-path").value);
+    return sig.join("|");
+  }
+
+  function uploadErrorField(field) {
+    if (field.startsWith("input.prompt_file")) return "#up-prompt-error";
+    if (field.startsWith("output.schema_file")) return "#up-schema-error";
+    if (field.startsWith("input.attachments")) return "#up-attachments-error";
+    return "#up-job-error"; // job.toml and every spec-section error live under the spec field
+  }
+
+  function clearUploadErrors() {
+    for (const sel of ["#up-job-error", "#up-prompt-error", "#up-schema-error", "#up-attachments-error", "#upload-error"]) {
+      const p = $(sel);
+      p.hidden = true;
+      p.textContent = "";
+    }
+  }
+
+  function showUploadErrors(resp) {
+    clearUploadErrors();
+    if (resp.errors && resp.errors.length) {
+      const buckets = {};
+      for (const e of resp.errors) {
+        const sel = uploadErrorField(e.field || "");
+        (buckets[sel] = buckets[sel] || []).push(e.message);
+      }
+      for (const [sel, msgs] of Object.entries(buckets)) {
+        const p = $(sel);
+        p.textContent = msgs.join("\n");
+        p.hidden = false;
+      }
+    } else {
+      const p = $("#upload-error");
+      p.textContent = resp.error || "upload failed";
+      p.hidden = false;
+    }
+  }
+
+  function resetUploadState() {
+    uploadValid = false;
+    uploadSig = "";
+    uploadBundle = null;
+    $("#upload-submit").textContent = "Validate";
+    const res = $("#upload-result");
+    res.hidden = true;
+    res.textContent = "";
+  }
+
+  for (const id of ["up-job", "up-prompt", "up-schema", "up-attachments", "up-prompt-path", "up-schema-path"]) {
+    $("#" + id).addEventListener("change", () => {
+      resetUploadState();
+      clearUploadErrors();
+      // default the bundle path to the chosen file's name
+      if (id === "up-prompt" && $("#up-prompt").files[0] && !$("#up-prompt-path").value) {
+        $("#up-prompt-path").value = $("#up-prompt").files[0].webkitRelativePath || $("#up-prompt").files[0].name;
+      }
+      if (id === "up-schema" && $("#up-schema").files[0] && !$("#up-schema-path").value) {
+        $("#up-schema-path").value = $("#up-schema").files[0].webkitRelativePath || $("#up-schema").files[0].name;
+      }
+    });
+  }
+
+  $("#upload-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    clearUploadErrors();
+    const built = await buildBundle();
+    if (built.error) {
+      const p = $(uploadErrorField(built.error.split(":")[0]));
+      p.textContent = built.error;
+      p.hidden = false;
+      return;
+    }
+    const sig = bundleSignature();
+    const alreadyValid = uploadValid && uploadSig === sig && uploadBundle;
+    if (!alreadyValid) {
+      // validate (the daemon stores the bundle only when valid)
+      const resp = await apiPost("/api/jobs/validate", { files: built.files });
+      if (resp === null) return; /* 401 → login view shown */
+      if (resp.__networkError || (resp.daemon && resp.daemon.up === false)) {
+        showUploadErrors({ error: "The supervisor is not reachable — " + (resp.error || "") + "." });
+        return;
+      }
+      if (!resp.ok || resp.valid !== true) {
+        showUploadErrors(resp);
+        resetUploadState();
+        return;
+      }
+      uploadValid = true;
+      uploadSig = sig;
+      uploadBundle = built;
+      $("#upload-submit").textContent = "Run job";
+      const res = $("#upload-result");
+      res.textContent = "valid — " + resp.job_id + " · sha256:" + String(resp.spec_hash).slice(0, 12) + "…";
+      res.hidden = false;
+      return;
+    }
+    // already validated and unchanged → run the stored bundle over HTTP
+    const resp = await apiPost("/api/runs", { files: uploadBundle.files });
+    if (resp === null) return; /* 401 → login view shown */
+    if (resp.__networkError || (resp.daemon && resp.daemon.up === false)) {
+      showUploadErrors({ error: "The supervisor is not reachable — " + (resp.error || "") + "." });
+      return;
+    }
+    if (!resp.ok) {
+      if (resp.errors) showUploadErrors(resp);
+      else showUploadErrors({ error: resp.error || "enqueue failed" });
+      resetUploadState();
+      return;
+    }
+    resetUploadState();
+    if (location.hash !== "#/runs") location.hash = "#/runs";
+    selectRun(resp.run_id);
+  });
+
   /* --- runs view (spec 14): filterable table + run detail pane ------------- */
 
   function statusDotInfo(r) {

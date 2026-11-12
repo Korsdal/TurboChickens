@@ -25,6 +25,14 @@ filters and reports each row's ``result_valid``; ``results_get`` additionally
 returns the quarantined ``raw_output`` with its schema errors (never as a
 valid result) and reports ``expired`` for artifacts the retention sweep removed.
 
+Spec 15 (upload + validate job specs from the browser): ``jobs_upload`` takes a
+spec bundle as JSON with base64-encoded files (``{"files": {"job.toml": …,
+"prompts/p.txt": …}}``), size-capped at ``UPLOAD_MAX_BYTES`` decoded bytes,
+validates it with the existing spec loader (field-named errors, exactly like
+``tc jobs validate``), and — only when valid — stores it under
+``<data_dir>/uploads/<job>-<spec_hash>/`` so it is enqueueable by that
+in-container path. Invalid bundles are never stored and never register a job.
+
 Spec 12 (coop): when ``coop_enabled`` is set, the same process also serves the
 TurboChickens GUI over HTTP (aiohttp, same event loop) — static SPA at ``/``
 and ``/api/ping`` + ``/api/status`` under ``/api``, thin mirrors of the socket
@@ -36,9 +44,12 @@ token printed once at startup when none is configured.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import os
+import re
+import shutil
 import signal
 import sqlite3
 import uuid
@@ -53,7 +64,7 @@ from turbochickens.providers import ProvidersConfig, load_providers
 from turbochickens.retention import sweep_expired_results
 from turbochickens.runner import TERMINAL_STATES, RunPipeline
 from turbochickens.scheduler import CronScheduler
-from turbochickens.settings import Settings
+from turbochickens.settings import SOCKET_STREAM_LIMIT, UPLOAD_MAX_BYTES, Settings
 from turbochickens.spec.loader import SpecValidationError, load_spec, spec_hash
 from turbochickens.storage import init_db
 from turbochickens.util import utcnow, utcnow_iso
@@ -65,7 +76,39 @@ RETENTION_SWEEP_INTERVAL_SEC = 3600.0
 AUDIT_TAIL_DEFAULT = 100
 AUDIT_TAIL_MAX = 1000
 
+#: spec 15 `jobs_upload` bound on the number of files in one bundle
+UPLOAD_MAX_FILES = 200
+
 PROTOCOL_VERSION = 1
+
+
+def _safe_bundle_relpath(key: str) -> str | None:
+    """A bundle-relative path is safe when it stays inside the bundle dir:
+    relative, POSIX, no empty/'.'/'..' segments, no backslash or NUL.
+    Returns the normalized key, or None when unsafe (spec 15)."""
+    if not isinstance(key, str) or not key or key != key.strip():
+        return None
+    if key.startswith("/") or "\\" in key or "\x00" in key:
+        return None
+    parts = key.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    return key
+
+
+def _safe_job_dir_name(name: str) -> str:
+    """Filesystem-safe directory component for an uploaded job (spec 15);
+    the spec hash in the dir name keeps distinct specs distinct."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.")
+    return (cleaned or "job")[:64]
+
+
+def _issue_dict(issue, staging_dir: str) -> dict[str, str]:
+    """One SpecIssue as a field-named error dict; the staging path is rewritten
+    to ``<bundle>`` so no host path leaves the daemon (spec 15)."""
+    field = ".".join(issue.loc) if issue.loc else "<spec>"
+    message = str(issue).replace(staging_dir, "<bundle>")
+    return {"field": field, "message": message}
 
 
 class DaemonAlreadyRunning(Exception):
@@ -136,7 +179,9 @@ class Daemon:
         self.cron = CronScheduler(fire=self._cron_fire)
         self.cron.start()
         self._load_schedules()
-        self._server = await asyncio.start_unix_server(self._handle_client, path=str(s.socket_path))
+        self._server = await asyncio.start_unix_server(
+            self._handle_client, path=str(s.socket_path), limit=SOCKET_STREAM_LIMIT
+        )
         os.chmod(s.socket_path, 0o600)
         # spec 12: coop — serve the GUI over HTTP in this same event loop
         if s.coop_enabled:
@@ -197,7 +242,20 @@ class Daemon:
     ) -> None:
         try:
             while self._stop is None or not self._stop.is_set():
-                line = await reader.readline()
+                try:
+                    line = await reader.readline()
+                except ValueError:
+                    # over SOCKET_STREAM_LIMIT: answer once, then close — the
+                    # stream is desynced after a LimitOverrunError
+                    resp = {
+                        "ok": False,
+                        "protocol": PROTOCOL_VERSION,
+                        "error": f"request line exceeds the {SOCKET_STREAM_LIMIT}-byte protocol limit",
+                    }
+                    writer.write(json.dumps(resp).encode("utf-8") + b"\n")
+                    with contextlib.suppress(Exception):
+                        await writer.drain()
+                    break
                 if not line:
                     break
                 resp = await self._respond(line)
@@ -260,6 +318,8 @@ class Daemon:
             return await self._schedule_rm(req)
         if op == "jobs_list":
             return self._jobs_list()
+        if op == "jobs_upload":
+            return self._jobs_upload(req)
         if op == "audit_tail":
             return self._audit_tail(req)
         if op == "settings_get":
@@ -788,6 +848,187 @@ class Daemon:
             "protocol": PROTOCOL_VERSION,
             "settings": {**self.settings.public_dict(), "coop": self._coop_block()},
         }
+
+    # --- spec 15: upload + validate job-spec bundles from the GUI -------------
+
+    def _jobs_upload(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Validate a job-spec bundle sent as JSON with base64-encoded files —
+        ``{"files": {"job.toml": "…", "prompts/p.txt": "…"}}`` — and, only when
+        valid, store it under ``<data_dir>/uploads/<job>-<spec_hash>/`` so it
+        is enqueueable by that in-container spec path.
+
+        Validation reuses the existing spec loader, so errors come back
+        field-named exactly like ``tc jobs validate`` (``trigger.schedule: …``);
+        the bundle must additionally contain the files the spec references
+        (prompt, attachments — the loader itself checks the schema file). The
+        total decoded size is capped at ``UPLOAD_MAX_BYTES``. Invalid bundles
+        are never stored and never register a job; staging paths never leave
+        the daemon (messages are rewritten to ``<bundle>``)."""
+        files = req.get("files")
+        if not isinstance(files, dict) or not files:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": "jobs_upload requires a 'files' object mapping bundle paths to base64 content",
+            }
+        if len(files) > UPLOAD_MAX_FILES:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": f"too many files in bundle: {len(files)} > {UPLOAD_MAX_FILES}",
+            }
+        if "job.toml" not in files:
+            return {
+                "ok": False,
+                "valid": False,
+                "protocol": PROTOCOL_VERSION,
+                "errors": [
+                    {"field": "job.toml", "message": "job.toml: the bundle must include a root-level job.toml"}
+                ],
+            }
+        decoded: dict[str, bytes] = {}
+        for key, b64 in files.items():
+            rel = _safe_bundle_relpath(key)
+            if rel is None:
+                return {
+                    "ok": False,
+                    "valid": False,
+                    "protocol": PROTOCOL_VERSION,
+                    "errors": [
+                        {
+                            "field": str(key),
+                            "message": (
+                                f"{key}: unsafe bundle path — must be a relative path inside the "
+                                "bundle (no absolute paths, no '..')"
+                            ),
+                        }
+                    ],
+                }
+            if not isinstance(b64, str):
+                return {
+                    "ok": False,
+                    "valid": False,
+                    "protocol": PROTOCOL_VERSION,
+                    "errors": [{"field": rel, "message": f"{rel}: content must be a base64 string"}],
+                }
+            try:
+                decoded[rel] = base64.b64decode(b64, validate=True)
+            except ValueError:
+                return {
+                    "ok": False,
+                    "valid": False,
+                    "protocol": PROTOCOL_VERSION,
+                    "errors": [{"field": rel, "message": f"{rel}: content is not valid base64"}],
+                }
+        total = sum(len(blob) for blob in decoded.values())
+        if total > UPLOAD_MAX_BYTES:
+            return {
+                "ok": False,
+                "too_large": True,
+                "protocol": PROTOCOL_VERSION,
+                "error": (
+                    f"bundle too large: {total} bytes decoded > cap of {UPLOAD_MAX_BYTES} bytes "
+                    f"({UPLOAD_MAX_BYTES // (1024 * 1024)} MiB)"
+                ),
+                "size_bytes": total,
+                "cap_bytes": UPLOAD_MAX_BYTES,
+            }
+        # stage the bundle, validate with the existing loader, store on success
+        uploads = self.settings.uploads_dir
+        staging = uploads / f".staging-{uuid.uuid4().hex[:12]}"
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+            for rel, blob in decoded.items():
+                dest = staging / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(blob)
+            try:
+                spec = load_spec(staging / "job.toml")
+            except SpecValidationError as e:
+                errors = [_issue_dict(i, str(staging)) for i in e.issues]
+                self._audit_upload_rejected(errors)
+                return {
+                    "ok": False,
+                    "valid": False,
+                    "protocol": PROTOCOL_VERSION,
+                    "errors": errors,
+                }
+            # the spec references files by bundle-relative path — the runner
+            # needs them present, so require them here with field-named errors
+            errors = []
+            if spec.input.prompt_file not in decoded:
+                errors.append(
+                    {
+                        "field": "input.prompt_file",
+                        "message": (
+                            f"input.prompt_file: prompt file {spec.input.prompt_file!r} is not in the bundle"
+                        ),
+                    }
+                )
+            for att in spec.input.attachments:
+                if att not in decoded:
+                    errors.append(
+                        {
+                            "field": "input.attachments",
+                            "message": f"input.attachments: attachment {att!r} is not in the bundle",
+                        }
+                    )
+            from turbochickens.models import model_issues
+
+            model_errors, warnings = model_issues(spec, self.providers, None)
+            errors.extend(
+                {
+                    "field": e.split(":", 1)[0].strip(),
+                    "message": e,  # verbatim, e.g. "harness.model: unknown provider …"
+                }
+                for e in model_errors
+            )
+            if errors:
+                self._audit_upload_rejected(errors)
+                return {"ok": False, "valid": False, "protocol": PROTOCOL_VERSION, "errors": errors, "warnings": warnings}
+            digest = spec_hash(spec)
+            target = uploads / f"{_safe_job_dir_name(spec.job.name)}-{digest}"
+            if target.is_dir():
+                shutil.rmtree(target)
+            elif target.exists():
+                target.unlink()
+            os.rename(staging, target)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+        spec_path = target / "job.toml"
+        assert self.audit is not None
+        self.audit.append(
+            {
+                "event": "job.uploaded",
+                "job_id": spec.job.name,
+                "spec_hash": f"sha256:{digest}",
+                "spec_path": str(spec_path),
+                "size_bytes": total,
+                "n_files": len(decoded),
+            }
+        )
+        return {
+            "ok": True,
+            "op": "jobs_upload",
+            "protocol": PROTOCOL_VERSION,
+            "valid": True,
+            "job_id": spec.job.name,
+            "spec_hash": digest,
+            "spec_path": str(spec_path),
+            "size_bytes": total,
+            "files": sorted(decoded),
+            "warnings": warnings,
+        }
+
+    def _audit_upload_rejected(self, errors: list[dict[str, Any]]) -> None:
+        """Audit a rejected bundle — field names only, never file contents or
+        host paths (spec 15)."""
+        if self.audit is None:
+            return
+        self.audit.append(
+            {"event": "job.upload_rejected", "fields": [e["field"] for e in errors]}
+        )
 
     # --- cron scheduling (spec 06) -------------------------------------------
 

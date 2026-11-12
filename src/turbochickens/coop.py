@@ -9,7 +9,10 @@ static SPA at ``/`` and a JSON API under ``/api`` — ``/api/ping`` +
 ``POST /api/runs`` (enqueue by in-container spec path, trigger=manual),
 ``GET /api/runs?job=&status=``, ``GET /api/runs/{id}``, ``GET /api/runs/{id}/logs``,
 ``GET /api/results/{run_id}`` (validated output, or quarantine errors + raw
-output, or expired).
+output, or expired). Spec 15 adds the upload path: ``POST /api/jobs/validate``
+(validates — and, when valid, stores — a spec bundle sent as JSON with
+base64-encoded files, size-capped) and the bundle form of ``POST /api/runs``
+(store + validate + enqueue in one call, so the browser never needs a path).
 
 Transport seam: every API handler is a thin client of the existing Unix-socket
 protocol — it calls ``request(op, **payload)`` over the socket (spec 12) and
@@ -40,7 +43,12 @@ from typing import Any, Protocol
 from aiohttp import web
 
 from turbochickens.client import DaemonUnreachable, request_async
-from turbochickens.settings import Settings
+from turbochickens.settings import UPLOAD_MAX_BYTES, UPLOAD_MAX_HTTP_BODY, Settings
+
+#: backstop for request bodies (spec 15): a bundle at the decoded cap encodes
+#: to ~4/3 in base64 inside JSON — allow that plus slack; the daemon enforces
+#: the real decoded-bytes cap and answers 413 with a clear error.
+CLIENT_MAX_BODY = UPLOAD_MAX_HTTP_BODY
 
 #: static SPA bundled with the package (index + app.js + styles.css + icons)
 STATIC_ROOT = files("turbochickens") / "coop_static"
@@ -133,7 +141,7 @@ class CoopServer:
         return {"enabled": True, "url": self.url, "auth_required": self.auth.required}
 
     async def start(self) -> None:
-        app = web.Application(middlewares=[self._auth_middleware])
+        app = web.Application(middlewares=[self._auth_middleware], client_max_size=CLIENT_MAX_BODY)
         app.router.add_get("/api/ping", self._api_ping)
         app.router.add_get("/api/status", self._api_status)
         # spec 13: read-only mirrors of the GUI socket ops
@@ -142,6 +150,8 @@ class CoopServer:
         app.router.add_get("/api/settings", self._api_settings)
         # spec 14: runs from the GUI
         app.router.add_post("/api/runs", self._api_run_enqueue)
+        # spec 15: upload + validate job-spec bundles from the browser
+        app.router.add_post("/api/jobs/validate", self._api_jobs_validate)
         app.router.add_get("/api/runs", self._api_runs_list)
         app.router.add_get("/api/runs/{run_id}", self._api_run_show)
         app.router.add_get("/api/runs/{run_id}/logs", self._api_run_logs)
@@ -233,35 +243,117 @@ class CoopServer:
 
     # --- spec 14: runs from the GUI -------------------------------------------
 
-    async def _api_run_enqueue(self, request: web.Request) -> web.Response:
-        """POST /api/runs — enqueue a manual run by in-container spec path.
-        The daemon re-validates the spec itself; a refused enqueue is a 422
-        carrying the socket response, a malformed body a 400."""
+    async def _json_body(self, request: web.Request) -> tuple[Any, web.Response | None]:
+        """Read one JSON request body. Returns (body, None), or (None, response):
+        413 when the raw body exceeds the client_max_size backstop (spec 15
+        bundles are large), 400 when it is not JSON."""
         try:
-            body = await request.json()
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            body = None
-        if (
-            not isinstance(body, dict)
-            or not isinstance(body.get("spec_path"), str)
-            or not body["spec_path"].strip()
-        ):
-            return web.json_response(
+            return await request.json(), None
+        except web.HTTPRequestEntityTooLarge:
+            return None, web.json_response(
                 {
                     "ok": False,
-                    "op": "enqueue",
-                    "error": "POST /api/runs needs a JSON body with a spec_path string (an in-container path)",
+                    "too_large": True,
+                    "error": (
+                        "request body too large: a spec bundle is capped at "
+                        f"{UPLOAD_MAX_BYTES // (1024 * 1024)} MiB decoded"
+                    ),
                 },
+                status=413,
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None, web.json_response({"ok": False, "error": "expected a JSON body"}, status=400)
+
+    def _upload_error_response(
+        self, resp: dict[str, Any] | None, down: web.Response | None
+    ) -> web.Response | None:
+        """Map a `jobs_upload` socket response to an HTTP error response, or
+        None when the upload succeeded. 413 over the size cap, 422 carrying
+        the field-named errors for an invalid bundle, 400 for a malformed
+        request, and the structured daemon-down payload (200) when the socket
+        is dead — never a 500."""
+        if down is not None:
+            return down
+        assert resp is not None
+        if resp.get("too_large"):
+            return web.json_response(resp, status=413)
+        if resp.get("valid") is False:
+            return web.json_response(resp, status=422)
+        if not resp.get("ok"):
+            return web.json_response(resp, status=400)
+        return None
+
+    async def _api_run_enqueue(self, request: web.Request) -> web.Response:
+        """POST /api/runs — enqueue a manual run, either by in-container spec
+        path (``{"spec_path": …}``) or as a spec bundle (``{"files": {path:
+        base64}}``, spec 15: stored + validated by the daemon's jobs_upload
+        op, then enqueued by the stored path — the browser never needs one).
+        The daemon re-validates the spec itself; a refused enqueue is a 422
+        carrying the socket response, a malformed body a 400."""
+        body, err = await self._json_body(request)
+        if err is not None:
+            return err
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"ok": False, "op": "enqueue", "error": "POST /api/runs needs a JSON object body"},
                 status=400,
             )
-        payload: dict[str, Any] = {"spec_path": body["spec_path"].strip(), "trigger": "manual"}
-        if body.get("spec_hash"):
-            payload["spec_hash"] = str(body["spec_hash"])
+        if isinstance(body.get("files"), dict):
+            upload_resp, upload_down = await self._call("jobs_upload", files=body["files"])
+            mapped = self._upload_error_response(upload_resp, upload_down)
+            if mapped is not None:
+                return mapped
+            assert upload_resp is not None and upload_resp.get("ok")
+            payload: dict[str, Any] = {
+                "spec_path": upload_resp["spec_path"],
+                "spec_hash": upload_resp["spec_hash"],
+                "trigger": "manual",
+            }
+        else:
+            if not isinstance(body.get("spec_path"), str) or not body["spec_path"].strip():
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "op": "enqueue",
+                        "error": "POST /api/runs needs a JSON body with a spec_path string (an in-container path) or a files bundle",
+                    },
+                    status=400,
+                )
+            payload = {"spec_path": body["spec_path"].strip(), "trigger": "manual"}
+            if body.get("spec_hash"):
+                payload["spec_hash"] = str(body["spec_hash"])
         resp, down = await self._call("enqueue", **payload)
         if down is not None:
             return down
         assert resp is not None
         return web.json_response(resp, status=200 if resp.get("ok") else 422)
+
+    # --- spec 15: upload + validate job-spec bundles from the browser ----------
+
+    async def _api_jobs_validate(self, request: web.Request) -> web.Response:
+        """POST /api/jobs/validate — validate a spec bundle ``{"files": {path:
+        base64}}`` over the transport seam (the daemon's jobs_upload op, which
+        also stores valid bundles under uploads/). 200 with the spec hash and
+        the stored in-container spec path when valid, 422 with the field-named
+        errors when not, 413 over the size cap, 400 for a malformed body."""
+        body, err = await self._json_body(request)
+        if err is not None:
+            return err
+        if not isinstance(body, dict) or not isinstance(body.get("files"), dict) or not body["files"]:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "op": "jobs_upload",
+                    "error": "POST /api/jobs/validate needs a JSON body with a 'files' object mapping bundle paths to base64 content",
+                },
+                status=400,
+            )
+        resp, down = await self._call("jobs_upload", files=body["files"])
+        mapped = self._upload_error_response(resp, down)
+        if mapped is not None:
+            return mapped
+        assert resp is not None
+        return web.json_response(resp)
 
     async def _api_runs_list(self, request: web.Request) -> web.Response:
         """GET /api/runs?job=&status= — the runs table, filterable."""
