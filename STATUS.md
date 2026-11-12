@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 18 landed (272/272 tests green, coop container smoke verified on a real Docker daemon).
+**Last updated:** 2026-11-12, after spec 19 landed (286/286 tests green, auth & access management GUI verified over HTTP against a hermetic fake OAuth server, incl. a subprocess `tc coop start` e2e).
 
 ---
 
@@ -26,9 +26,9 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10 and specs 12–18 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, and the spec-18 commit). Spec 11 is the parent GUI spec; its first six slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
+**Spec 01 through spec 10 and specs 12–19 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, and the spec-19 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
 
-**Spec 19 (auth & access management UI) is backlogged** — `specs/19-auth-access-management-ui.md`, status ready-for-agent, not started. Note spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality.
+Spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality. Spec 19 gave seat auth a GUI surface (see below).
 Verified this session:
 
 ```
@@ -185,6 +185,34 @@ Verified this session:
 #   fresh ephemeral token printed once, jobs + runs + result + schedule all still there over HTTP
 #   and via `docker exec coop tc schedule list` / `tc runs list`; docker compose -f
 #   docker/compose.yaml config → valid
+# spec-19 smoke (temp settings, coop_enabled=true, seat provider `seatco` in providers.toml against a
+#   hermetic loopback fake OAuth server, no *_API_KEY in env):
+#   → GET /api/auth/providers → rows for every provider with mode; seatco mode=seat session=null;
+#     HTTP payload == socket auth_providers; no access_token/refresh_token keys, no token values
+#   → POST /api/auth/login {provider: seatco} → 200 {user_code, verification_uri, expires_at,
+#     interval} — device_code never in the response; POST /api/auth/login/status → 200
+#     status=authorized (auto-approve; pending_once → pending then authorized); session stored
+#     0600 at <data_dir>/seats/seatco.json; audit auth.login {provider, mode} only — never tokens
+#     or the user code; GET /api/auth/providers now shows session {expires_at, expired=false}
+#   → POST /api/auth/logout {provider: seatco} → 200, session file gone, providers session=null,
+#     audit auth.logout; second logout → 422; login on api-key provider / unknown provider → 422;
+#     poll without a start → 422; {} / non-string / non-JSON body → 400
+#   → GET /api/auth/access → {env_allowlist: [MISTRAL_API_KEY] (enforced), base_env_keys,
+#     network_policy: none (declared, enforcement post-MVP), scope: tools/data/mcp_servers/
+#     connectors placeholders} == socket auth_access
+#   → seat run after HTTP login → succeeded (fake provider saw "Bearer seat-access-1");
+#     runs_list rows carry auth_mode (seat for the seat run, none for a keyless vibe-cli run),
+#     GET /api/runs == socket runs_list; run.finished audit row has auth_mode
+#   → auth-required mode (0.0.0.0 + coop_auth_token): all five /api/auth/* endpoints → 401 without
+#     bearer, 200/422 with; /api/ping open; dead-socket transport → 200 {ok:false, daemon.up=false}
+#     on all five (POSTs included, never 500)
+#   → GET / serves the Auth view (nav entry + key icon, provider table with mode badges + session
+#     countdown, device-code login card, logout actions, Access scope card); app.js polls
+#     /api/auth/providers + /api/auth/access every 2 s and the device status every 2 s while a
+#     login is in flight; runs table has an Auth column; no host paths in the assets;
+#     no response body or audit row ever contains token/device-code material
+#   → subprocess e2e (`tc coop start` + fake OAuth): full login → status → providers → logout flow
+#     over HTTP, session 0600 on disk between, audit auth.login/auth.logout, SPA smoke, clean stop
 ```
 
 What exists:
@@ -221,7 +249,15 @@ src/turbochickens/
 │                          # spec 17: GET /api/stats (stats_list mirror), GET /api/stats/{job_id}
 │                          # (stats_show mirror; 404 "no usage stats" when the job has none), POST
 │                          # /api/retention/sweep (retention_sweep; 200 with the expired/deleted
-│                          # summary, 422 refused, 200 {daemon.up=false} when the socket is dead)
+│                          # summary, 422 refused, 200 {daemon.up=false} when the socket is dead);
+│                          # spec 19: GET /api/auth/providers (auth_providers mirror — mode + seat
+│                          # session expiry, never token material), GET /api/auth/access (declared
+│                          # access scope), POST /api/auth/login (auth_login_start — relays the
+│                          # user-facing user code + verification URI only), POST
+│                          # /api/auth/login/status (auth_login_poll — pending/authorized/expired),
+│                          # POST /api/auth/logout (auth_logout) — 200 ok / 422 refused / 400
+│                          # malformed / 200 {daemon.up=false} when the socket is dead; all behind
+│                          # the bearer middleware like every /api/* op
 │   └── coop_static/       # the dependency-free SPA (index.html + app.js + styles.css + lucide icons as
 │                          # local SVGs, no build step, no runtime CDN): 240px sidebar shell, wordmark +
 │                          # egg dot, nav, login card (sessionStorage bearer, no cookies), Dashboard with
@@ -243,7 +279,14 @@ src/turbochickens/
 │                          # from /api/stats/{job}, 2 s polling, flash on change) + Dashboard retention
 │                          # card ("Sweep now" primary button → POST /api/retention/sweep, outcome lists
 │                          # the result.expired entries inline; last sweep also shown from
-│                          # status.retention.last_sweep) — built to specs/00-design-system.md
+│                          # status.retention.last_sweep) — built to specs/00-design-system.md;
+│                          # spec 19: Auth view (nav entry + key-round icon, provider table with mode
+│                          # badges + seat-session expiry countdown + Login/Logout actions, device-code
+│                          # login card polling /api/auth/login/status every 2 s, read-only Access scope
+│                          # card from /api/auth/access) — app.js polls /api/auth/providers +
+│                          # /api/auth/access every 2 s; spec 19: the Runs table gained an Auth column
+│                          # and the run detail header shows the per-run auth mode (runs_list rows
+│                          # carry auth_mode from the manifest's spec-09 auth block)
 ├── storage.py             # init_db(): full MVP SQLite schema + `schedules` table (spec 06) +
 │                          # `job_usage_stats` percentile columns (spec 08, schema_version=3→4 migration)
 │                          # + `job_specs.spec_path` (spec 16, schema_version=4, in-place ALTER migration
@@ -260,7 +303,11 @@ src/turbochickens/
 │                          # 0600 under <data_dir>/seats/, refresh of expired tokens (fail-closed on
 │                          # revoked), token injected per-run under the provider's api_key_env;
 │                          # auth_telemetry() exposes only mode + token expiry (never tokens);
-│                          # bearer_token() (spec 10) hands the session token to `tc models list`
+│                          # bearer_token() (spec 10) hands the session token to `tc models list`;
+│                          # spec 19: login() is composed from start_device_flow() +
+│                          # poll_device_flow() (DeviceGrant holds the device_code server-side
+│                          # only) so the GUI can drive the same device flow one socket op at
+│                          # a time — same broker, same 0600 session store, no duplicated logic
 ├── adapter.py             # HarnessAdapter Protocol (prepare/execute/teardown) + CredentialProvider
 │                          # extension point + VibeCLIAdapter (headless subprocess pinned to the
 │                          # workspace, sanitized streamed logs) + MistralAPIAdapter (spec 05:
@@ -306,7 +353,14 @@ src/turbochickens/
 │                          # results_get reports expired artifacts; status carries a retention block
 │                          # + a coop block (spec 12: enabled/url/auth_required, never the token);
 │                          # spec 12: with coop_enabled, serve() also starts the coop HTTP server in
-│                          # the same loop and shutdown tears it down (audit coop.started/stopped)
+│                          # the same loop and shutdown tears it down (audit coop.started/stopped);
+│                          # spec 19: auth & access ops for the GUI — auth_providers (SeatBroker.status()
+│                          # rows: mode + session expiry, never tokens), auth_access (declared scope:
+│                          # env allowlist, network policy, tools/data/MCP/connectors placeholders),
+│                          # auth_login_start / auth_login_poll (device flow via the same SeatBroker;
+│                          # grants held in daemon memory, sessions stored 0600, audit auth.login with
+│                          # provider+mode only), auth_logout (deletes the session, audit auth.logout);
+│                          # runs_list rows also carry auth_mode (spec 19) from the manifest auth block
 ├── client.py              # request(socket, op, **payload) → parsed response; DaemonUnreachable;
 │                          # spec 12: request_async(...) — the same exchange awaitable inside a running
 │                          # loop (used by the coop web layer's SocketTransport); spec 15: the stream
@@ -401,6 +455,15 @@ tests/
                            # unaffected + status last_sweep, auth-required 401s, dead-socket daemon-down
                            # payloads on all three, served SPA Stats view + Dashboard retention card), and
                            # a subprocess e2e (`tc coop start` + fake vibe) running + sweeping over HTTP
+├── test_coop_auth.py      # spec 19: /api/auth/* against a thread coop daemon with a hermetic loopback
+                           # fake OAuth server behind a seat provider (providers list + socket parity,
+                           # device login flow over HTTP e2e auto-approve + pending-then-authorized,
+                           # session stored 0600, logout, 422/400 refusals, socket ops standalone,
+                           # runs_list auth_mode over HTTP == socket incl. a real seat run, no
+                           # token/device-code material in any response or audit row, auth-required
+                           # 401s when non-loopback, dead-socket daemon-down payloads on all five
+                           # endpoints, served SPA Auth view + runs Auth column, and a subprocess
+                           # e2e of `tc coop start` running the whole login → logout flow over HTTP
 ├── test_coop_container.py # spec 18: the shipped docker/settings.toml defaults (data_dir=/data, coop
                            # 0.0.0.0:8737, no fixed token, all stateful paths under /data), the
                            # Dockerfile contract (base, EXPOSE, VOLUME, loopback /api/ping HEALTHCHECK,
@@ -1046,9 +1109,32 @@ prints exactly once per start, the GUI + full upload→run→result→schedule f
 work over HTTP, and jobs/runs/results/schedules survive container replacement
 on the same volume.
 
-Next backlog item is **spec 19** (auth & access management UI), queued behind
-09 + 12. The MVP spec pipeline (01–10) is complete; what remains beyond the
-GUI is the post-MVP roadmap in baseline §13.
+Spec 19 (auth & access management in the GUI) landed: new socket ops
+`auth_providers` (each provider's mode + seat session expiry via
+`SeatBroker.status()`, never token material), `auth_access` (the declared
+access scope — per-run env allowlist, network policy `none`, and
+tools/data/MCP/connectors placeholders for the future host-broker layer),
+`auth_login_start` / `auth_login_poll` / `auth_logout` (the OAuth device flow
+driven one request at a time through the same `SeatBroker` — `login()` is now
+composed from the new `start_device_flow()` + `poll_device_flow()`, so the
+CLI and the GUI share one code path; device codes stay in daemon memory,
+sessions land 0600 under `<data_dir>/seats/`, audit rows `auth.login` /
+`auth.logout` carry provider + mode only), mirrored over the transport seam
+as `GET /api/auth/providers`, `GET /api/auth/access`, `POST /api/auth/login`,
+`POST /api/auth/login/status`, `POST /api/auth/logout` (422 on refusals, 400
+on malformed bodies, structured `daemon.up=false` when the socket is dead,
+bearer-required when non-loopback via the existing middleware); `runs_list`
+rows and the Runs view (new Auth column + detail header) surface the per-run
+`auth_mode` from the spec-09 manifest block; the SPA gained the Auth view
+(nav entry, provider table with mode badges + session expiry countdown,
+device-code login card that polls `/api/auth/login/status`, logout actions,
+and the read-only Access scope card) polling every 2 s — verified e2e over
+HTTP with a hermetic fake OAuth server, including a seat run after a GUI
+login and a subprocess `tc coop start` flow, with an explicit assertion that
+no response body or audit row ever contains token or device-code material.
+
+The MVP spec pipeline (01–10) and the GUI spec 11 slices (12–19) are
+complete; what remains is the post-MVP roadmap in baseline §13.
 
 **Deferred (backlog notes):**
 - *Async seat broker:* `SeatBroker` does its HTTP synchronously (httpx.Client)

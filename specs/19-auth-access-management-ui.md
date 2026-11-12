@@ -4,13 +4,13 @@
 
 **Blocked by:** 12 (coop skeleton: HTTP + auth shell + SPA + `/api` transport seam over the Unix socket) and 09 (seat broker + `tc auth` CLI)
 
-**Status:** ready-for-agent (backlogged 2026-11-12 — raised with spec 09; the seat broker landed CLI-side, the GUI surface is the natural next step)
+**Status:** done (2026-11-12 — implemented as socket ops `auth_providers` / `auth_access` / `auth_login_start` / `auth_login_poll` / `auth_logout` in `daemon.py` driving the same `SeatBroker` (its `login()` is now composed from the new `start_device_flow()` + `poll_device_flow()` steps, so CLI and GUI share one code path), mirrored over the transport seam as `/api/auth/*` in `coop.py`, with the SPA Auth view; 14 tests in `tests/test_coop_auth.py`)
 
-- [ ] `/api/auth/providers` lists each provider from providers.toml with its auth mode, and for seat providers the stored session state (expires_at, expired) — **never any token material**; backed by a new socket op (or a thin web-layer call into `SeatBroker.status()`), following the spec-12 transport seam
-- [ ] `/api/auth/login` starts the OAuth device flow and relays the verification URI + user code to the browser; `/api/auth/login/status` polls until authorized/expired; on success the session is stored 0600 under `<data_dir>/seats/` exactly as the CLI path (same `SeatBroker`, no duplicated logic)
-- [ ] `/api/auth/logout` deletes a provider's stored session
-- [ ] Auth-mutating API ops require the coop auth token whenever the server is bound non-loopback (spec 12 rule); loopback stays open
-- [ ] GUI: sidebar gains an "Auth" nav entry (design system shell, spec 00): provider table with mode badges, seat-session expiry countdown, login (shows the device code + link) and logout actions; runs view / audit view surface the per-run `auth_mode` from spec 09 manifests
-- [ ] Access groundwork (read-only first): an "Access" section listing the declared scope — per-run env allowlist, network policy `none`, and placeholders for tools / data / MCP / connectors access — so a future access-control layer has a UI home; no enforcement beyond what specs 02–09 already enforce
-- [ ] Audit: seat login/logout events append audit rows (`auth.login`, `auth.logout` — provider + mode only, never tokens or codes beyond the user-facing device code handling rules of spec 09)
-- [ ] Tests: HTTP API against a thread daemon on a temp port with a hermetic loopback fake OAuth server — providers list, device login flow end-to-end (auto-approve), logout, auth-required-when-non-loopback, and an assertion that no response body ever contains token material; page-served smoke like spec 12; no browser automation
+- [x] `/api/auth/providers` lists each provider from providers.toml with its auth mode, and for seat providers the stored session state (expires_at, expired) — **never any token material**; backed by a new socket op (or a thin web-layer call into `SeatBroker.status()`), following the spec-12 transport seam
+- [x] `/api/auth/login` starts the OAuth device flow and relays the verification URI + user code to the browser; `/api/auth/login/status` polls until authorized/expired; on success the session is stored 0600 under `<data_dir>/seats/` exactly as the CLI path (same `SeatBroker`, no duplicated logic)
+- [x] `/api/auth/logout` deletes a provider's stored session
+- [x] Auth-mutating API ops require the coop auth token whenever the server is bound non-loopback (spec 12 rule); loopback stays open
+- [x] GUI: sidebar gains an "Auth" nav entry (design system shell, spec 00): provider table with mode badges, seat-session expiry countdown, login (shows the device code + link) and logout actions; runs view / audit view surface the per-run `auth_mode` from spec 09 manifests
+- [x] Access groundwork (read-only first): an "Access" section listing the declared scope — per-run env allowlist, network policy `none`, and placeholders for tools / data / MCP / connectors access — so a future access-control layer has a UI home; no enforcement beyond what specs 02–09 already enforce
+- [x] Audit: seat login/logout events append audit rows (`auth.login`, `auth.logout` — provider + mode only, never tokens or codes beyond the user-facing device code handling rules of spec 09)
+- [x] Tests: HTTP API against a thread daemon on a temp port with a hermetic loopback fake OAuth server — providers list, device login flow end-to-end (auto-approve), logout, auth-required-when-non-loopback, and an assertion that no response body ever contains token material; page-served smoke like spec 12; no browser automation

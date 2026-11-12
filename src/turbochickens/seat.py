@@ -54,6 +54,26 @@ def _iso(epoch: float) -> str:
 
 
 @dataclass
+class DeviceGrant:
+    """An in-flight OAuth device-flow grant (spec 09/19). The `device_code`
+    is the grant credential — it stays server-side (daemon memory), it is
+    never returned to a caller or written to the audit log. Only the
+    user-facing `user_code` + `verification_uri` leave the broker (CLI
+    prints them; the GUI relays them to the browser)."""
+
+    provider: str
+    device_code: str
+    user_code: str
+    verification_uri: str
+    interval: float
+    expires_at: float  # epoch seconds
+
+    @property
+    def expired(self) -> bool:
+        return time.time() >= self.expires_at
+
+
+@dataclass
 class SeatSession:
     """One provider's stored seat session. The access/refresh tokens are
     secrets: they live only in the 0600 file, never in manifests/audit."""
@@ -302,12 +322,9 @@ class SeatBroker:
             scope=payload.get("scope"),
         )
 
-    # --- device flow (tc auth login) ------------------------------------------
+    # --- device flow (tc auth login / spec 19 GUI login) ----------------------
 
-    def login(self, provider_name: str, notify: Callable[[str], None] = print) -> SeatSession:
-        """Run the OAuth device flow for a seat provider and store the session.
-        Prints the verification URI + user code via `notify`, then polls the
-        token endpoint until the user authorizes, it expires, or times out."""
+    def _seat_provider(self, provider_name: str) -> ProviderProfile:
         provider = self.providers.providers.get(provider_name)
         if provider is None:
             raise SeatError(
@@ -317,6 +334,15 @@ class SeatBroker:
             raise SeatError(
                 f"provider {provider_name!r} uses auth='api-key'; no seat login — set ${provider.api_key_env} instead"
             )
+        assert provider.oauth_device_url and provider.oauth_token_url and provider.oauth_client_id
+        return provider
+
+    def start_device_flow(self, provider_name: str) -> DeviceGrant:
+        """Start the OAuth device flow: POST the device endpoint and return
+        the grant. Only the user-facing user_code + verification_uri ride on
+        the grant; the device_code stays inside the broker (and, for the GUI
+        path, in daemon memory) — never in a response or the audit log."""
+        provider = self._seat_provider(provider_name)
         assert provider.oauth_device_url and provider.oauth_token_url and provider.oauth_client_id
         client, owned = self._http()
         try:
@@ -336,40 +362,74 @@ class SeatBroker:
             expires_in = float(dev.get("expires_in", 1800) or 1800)
             if not device_code or not verification_uri:
                 raise SeatError(f"device endpoint for provider {provider_name!r} returned an incomplete device grant")
-            notify(f"authorize TurboChickens: open {verification_uri} and enter code {user_code}")
-            deadline = time.time() + expires_in
-            while time.time() < deadline:
-                time.sleep(max(interval, 0.05))
-                resp = client.post(
-                    provider.oauth_token_url,
-                    data={
-                        "grant_type": DEVICE_CODE_GRANT,
-                        "device_code": device_code,
-                        "client_id": provider.oauth_client_id,
-                    },
-                )
-                if resp.status_code == 200:
-                    session = self._session_from_token(provider_name, resp.json())
-                    self.store.save(session)
-                    return session
-                try:
-                    error = resp.json().get("error", "")
-                except ValueError:
-                    error = resp.text[:200]
-                if error == "authorization_pending":
-                    continue
-                if error == "slow_down":
-                    interval = min(interval * 1.5, 30.0)
-                    continue
-                raise SeatError(
-                    f"device login for provider {provider_name!r} failed (http {resp.status_code}: {error})"
-                )
-            raise SeatError(f"device login for provider {provider_name!r} timed out (device code expired)")
+            return DeviceGrant(
+                provider=provider_name,
+                device_code=str(device_code),
+                user_code=str(user_code),
+                verification_uri=str(verification_uri),
+                interval=interval,
+                expires_at=time.time() + expires_in,
+            )
         except httpx.TransportError as e:
             raise SeatError(f"OAuth endpoint for provider {provider_name!r} unreachable: {e}") from e
         finally:
             if owned:
                 client.close()
+
+    def poll_device_flow(self, grant: DeviceGrant) -> dict[str, Any]:
+        """One poll step of the device flow. Returns ``{"status": "pending"}``
+        (authorization_pending, or slow_down — which also widens
+        ``grant.interval``) or ``{"status": "authorized", "session": …}`` —
+        on success the session is stored 0600 exactly as the CLI path.
+        Raises SeatError on a hard failure (rejected grant, transport)."""
+        provider = self.providers.providers[grant.provider]
+        assert provider.oauth_token_url and provider.oauth_client_id
+        client, owned = self._http()
+        try:
+            resp = client.post(
+                provider.oauth_token_url,
+                data={
+                    "grant_type": DEVICE_CODE_GRANT,
+                    "device_code": grant.device_code,
+                    "client_id": provider.oauth_client_id,
+                },
+            )
+        except httpx.TransportError as e:
+            raise SeatError(f"token endpoint for provider {grant.provider!r} unreachable: {e}") from e
+        finally:
+            if owned:
+                client.close()
+        if resp.status_code == 200:
+            session = self._session_from_token(grant.provider, resp.json())
+            self.store.save(session)
+            return {"status": "authorized", "session": session}
+        try:
+            error = resp.json().get("error", "")
+        except ValueError:
+            error = resp.text[:200]
+        if error == "authorization_pending":
+            return {"status": "pending"}
+        if error == "slow_down":
+            grant.interval = min(grant.interval * 1.5, 30.0)
+            return {"status": "pending"}
+        raise SeatError(
+            f"device login for provider {grant.provider!r} failed (http {resp.status_code}: {error})"
+        )
+
+    def login(self, provider_name: str, notify: Callable[[str], None] = print) -> SeatSession:
+        """Run the OAuth device flow for a seat provider and store the session.
+        Prints the verification URI + user code via `notify`, then polls the
+        token endpoint until the user authorizes, it expires, or times out.
+        Composed from `start_device_flow` + `poll_device_flow` — the same two
+        steps the spec-19 GUI path drives one request at a time."""
+        grant = self.start_device_flow(provider_name)
+        notify(f"authorize TurboChickens: open {grant.verification_uri} and enter code {grant.user_code}")
+        while not grant.expired:
+            time.sleep(max(grant.interval, 0.05))
+            outcome = self.poll_device_flow(grant)
+            if outcome["status"] == "authorized":
+                return outcome["session"]
+        raise SeatError(f"device login for provider {provider_name!r} timed out (device code expired)")
 
     def logout(self, provider_name: str) -> None:
         if not self.store.delete(provider_name):

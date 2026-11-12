@@ -21,6 +21,18 @@ bundle — stored first, then scheduled by the stored path), and
 (stats_show mirror, 404 when the job has no stats yet) — and
 ``POST /api/retention/sweep`` (the on-demand retention_sweep op, whose
 response lists every deletion as a ``result.expired`` entry).
+Spec 19 adds the auth path: ``GET /api/auth/providers`` (each provider's auth
+mode + seat session expiry, never token material), ``GET /api/auth/access``
+(the declared access scope — env allowlist, network policy, tools/data/MCP/
+connectors placeholders), ``POST /api/auth/login`` (starts the OAuth device
+flow, relaying only the user-facing user code + verification URI),
+``POST /api/auth/login/status`` (one poll step: pending / authorized /
+expired; the daemon stores the session 0600 via the same SeatBroker as the
+CLI), and ``POST /api/auth/logout`` — all thin mirrors of the new socket ops
+over the transport seam, 422 on a refusal, 400 on a malformed body, and the
+structured daemon-down payload (200) when the socket is dead. They sit behind
+the bearer middleware like every other ``/api/*`` op, so auth-mutating ops
+require the coop token whenever the server is bound non-loopback.
 
 Transport seam: every API handler is a thin client of the existing Unix-socket
 protocol — it calls ``request(op, **payload)`` over the socket (spec 12) and
@@ -172,6 +184,12 @@ class CoopServer:
         app.router.add_get("/api/stats", self._api_stats_list)
         app.router.add_get("/api/stats/{job_id}", self._api_stats_show)
         app.router.add_post("/api/retention/sweep", self._api_retention_sweep)
+        # spec 19: auth & access management from the GUI
+        app.router.add_get("/api/auth/providers", self._api_auth_providers)
+        app.router.add_get("/api/auth/access", self._api_auth_access)
+        app.router.add_post("/api/auth/login", self._api_auth_login)
+        app.router.add_post("/api/auth/login/status", self._api_auth_login_status)
+        app.router.add_post("/api/auth/logout", self._api_auth_logout)
         app.router.add_get("/", self._index)
         app.router.add_get("/{tail:.*}", self._static_file)
         self._runner = web.AppRunner(app)
@@ -498,6 +516,74 @@ class CoopServer:
             return down
         assert resp is not None
         return web.json_response(resp, status=200 if resp.get("ok") else 422)
+
+    # --- spec 19: auth & access management from the GUI -------------------------
+
+    async def _api_auth_providers(self, request: web.Request) -> web.Response:
+        """GET /api/auth/providers — every provider's auth mode plus its seat
+        session state (expiry only, never token material): the auth_providers
+        socket op mirrored over the transport seam."""
+        return await self._mirror("auth_providers")
+
+    async def _api_auth_access(self, request: web.Request) -> web.Response:
+        """GET /api/auth/access — the declared access scope (env allowlist,
+        network policy, tools/data/MCP/connector placeholders): the
+        auth_access socket op mirrored, read-only."""
+        return await self._mirror("auth_access")
+
+    async def _api_auth_login_body(self, request: web.Request, op: str) -> tuple[str | None, web.Response | None]:
+        """Shared body handling for the auth-mutating POSTs: a JSON object
+        with a non-empty ``provider`` string. Returns (provider, None), or
+        (None, response) with 400 on a malformed body."""
+        body, err = await self._json_body(request)
+        if err is not None:
+            return None, err
+        if not isinstance(body, dict) or not isinstance(body.get("provider"), str) or not body["provider"].strip():
+            return None, web.json_response(
+                {
+                    "ok": False,
+                    "op": op,
+                    "error": "POST needs a JSON body with a provider string",
+                },
+                status=400,
+            )
+        return body["provider"].strip(), None
+
+    async def _api_auth_mutation(self, request: web.Request, op: str) -> web.Response:
+        """Run one auth-mutating socket op (auth_login_start / auth_login_poll /
+        auth_logout) over the transport seam: 200 with the payload (pending /
+        authorized / expired are all ok:true), 422 with the socket error on a
+        refusal (unknown provider, not a seat provider, no login in progress,
+        no stored session), 400 on a malformed body, and the structured
+        daemon-down payload (200) when the socket is dead — never a 500. All
+        of these sit behind the bearer middleware like every /api/* op, so
+        they require the coop token whenever the server is non-loopback."""
+        provider, err = await self._api_auth_login_body(request, op)
+        if err is not None:
+            return err
+        assert provider is not None
+        resp, down = await self._call(op, provider=provider)
+        if down is not None:
+            return down
+        assert resp is not None
+        return web.json_response(resp, status=200 if resp.get("ok") else 422)
+
+    async def _api_auth_login(self, request: web.Request) -> web.Response:
+        """POST /api/auth/login {provider} — start the OAuth device flow; the
+        response carries the user-facing user code + verification URI to show
+        in the browser (never the device code or any token material)."""
+        return await self._api_auth_mutation(request, "auth_login_start")
+
+    async def _api_auth_login_status(self, request: web.Request) -> web.Response:
+        """POST /api/auth/login/status {provider} — one poll step of the
+        started device flow: pending / authorized (session stored 0600 by the
+        daemon, audited as auth.login) / expired."""
+        return await self._api_auth_mutation(request, "auth_login_poll")
+
+    async def _api_auth_logout(self, request: web.Request) -> web.Response:
+        """POST /api/auth/logout {provider} — delete the provider's stored
+        seat session (audited as auth.logout); 422 when none is stored."""
+        return await self._api_auth_mutation(request, "auth_logout")
 
     # --- static SPA ----------------------------------------------------------
 

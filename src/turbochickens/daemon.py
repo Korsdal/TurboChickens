@@ -39,6 +39,17 @@ and ``/api/ping`` + ``/api/status`` under ``/api``, thin mirrors of the socket
 ops called over the daemon's own socket. Loopback + no token → open;
 non-loopback (or any configured token) → bearer required, with an ephemeral
 token printed once at startup when none is configured.
+
+Spec 19 (auth & access management in the GUI) adds the ops behind the Auth
+view: ``auth_providers`` (each provider's auth mode + seat session expiry via
+``SeatBroker.status()`` — never token material), ``auth_access`` (the declared
+access scope: per-run env allowlist, network policy, tools/data/MCP/connectors
+placeholders), ``auth_login_start`` / ``auth_login_poll`` (the OAuth device
+flow driven one request at a time through the same ``SeatBroker`` — the
+device_code stays in daemon memory, sessions land 0600 under
+``<data_dir>/seats/`` exactly as the CLI path, audit rows ``auth.login`` /
+``auth.logout`` carry provider + mode only), and ``auth_logout``.
+``runs_list`` rows also carry ``auth_mode`` from the run manifest.
 """
 
 from __future__ import annotations
@@ -58,14 +69,22 @@ from pathlib import Path
 from typing import Any
 
 from turbochickens import __version__
-from turbochickens.adapter import AdapterNotImplemented, ProviderConfigError, run_weight
+from turbochickens.adapter import (
+    BASE_ENV_KEYS,
+    DEFAULT_CREDENTIAL_ALLOWLIST,
+    AdapterNotImplemented,
+    ProviderConfigError,
+    run_weight,
+)
 from turbochickens.audit import AuditLog
 from turbochickens.providers import ProvidersConfig, load_providers
 from turbochickens.retention import sweep_expired_results
 from turbochickens.runner import TERMINAL_STATES, RunPipeline
 from turbochickens.scheduler import CronScheduler
+from turbochickens.seat import DeviceGrant, SeatBroker, SeatError, _iso
 from turbochickens.settings import SOCKET_STREAM_LIMIT, UPLOAD_MAX_BYTES, Settings
 from turbochickens.spec.loader import SpecValidationError, load_spec, spec_hash
+from turbochickens.spec.model import NETWORK_POLICIES
 from turbochickens.storage import init_db
 from turbochickens.util import utcnow, utcnow_iso
 
@@ -135,6 +154,9 @@ class Daemon:
         self._retention_task: asyncio.Task | None = None
         self._last_retention: dict[str, Any] | None = None
         self._run_tasks: set[asyncio.Task] = set()
+        # spec 19: seat broker for the auth ops + in-flight device grants
+        self._broker: SeatBroker | None = None
+        self._device_grants: dict[str, DeviceGrant] = {}
 
     def request_stop(self) -> None:
         if self._stop is not None:
@@ -324,6 +346,17 @@ class Daemon:
             return self._audit_tail(req)
         if op == "settings_get":
             return self._settings_get()
+        # spec 19: auth & access management for the GUI
+        if op == "auth_providers":
+            return self._auth_providers()
+        if op == "auth_access":
+            return self._auth_access()
+        if op == "auth_login_start":
+            return self._auth_login_start(req)
+        if op == "auth_login_poll":
+            return self._auth_login_poll(req)
+        if op == "auth_logout":
+            return self._auth_logout(req)
         if op == "shutdown":
             self.request_stop()
             return {"ok": True, "op": "shutdown", "protocol": PROTOCOL_VERSION, "message": "shutting down"}
@@ -568,7 +601,8 @@ class Daemon:
         """Runs, most recent first. Optional filters (spec 14, used by the GUI):
         `job` matches the job id or name, `status` is an exact status match.
         Each row also carries `result_valid` (None when the run never reached
-        collecting) so the runs table can show the quarantined state."""
+        collecting) so the runs table can show the quarantined state, and
+        `auth_mode` (spec 19) from the run manifest's spec-09 auth block."""
         if self.db is None:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "db not ready"}
         req = req or {}
@@ -586,24 +620,38 @@ class Daemon:
         rows = self.db.execute(
             "SELECT r.id, r.job_id, j.name, r.status, r.trigger, r.started_at, r.finished_at,"
             " (SELECT COUNT(*) FROM teardown_attestations t WHERE t.run_id = r.id),"
-            " (SELECT valid FROM results WHERE run_id = r.id)"
+            " (SELECT valid FROM results WHERE run_id = r.id),"
+            " r.manifest_json"
             f" FROM runs r JOIN job_specs j ON j.id = r.job_id{where} ORDER BY r.rowid DESC",
             params,
         ).fetchall()
-        runs = [
-            {
-                "id": r[0],
-                "job_id": r[1],
-                "job_name": r[2],
-                "status": r[3],
-                "trigger": r[4],
-                "started_at": r[5],
-                "finished_at": r[6],
-                "attested": bool(r[7]),
-                "result_valid": None if r[8] is None else bool(r[8]),
-            }
-            for r in rows
-        ]
+        runs = []
+        for r in rows:
+            # spec 19: surface the per-run auth mode (spec 09 manifest block)
+            # in the runs table — a mode string only, never token material
+            auth_mode = None
+            if r[9]:
+                try:
+                    manifest = json.loads(r[9])
+                    auth = manifest.get("auth") if isinstance(manifest, dict) else None
+                    if isinstance(auth, dict):
+                        auth_mode = auth.get("mode")
+                except (ValueError, TypeError):
+                    auth_mode = None
+            runs.append(
+                {
+                    "id": r[0],
+                    "job_id": r[1],
+                    "job_name": r[2],
+                    "status": r[3],
+                    "trigger": r[4],
+                    "started_at": r[5],
+                    "finished_at": r[6],
+                    "attested": bool(r[7]),
+                    "result_valid": None if r[8] is None else bool(r[8]),
+                    "auth_mode": auth_mode,
+                }
+            )
         return {"ok": True, "op": "runs_list", "protocol": PROTOCOL_VERSION, "runs": runs}
 
     def _runs_show(self, req: dict[str, Any]) -> dict[str, Any]:
@@ -853,6 +901,151 @@ class Daemon:
             "protocol": PROTOCOL_VERSION,
             "settings": {**self.settings.public_dict(), "coop": self._coop_block()},
         }
+
+    # --- spec 19: auth & access management for the GUI -------------------------
+
+    def _seat_broker(self) -> SeatBroker:
+        """The one SeatBroker for the auth ops — the same broker class the
+        runner hands to the adapters, so the GUI path stores sessions 0600
+        under <data_dir>/seats/ exactly as `tc auth login` does."""
+        if self._broker is None:
+            assert self.providers is not None
+            self._broker = SeatBroker(self.settings, self.providers)
+        return self._broker
+
+    def _auth_providers(self) -> dict[str, Any]:
+        """Every provider from providers.toml with its auth mode, plus the
+        stored seat session state (expiry only) — `SeatBroker.status()` never
+        returns token material, and neither does this response."""
+        return {
+            "ok": True,
+            "op": "auth_providers",
+            "protocol": PROTOCOL_VERSION,
+            "providers": self._seat_broker().status(),
+        }
+
+    def _auth_access(self) -> dict[str, Any]:
+        """The declared access scope (spec 19, read-only groundwork): the
+        per-run env allowlist the pipeline actually enforces, the declared
+        network policy, and placeholders for tools / data / MCP / connectors
+        so a future host-broker access layer (baseline v0.2 §7) has a home.
+        No enforcement beyond what specs 02–09 already enforce."""
+        placeholder = (
+            "declared: none — placeholder for the host broker deciding what a job may touch (baseline v0.2 §7)"
+        )
+        return {
+            "ok": True,
+            "op": "auth_access",
+            "protocol": PROTOCOL_VERSION,
+            "access": {
+                "env_allowlist": list(DEFAULT_CREDENTIAL_ALLOWLIST),
+                "env_allowlist_enforced": True,
+                "base_env_keys": list(BASE_ENV_KEYS),
+                "network_policy": "none",
+                "network_allowed": list(NETWORK_POLICIES),
+                "network_enforced": False,
+                "network_note": "declared in resources.network; enforcement is post-MVP",
+                "scope": [
+                    {"kind": kind, "declared": None, "note": placeholder}
+                    for kind in ("tools", "data", "mcp_servers", "connectors")
+                ],
+            },
+        }
+
+    def _auth_login_start(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Start the OAuth device flow for a seat provider. Returns only the
+        user-facing user_code + verification_uri (+ expiry/interval) — the
+        device_code stays in daemon memory. The session itself is stored by
+        `auth_login_poll` on authorization, through the same SeatBroker path
+        as the CLI."""
+        provider = str(req.get("provider", ""))
+        if not provider:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "auth_login_start requires provider"}
+        try:
+            grant = self._seat_broker().start_device_flow(provider)
+        except SeatError as e:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": str(e)}
+        self._device_grants[provider] = grant
+        return {
+            "ok": True,
+            "op": "auth_login_start",
+            "protocol": PROTOCOL_VERSION,
+            "provider": provider,
+            "mode": "seat",
+            "user_code": grant.user_code,
+            "verification_uri": grant.verification_uri,
+            "interval": grant.interval,
+            "expires_at": _iso(grant.expires_at),
+        }
+
+    def _auth_login_poll(self, req: dict[str, Any]) -> dict[str, Any]:
+        """One poll step of a started device flow: pending / authorized /
+        expired. On authorized the session is stored 0600 (same SeatBroker
+        path as the CLI) and audited as `auth.login` — provider + mode only,
+        never tokens or codes."""
+        provider = str(req.get("provider", ""))
+        if not provider:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "auth_login_poll requires provider"}
+        grant = self._device_grants.get(provider)
+        if grant is None:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": f"no device login in progress for provider {provider!r}; start one first",
+            }
+        if grant.expired:
+            del self._device_grants[provider]
+            return {
+                "ok": True,
+                "op": "auth_login_poll",
+                "protocol": PROTOCOL_VERSION,
+                "provider": provider,
+                "status": "expired",
+            }
+        try:
+            outcome = self._seat_broker().poll_device_flow(grant)
+        except SeatError as e:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": str(e)}
+        if outcome["status"] == "authorized":
+            del self._device_grants[provider]
+            session = outcome["session"]
+            assert self.audit is not None
+            self.audit.append({"event": "auth.login", "provider": provider, "mode": "seat"})
+            return {
+                "ok": True,
+                "op": "auth_login_poll",
+                "protocol": PROTOCOL_VERSION,
+                "provider": provider,
+                "status": "authorized",
+                "session": {
+                    "expires_at": _iso(session.expires_at),
+                    "expired": session.expired,
+                    "token_type": session.token_type,
+                },
+            }
+        return {
+            "ok": True,
+            "op": "auth_login_poll",
+            "protocol": PROTOCOL_VERSION,
+            "provider": provider,
+            "status": "pending",
+            "interval": grant.interval,
+            "expires_at": _iso(grant.expires_at),
+        }
+
+    def _auth_logout(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Delete a provider's stored seat session (tokens removed, not
+        revoked) and audit `auth.logout` — provider + mode only."""
+        provider = str(req.get("provider", ""))
+        if not provider:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "auth_logout requires provider"}
+        try:
+            self._seat_broker().logout(provider)
+        except SeatError as e:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": str(e)}
+        assert self.audit is not None
+        self.audit.append({"event": "auth.logout", "provider": provider, "mode": "seat"})
+        return {"ok": True, "op": "auth_logout", "protocol": PROTOCOL_VERSION, "provider": provider}
 
     # --- spec 15: upload + validate job-spec bundles from the GUI -------------
 

@@ -6,8 +6,8 @@
 
   const TOKEN_KEY = "tc.coop.token";
   const POLL_MS = 2000;
-  const VIEWS = ["dashboard", "runs", "jobs", "schedules", "stats", "audit", "settings"];
-  const VIEW_LOADERS = { dashboard: loadStatus, runs: loadRuns, jobs: loadJobs, schedules: loadSchedules, stats: loadStats, audit: loadAudit, settings: loadSettings };
+  const VIEWS = ["dashboard", "runs", "jobs", "schedules", "stats", "audit", "settings", "auth"];
+  const VIEW_LOADERS = { dashboard: loadStatus, runs: loadRuns, jobs: loadJobs, schedules: loadSchedules, stats: loadStats, audit: loadAudit, settings: loadSettings, auth: loadAuth };
 
   const RUN_STATUSES = ["queued", "provisioning", "running", "collecting", "finalizing", "succeeded", "failed"];
 
@@ -608,14 +608,14 @@
     }
     showCard("#runs-empty", "#runs-card");
     const tbody = $("#runs-tbody");
-    const sig = JSON.stringify(runs.map((r) => [r.id, r.status, r.result_valid, r.finished_at, r.attested]));
+    const sig = JSON.stringify(runs.map((r) => [r.id, r.status, r.result_valid, r.finished_at, r.attested, r.auth_mode]));
     if (tbody.dataset.sig !== sig) {
       tbody.dataset.sig = sig;
       tbody.replaceChildren();
       const seen = new Set();
       for (const r of runs) {
         seen.add(r.id);
-        const rowSig = JSON.stringify([r.status, r.result_valid, r.finished_at, r.attested]);
+        const rowSig = JSON.stringify([r.status, r.result_valid, r.finished_at, r.attested, r.auth_mode]);
         const changed = lastRunSigs[r.id] !== undefined && lastRunSigs[r.id] !== rowSig;
         lastRunSigs[r.id] = rowSig;
         const tr = el("tr", "run-row" + (r.id === selectedRunId ? " selected" : "") + (changed ? " flash" : ""));
@@ -636,6 +636,7 @@
         stTd.appendChild(st);
         tr.appendChild(stTd);
         tr.appendChild(el("td", "mono muted", r.trigger || "—"));
+        tr.appendChild(el("td", "mono muted", r.auth_mode || "—")); // spec 19: per-run auth mode
         tr.appendChild(el("td", "mono muted", r.started_at || "—"));
         tr.appendChild(el("td", "mono muted", r.finished_at || "—"));
         tr.addEventListener("click", (ev) => {
@@ -676,7 +677,8 @@
     const d = $("#detail-dot");
     d.className = "dot " + dot.cls;
     $("#detail-title").textContent = run.id;
-    $("#detail-job").textContent = run.job_name + " · " + run.trigger + " · " + run.status;
+    const authMode = run.manifest && run.manifest.auth && run.manifest.auth.mode;
+    $("#detail-job").textContent = run.job_name + " · " + run.trigger + " · " + run.status + (authMode ? " · auth " + authMode : "");
     $("#tab-result").textContent = run.result && run.result.valid === false ? "Quarantine" : "Result";
 
     const manifestPre = $("#manifest-pre");
@@ -1221,6 +1223,237 @@
       flashCard(card);
     }
   }
+
+  /* --- auth view (spec 19): providers + seat sessions + declared access scope --- */
+
+  function authError(msg) {
+    const p = $("#auth-error");
+    if (!msg) {
+      p.hidden = true;
+      p.textContent = "";
+      return;
+    }
+    p.textContent = msg;
+    p.hidden = false;
+  }
+
+  function fmtCountdown(iso) {
+    // "expires 2026-11-12T…Z · in 59m" / "expired 2026-11-11T…Z"
+    if (!iso) return "—";
+    const t = Date.parse(iso);
+    if (!isFinite(t)) return iso;
+    const diffSec = Math.round((t - Date.now()) / 1000);
+    const when = iso;
+    if (diffSec <= 0) return "expired " + when;
+    if (diffSec < 3600) return "expires " + when + " · in " + Math.max(1, Math.floor(diffSec / 60)) + "m";
+    if (diffSec < 86400) return "expires " + when + " · in " + Math.floor(diffSec / 3600) + "h " + Math.floor((diffSec % 3600) / 60) + "m";
+    return "expires " + when + " · in " + Math.floor(diffSec / 86400) + "d";
+  }
+
+  function renderProviders(providers) {
+    if (!providers.length) {
+      showEmpty("#auth-empty", "#auth-card", "No providers configured.");
+      return;
+    }
+    showCard("#auth-empty", "#auth-card");
+    const tbody = $("#auth-providers-tbody");
+    const card = $("#auth-card");
+    const sig = JSON.stringify(providers);
+    if (tbody.dataset.sig === sig) return;
+    tbody.dataset.sig = sig;
+    tbody.replaceChildren();
+    for (const p of providers) {
+      const tr = el("tr");
+      tr.appendChild(el("td", "mono job-name", p.provider));
+      const modeTd = el("td");
+      modeTd.appendChild(el("span", "badge " + (p.mode === "seat" ? "badge-seat" : "badge-api-key"), p.mode || "—"));
+      tr.appendChild(modeTd);
+      const sessTd = el("td");
+      const sess = p.session;
+      if (p.mode === "seat" && sess) {
+        const wrap = el("span", "status-cell");
+        wrap.appendChild(el("span", "dot " + (sess.expired ? "dot-failed" : "dot-succeeded")));
+        wrap.appendChild(el("span", "mono", fmtCountdown(sess.expires_at)));
+        sessTd.appendChild(wrap);
+      } else if (p.mode === "seat") {
+        const wrap = el("span", "status-cell");
+        wrap.appendChild(el("span", "dot dot-queued"));
+        wrap.appendChild(el("span", "mono muted", p.session_error ? "unreadable" : "none — log in"));
+        sessTd.appendChild(wrap);
+      } else {
+        sessTd.appendChild(el("span", "mono muted", "—"));
+      }
+      tr.appendChild(sessTd);
+      const actionTd = el("td");
+      if (p.mode === "seat") {
+        const validSession = sess && !sess.expired;
+        if (!validSession) {
+          const login = el("button", "linklike auth-login", "Log in");
+          login.type = "button";
+          login.setAttribute("aria-label", "Start seat login for " + p.provider);
+          login.addEventListener("click", () => startDeviceLogin(p.provider));
+          actionTd.appendChild(login);
+        }
+        if (sess) {
+          if (!validSession) actionTd.appendChild(el("span", "muted", " · "));
+          const out = el("button", "linklike auth-logout", "Log out");
+          out.type = "button";
+          out.setAttribute("aria-label", "Log out " + p.provider);
+          out.addEventListener("click", () => logoutProvider(p.provider));
+          actionTd.appendChild(out);
+        }
+      }
+      tr.appendChild(actionTd);
+      tbody.appendChild(tr);
+    }
+    flashCard(card);
+  }
+
+  function renderAccess(access) {
+    const rows = [
+      ["env_allowlist" + (access.env_allowlist_enforced ? " (enforced per run)" : ""), (access.env_allowlist || []).join(", ") || "—"],
+      ["base_env_keys", (access.base_env_keys || []).join(", ") || "—"],
+      ["network_policy", String(access.network_policy || "—") + (access.network_enforced ? " (enforced)" : " (declared — enforcement post-MVP)")],
+    ];
+    const list = $("#access-list");
+    const sig = JSON.stringify(rows);
+    if (list.dataset.sig !== sig) {
+      list.dataset.sig = sig;
+      list.replaceChildren();
+      for (const [k, v] of rows) {
+        const row = el("div", "settings-row");
+        row.appendChild(el("dt", null, k));
+        row.appendChild(el("dd", null, String(v)));
+        list.appendChild(row);
+      }
+    }
+    const scope = access.scope || [];
+    const table = $("#access-scope-table");
+    if (!scope.length) {
+      table.hidden = true;
+      return;
+    }
+    table.hidden = false;
+    const tbody = $("#access-scope-tbody");
+    const sSig = JSON.stringify(scope);
+    if (tbody.dataset.sig === sSig) return;
+    tbody.dataset.sig = sSig;
+    tbody.replaceChildren();
+    for (const s of scope) {
+      const tr = el("tr");
+      tr.appendChild(el("td", "mono", s.kind || "—"));
+      tr.appendChild(el("td", "mono muted", s.declared == null ? "none" : String(s.declared)));
+      tr.appendChild(el("td", "muted", s.note || ""));
+      tbody.appendChild(tr);
+    }
+  }
+
+  async function loadAuth() {
+    const [prov, acc] = await Promise.all([api("/api/auth/providers"), api("/api/auth/access")]);
+    if (prov === null || acc === null) return; /* 401 → login view shown */
+    if (payloadDown(prov)) {
+      showEmpty("#auth-empty", "#auth-card", "Auth unavailable — " + (prov.error || "the supervisor is not reachable") + ".");
+    } else {
+      renderProviders(prov.providers || []);
+    }
+    if (!payloadDown(acc)) renderAccess(acc.access || {});
+  }
+
+  /* device login: POST /api/auth/login shows the code, then poll /api/auth/login/status */
+  let devicePollTimer = null;
+  let deviceProvider = null;
+
+  function stopDevicePoll() {
+    if (devicePollTimer !== null) clearInterval(devicePollTimer);
+    devicePollTimer = null;
+  }
+
+  function deviceStatus(msg) {
+    $("#device-status").textContent = msg;
+  }
+
+  async function pollDeviceLogin() {
+    if (!deviceProvider) return;
+    const resp = await apiPost("/api/auth/login/status", { provider: deviceProvider });
+    if (resp === null) return; /* 401 → login view shown */
+    if (resp.__networkError || (resp.daemon && resp.daemon.up === false)) {
+      deviceStatus("Lost contact with the coop — still waiting.");
+      return;
+    }
+    if (!resp.ok) {
+      stopDevicePoll();
+      deviceStatus(resp.error || "Login failed.");
+      return;
+    }
+    if (resp.status === "authorized") {
+      stopDevicePoll();
+      deviceStatus("Authorized — seat session stored.");
+      loadAuth();
+      setTimeout(() => { $("#device-card").hidden = true; }, 1600);
+      return;
+    }
+    if (resp.status === "expired") {
+      stopDevicePoll();
+      deviceStatus("The code expired — start the login again.");
+      return;
+    }
+    deviceStatus("Waiting for authorization…");
+  }
+
+  async function startDeviceLogin(provider) {
+    authError("");
+    stopDevicePoll();
+    const resp = await apiPost("/api/auth/login", { provider });
+    if (resp === null) return; /* 401 → login view shown */
+    if (resp.__networkError) {
+      authError("The GUI could not reach the coop server.");
+      return;
+    }
+    if (resp.daemon && resp.daemon.up === false) {
+      authError("The supervisor is not reachable — " + (resp.error || "") + ".");
+      return;
+    }
+    if (!resp.ok) {
+      authError(resp.error || "login refused");
+      return;
+    }
+    deviceProvider = provider;
+    $("#device-provider").textContent = provider;
+    $("#device-code").textContent = resp.user_code || "—";
+    const link = $("#device-verification");
+    link.textContent = resp.verification_uri || "";
+    link.href = resp.verification_uri || "#";
+    $("#device-expires").textContent = "code expires " + (resp.expires_at || "—");
+    deviceStatus("Waiting for authorization…");
+    $("#device-card").hidden = false;
+    devicePollTimer = setInterval(pollDeviceLogin, 2000);
+    pollDeviceLogin();
+  }
+
+  async function logoutProvider(provider) {
+    authError("");
+    const resp = await apiPost("/api/auth/logout", { provider });
+    if (resp === null) return; /* 401 → login view shown */
+    if (resp.__networkError) {
+      authError("The GUI could not reach the coop server.");
+      return;
+    }
+    if (resp.daemon && resp.daemon.up === false) {
+      authError("The supervisor is not reachable — " + (resp.error || "") + ".");
+      return;
+    }
+    if (!resp.ok) {
+      authError(resp.error || "logout refused");
+      return;
+    }
+    loadAuth();
+  }
+
+  $("#device-cancel").addEventListener("click", () => {
+    stopDevicePoll();
+    deviceProvider = null;
+    $("#device-card").hidden = true;
+  });
 
   /* restart the diagram pulses on hover (CSS restarts on a new animation-name) */
   $("#diagram-card").addEventListener("mouseenter", () => {
