@@ -4,9 +4,9 @@
 
 **Blocked by:** 02 (daemon, socket, storage, `tc status`)
 
-**Status:** ready-for-agent
+**Status:** done (2026-11-12)
 
-- [ ] `tc run <job>` executes the job via headless `vibe-cli` in a fresh workspace and the run reaches `succeeded`
-- [ ] The run manifest records the pinned environment; streamed logs land in run events, sanitized of control characters
-- [ ] A teardown attestation and audit rows exist for the run; a run without an attestation is detectable as an alert condition
-- [ ] `tc runs list/show/logs` display the run; an over-budget run waits in the queue instead of being rejected
+- [x] `tc run <job>` executes the job via headless `vibe-cli` in a fresh workspace and the run reaches `succeeded`
+- [x] The run manifest records the pinned environment; streamed logs land in run events, sanitized of control characters
+- [x] A teardown attestation and audit rows exist for the run; a run without an attestation is detectable as an alert condition
+- [x] `tc runs list/show/logs` display the run; an over-budget run waits in the queue instead of being rejected

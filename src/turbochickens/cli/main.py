@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from pathlib import Path
 
 import typer
@@ -11,6 +13,7 @@ from rich.table import Table
 
 from turbochickens.client import DaemonUnreachable, request
 from turbochickens.daemon import DaemonAlreadyRunning, run_daemon
+from turbochickens.runner import TERMINAL_STATES
 from turbochickens.settings import SettingsError, load_settings
 from turbochickens.spec.loader import SpecValidationError, load_spec, spec_hash
 
@@ -22,8 +25,10 @@ app = typer.Typer(
 )
 jobs_app = typer.Typer(help="Job spec commands.", no_args_is_help=True)
 daemon_app = typer.Typer(help="Daemon lifecycle commands.", no_args_is_help=True)
+runs_app = typer.Typer(help="Inspect runs.", no_args_is_help=True)
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(daemon_app, name="daemon")
+app.add_typer(runs_app, name="runs")
 
 err_console = Console(stderr=True)
 console = Console()
@@ -126,6 +131,11 @@ def status(
     typer.echo(f"queue_depth: {resp['queue_depth']}")
     in_flight = resp["in_flight"]
     typer.echo(f"in_flight: {len(in_flight)}")
+    alerts = resp.get("alerts", [])
+    if alerts:
+        err_console.print(f"[bold red]alerts[/bold red]: {len(alerts)} terminal run(s) without a valid teardown attestation: {', '.join(alerts)}")
+    else:
+        typer.echo("alerts: 0")
     if in_flight:
         table = Table(title="In-flight runs")
         table.add_column("run_id")
@@ -133,6 +143,124 @@ def status(
         for r in in_flight:
             table.add_row(str(r["run_id"]), str(r["weight"]))
         console.print(table)
+
+
+def _daemon_request(settings_path: Path | None, op: str, timeout: float = 5.0, **payload) -> dict:
+    """Load settings and round-trip one request to the daemon; exit 1 on failure."""
+    try:
+        settings = load_settings(settings_path)
+        return request(settings.socket_path, op, timeout=timeout, **payload)
+    except (SettingsError, DaemonUnreachable) as e:
+        err_console.print(f"[bold red]error[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+
+
+def _request_or_exit(settings_path: Path | None, op: str, timeout: float = 5.0, **payload) -> dict:
+    resp = _daemon_request(settings_path, op, timeout=timeout, **payload)
+    if not resp.get("ok"):
+        err_console.print(f"[bold red]error[/bold red] {resp.get('error', 'unknown error')}")
+        raise typer.Exit(code=1)
+    return resp
+
+
+@app.command("run")
+def run_cmd(
+    spec_path: Path = typer.Argument(
+        ...,
+        help="Path to the job spec TOML file.",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+    ),
+    wait: bool = typer.Option(False, "--wait", help="Wait until the run reaches a terminal state."),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Submit a manual run of a job to the daemon queue (over the socket)."""
+    try:
+        spec = load_spec(spec_path)
+    except SpecValidationError as e:
+        for issue in e.issues:
+            err_console.print(f"[bold red]error[/bold red] {issue}")
+        raise typer.Exit(code=1) from None
+    digest = spec_hash(spec)
+    resp = _request_or_exit(
+        settings_path, "enqueue", timeout=10.0, spec_path=str(spec_path.resolve()), spec_hash=digest, trigger="manual"
+    )
+    run_id = resp["run_id"]
+    typer.echo(
+        f"queued run {run_id} job '{resp['job_id']}' status=queued "
+        f"weight={resp['weight']} queue_depth={resp['queue_depth']}"
+    )
+    if not wait:
+        return
+    deadline = time.time() + 3600
+    while time.time() < deadline:
+        show = _request_or_exit(settings_path, "runs_show", run_id=run_id)
+        status = show["run"]["status"]
+        if status in TERMINAL_STATES:
+            reason = (show["run"].get("manifest") or {}).get("status_reason", "")
+            typer.echo(f"run {run_id} → {status}" + (f" ({reason})" if reason else ""))
+            raise typer.Exit(code=0 if status == "succeeded" else 1)
+        time.sleep(0.2)
+    err_console.print(f"[bold red]error[/bold red] run {run_id} did not finish in time")
+    raise typer.Exit(code=1)
+
+
+@runs_app.command("list")
+def runs_list(
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """List runs, most recent first, one line per run (round-trip over the socket)."""
+    resp = _request_or_exit(settings_path, "runs_list")
+    if not resp["runs"]:
+        typer.echo("no runs")
+        return
+    for r in resp["runs"]:
+        status = r["status"]
+        attested = "yes" if r["attested"] else "no"
+        if r["status"] in TERMINAL_STATES and not r["attested"]:
+            status += " ALERT:no-attestation"
+        typer.echo(
+            f"{r['id']}  job={r['job_name']}  status={status}  trigger={r['trigger']}  "
+            f"started={r['started_at'] or '-'}  finished={r['finished_at'] or '-'}  attested={attested}"
+        )
+
+
+@runs_app.command("show")
+def runs_show(
+    run_id: str = typer.Argument(..., help="Run ID, e.g. run-0123abcd4567."),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Show one run: lifecycle fields, manifest, attestation."""
+    resp = _request_or_exit(settings_path, "runs_show", run_id=run_id)
+    r = resp["run"]
+    typer.echo(f"run: {r['id']}")
+    typer.echo(f"job: {r['job_name']} ({r['job_id']})")
+    typer.echo(f"status: {r['status']}")
+    typer.echo(f"trigger: {r['trigger']}")
+    typer.echo(f"started_at: {r['started_at']}")
+    typer.echo(f"finished_at: {r['finished_at']}")
+    if r["manifest"]:
+        typer.echo("manifest:")
+        typer.echo(json.dumps(r["manifest"], indent=2, sort_keys=True))
+    if r["attestation"]:
+        typer.echo(
+            "attestation: process_reaped={process_reaped} workspace_removed={workspace_removed} "
+            "env_cleared={env_cleared} verified_at={verified_at}".format(**r["attestation"])
+        )
+    elif r["status"] in TERMINAL_STATES:
+        err_console.print("[bold red]ALERT: terminal run without a teardown attestation[/bold red]")
+
+
+@runs_app.command("logs")
+def runs_logs(
+    run_id: str = typer.Argument(..., help="Run ID, e.g. run-0123abcd4567."),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Print the run's streamed events (sanitized log lines + state transitions)."""
+    resp = _request_or_exit(settings_path, "runs_logs", run_id=run_id)
+    for e in resp["events"]:
+        typer.echo(f"{e['seq']:>4} {e['ts']} [{e['level']}] {e['source']}: {e['line']}")
 
 
 @app.callback()

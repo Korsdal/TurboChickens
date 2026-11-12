@@ -1,0 +1,24 @@
+[job]
+name = "hello-vibe-cli"
+description = "Minimal manual job executed by the headless vibe-cli adapter"
+
+[trigger]
+type = "manual"
+
+[harness]
+adapter = "vibe-cli"
+model = "mistral-small-latest"
+temperature = 0.0
+
+[resources]
+timeout_sec = 300
+max_context_mb = 2
+network = "none"
+
+[input]
+prompt_file = "prompts/hello.txt"
+attachments = []
+
+[output]
+format = "json"
+schema_file = "schemas/hello.schema.json"

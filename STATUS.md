@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 02 landed (60/60 tests green, e2e smoke verified).
+**Last updated:** 2026-11-12, after spec 03 landed (72/72 tests green, e2e smoke verified).
 
 ---
 
@@ -26,16 +26,18 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 and spec 02 are done** (commits `f8b8061` and the spec-02 commit).
+**Spec 01, spec 02, and spec 03 are done** (commits `f8b8061`, the spec-02 commit, and the spec-03 commit).
 Verified this session:
 
 ```
-.venv/bin/python -m pytest -q          → 60 passed
-.venv/bin/tc --help                     → works, shows `jobs`, `daemon`, `status`
+.venv/bin/python -m pytest -q          → 72 passed
+.venv/bin/tc --help                     → works, shows `run`, `runs`, `jobs`, `daemon`, `status`
 .venv/bin/tc jobs validate examples/weekly-incidents-digest/job.toml
                                         → OK … sha256:18efbd8c…80b959
-# e2e smoke: tc daemon start (background) → tc status → tc daemon stop
-                                        → up / queue_depth 0 / in_flight 0, rc 0; down → rc 1
+# e2e smoke (fake vibe binary via $TURBOCHICKENS_VIBE_BIN): tc daemon start (background)
+#   → tc run examples/hello-vibe-cli/job.toml --wait → queued … → succeeded, rc 0
+#   → tc runs list/show/logs → manifest + sanitized events + attestation
+#   → tc status → queue_depth 0 / in_flight 0 / alerts: 0; tc daemon stop → rc 0
 ```
 
 What exists:
@@ -47,20 +49,30 @@ src/turbochickens/
 ├── settings.py            # Settings (Pydantic, extra=forbid) + load_settings(); defaults below
 ├── storage.py             # init_db(): full MVP SQLite schema + append-only triggers + schema_meta
 ├── audit.py               # AuditLog: append-only JSONL (open "a" only, fsync per row)
-├── daemon.py              # Daemon: asyncio process, Unix socket, JSON-lines ops ping/status/shutdown
+├── adapter.py             # HarnessAdapter Protocol (prepare/execute/teardown) + CredentialProvider
+│                          # extension point + VibeCLIAdapter (headless subprocess pinned to the
+│                          # workspace, sanitized streamed logs) + adapter weights (API 0.25 / CLI 1.0)
+├── runner.py              # RunPipeline: lifecycle queued→…→succeeded/failed, fresh workspace +
+│                          # per-run env, manifest, run_events, teardown attestation + audit rows
+├── daemon.py              # Daemon: asyncio process, Unix socket, JSON-lines ops
+│                          # ping/status/shutdown/enqueue/runs_list/runs_show/runs_logs;
+│                          # admission-control scheduler (over-budget backlogs, never rejects)
 ├── client.py              # request(socket, op, **payload) → parsed response; DaemonUnreachable
 ├── spec/
 │   ├── model.py           # Pydantic v2 model, all 6 sections, extra="forbid"
 │   └── loader.py          # load_spec(), SpecValidationError (field-named issues), spec_hash()
-└── cli/main.py            # Typer app `tc`: jobs validate | daemon start/stop | status
+└── cli/main.py            # Typer app `tc`: run [--wait] | runs list/show/logs | jobs validate | daemon start/stop | status
 tests/
 ├── test_spec_model.py     # pure-function seam: parser/model/hash
 ├── test_cli_validate.py   # CLI seam: tc jobs validate behavior
 ├── test_settings.py       # defaults, overrides, env var, error cases, weight-budget formula
 ├── test_storage.py        # schema tables, append-only triggers, audit log ordering/append-only
-└── test_daemon.py         # protocol + CLI tests on a thread daemon + subprocess e2e
+├── test_daemon.py         # protocol + CLI tests on a thread daemon + subprocess e2e
+└── test_run_e2e.py        # spec 03 e2e: thread + subprocess daemons, hermetic fake vibe binary
+                           # ($TURBOCHICKENS_VIBE_BIN), full lifecycle/attestation/admission tests
 examples/weekly-incidents-digest/   # baseline-format example job (job.toml, prompt, schema, csv)
-pyproject.toml             # uv/hatchling, Python >=3.12, version 0.2.0, deps: pydantic, typer, rich, croniter; dev: pytest
+examples/hello-vibe-cli/            # manual vibe-cli example job (job.toml, prompt, schema)
+pyproject.toml             # uv/hatchling, Python >=3.12, version 0.3.0, deps: pydantic, typer, rich, croniter; dev: pytest
 ```
 
 Spec-02 deliverables, concretely:
@@ -96,6 +108,40 @@ Spec-02 deliverables, concretely:
   exit 1 with `no daemon at …` when down. All socket commands take `--settings`
   (envvar `TURBOCHICKENS_SETTINGS`).
 
+Spec-03 deliverables, concretely:
+
+- **Run submission:** `tc run <spec> [--wait]` validates the spec locally, then sends
+  `enqueue` (spec_path + spec_hash + trigger) over the socket. The daemon re-validates,
+  registers the job (`job_specs`, INSERT OR IGNORE), inserts the `runs` row (`queued`),
+  audit-logs `run.queued`, and returns `{run_id, status: queued, weight, queue_depth}`.
+  `--wait` polls `runs_show` until terminal and exits 0/1 on succeeded/failed.
+- **Admission control:** weights API 0.25 / CLI 1.0 against `settings.weight_budget`; the
+  scheduler admits FIFO from `pending` only while `weight <= budget - in_flight_sum`.
+  Over-budget runs backlog (visible in `status.queue_depth`), never rejected.
+- **Adapter layer** (`adapter.py`): `HarnessAdapter` Protocol (`prepare`/`execute`/
+  `teardown`) over a `RunContext`; `CredentialProvider` extension point reserved, MVP
+  implementation injects only allowlisted env names (`MISTRAL_API_KEY`) as per-run env
+  vars — the run env is built fresh from a base-key whitelist, never copied from
+  `os.environ`. `VibeCLIAdapter` runs `vibe --prompt-file … --output text
+  --output-dir … --model … --workdir <workspace>` headless with cwd pinned to the
+  workspace, streams stdout/stderr as sanitized `run_events` (control chars stripped,
+  length-capped), hard-kills on `timeout_sec`, and reads token usage from the
+  harness `export.json` (telemetry only). Binary resolved via
+  `$TURBOCHICKENS_VIBE_BIN` else PATH. `mistral-api` is rejected at enqueue until
+  spec 05.
+- **Pipeline** (`runner.py`): provisioning creates `<data_dir>/workspaces/<run_id>` and
+  copies prompt + attachments in; lifecycle transitions are written to `runs.status`
+  and mirrored as `run_events`; the manifest (spec hash, harness+version/provider/model/
+  temperature, resources, usage, timestamps, workspace, `env_keys` — never secret
+  values, `timed_out`, status reason) lands in `runs.manifest_json`/`usage_json`.
+  Every terminal state — success, harness error, timeout, internal error — gets
+  `adapter.teardown()` (process reaped, workspace rmtree'd and verified gone, env
+  cleared) → `teardown_attestations` row + `teardown.attested` and `run.finished`
+  audit rows.
+- **Inspection:** socket ops `runs_list`/`runs_show`/`runs_logs` + CLI `tc runs
+  list/show/logs`; `status` gains `alerts` (terminal runs missing an attestation or
+  with a failed attestation flag) and `tc status` prints them.
+
 Spec-01 deliverables, concretely:
 
 - Installable package `turbochickens` 0.1.0 with `tc` entry point (Typer + Rich).
@@ -119,7 +165,7 @@ Spec-01 deliverables, concretely:
 | --- | --- | --- | --- |
 | 01 | Scaffold + job spec model + `tc jobs validate` | **done** (`f8b8061`) | — |
 | 02 | Daemon + Unix socket (JSON-lines) + SQLite schema + audit log + settings + `tc status` | **done** (2026-11-12) | 01 |
-| 03 | Manual run e2e via `vibe-cli` adapter (queue, admission, workspace, manifest, attestation, `tc run`/`tc runs`) | **next — unblocked** | 02 |
+| 03 | Manual run e2e via `vibe-cli` adapter (queue, admission, workspace, manifest, attestation, `tc run`/`tc runs`) | **done** (2026-11-12) | 02 |
 | 04 | Output validation + result store + quarantine + `tc results get` | ready-for-agent | 03 |
 | 05 | `mistral-api` adapter + `providers.toml` + backoff on 429/5xx | ready-for-agent | 03, 04 |
 | 06 | Cron scheduling (APScheduler) + `tc schedule add/list/rm` | ready-for-agent | 03 |
@@ -180,16 +226,11 @@ tables deliberately excluded).
   <vibe@mistral.ai>`.
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 
-## 7. Next up — spec 03 (`specs/03-manual-run-e2e-vibe-cli.md`)
+## 7. Next up — spec 04 (`specs/04-validation-results-quarantine.md`)
 
-First complete vertical path: `tc run <job>` submits over the socket into the
-daemon queue with weight admission (0.25 API / 1.0 CLI against
-`settings.weight_budget`; over-budget backlogs, never rejects); provisioner makes
-a fresh per-run workspace + per-run env; the adapter interface
-(`prepare`/`execute`/`teardown`, credential-provider extension point reserved)
-is implemented by `vibe-cli` (headless subprocess pinned to the workspace,
-sanitized streamed logs); lifecycle queued→…→succeeded/failed; manifest with
-spec hash + pinned env + usage; teardown attestation + audit rows on every
-terminal state; CLI `tc run`, `tc runs list/show/logs`. Builds directly on what
-spec 02 left: the socket protocol (add an `enqueue` op), the DB schema, the
-audit log, `spec_hash` from spec 01, and the `Daemon.queue`/`in_flight` hooks.
+The validated-results channel on top of the spec-03 pipeline: at `collecting`,
+run the raw harness output through the job's JSON schema (`jsonschema`, add the
+dep); valid → `results` row + on-disk artifacts keyed by run ID → `succeeded`;
+invalid → quarantine (kept, `schema_errors` recorded, run `failed`), never
+stored as valid. CLI `tc results get <run>`. The pipeline's `collecting` step
+in `runner.py` is the plug-in point.
