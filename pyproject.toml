@@ -1,6 +1,6 @@
 [project]
 name = "turbochickens"
-version = "0.7.0"
+version = "0.0.7"
 description = "Local-first platform for ephemeral, just-in-time AI agent jobs."
 requires-python = ">=3.12"
 dependencies = [
