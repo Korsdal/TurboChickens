@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 15 landed (250/250 tests green, e2e smoke verified).
+**Last updated:** 2026-11-12, after spec 16 landed (259/259 tests green, e2e smoke verified).
 
 ---
 
@@ -26,13 +26,13 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10 and specs 12–15 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, and the spec-15 commit). Spec 11 is the parent GUI spec; its first four slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate) are landed, the rest of its stories land via specs 16–18.
+**Spec 01 through spec 10 and specs 12–16 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, and the spec-16 commit). Spec 11 is the parent GUI spec; its first five slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules) are landed, the rest of its stories land via specs 17–18.
 
 **Spec 19 (auth & access management UI) is backlogged** — `specs/19-auth-access-management-ui.md`, status ready-for-agent, not started. Note spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality.
 Verified this session:
 
 ```
-.venv/bin/python -m pytest -q          → 188 passed
+.venv/bin/python -m pytest -q          → 259 passed
 .venv/bin/tc --help                     → works, shows `run`, `runs`, `jobs`, `daemon`, `results`, `schedule`, `stats`, `status`, `auth`, `models`
 .venv/bin/tc jobs validate examples/weekly-incidents-digest/job.toml
                                         → OK … sha256:18efbd8c…80b959 (unchanged)
@@ -141,6 +141,24 @@ Verified this session:
 #   → auth-required mode: both POSTs 401 without bearer, 200 with; dead-socket transport → 200
 #     {ok:false, daemon.up=false} (never 500); GET / serves the Jobs upload form (48px fields, labels,
 #     per-field errors, one primary Validate→Run job button), no host paths in the assets
+# spec-16 smoke (temp settings, coop_enabled=true, `tc coop start` subprocess, fake vibe binary):
+#   → POST /api/schedule {spec_path: <cron job.toml>, spec_hash} → 200 {ok, job_id, schedule, next_run};
+#     GET /api/schedule == socket schedule_list (job, cron, live next_run, added_at); `tc schedule list`
+#     shows the row with next_run; DB schedules row + audit schedule.added; status schedules=1;
+#     jobs_list rows now carry spec_path (the registered in-container path)
+#   → re-POST with an edited cron → 200, still one row with the new expression (replace semantics)
+#   → DELETE /api/schedule/<job_id> → 200; schedule_list empty; `tc schedule list` → "no schedules";
+#     audit schedule.removed; DELETE again → 404 "no schedule registered"
+#   → manual-trigger spec → 422 "only cron-triggered jobs"; bad cron → 422 "trigger.schedule: …";
+#     hash mismatch → 422; {} / non-string spec_path / non-JSON → 400; POST {files: <bundle>} →
+#     store+validate+schedule in one call (200); invalid bundle → 422 field-named, nothing scheduled
+#   → next-minute cron added over HTTP fires within 90s → run trigger=cron → succeeded, attested,
+#     result over GET /api/results/<run> 200; audit schedule.fired + run.queued(trigger=cron)
+#   → auth-required mode: GET/POST/DELETE /api/schedule* → 401 without bearer, 200 with; /api/ping open;
+#     dead-socket transport → 200 {ok:false, daemon.up=false} on all three (never 500)
+#   → GET / serves the Schedules view (sched-form with spec select + "Add schedule" primary button,
+#     sched-error inline error, schedules table with mono cron + next run + per-row Remove, empty
+#     state); app.js polls /api/schedule + /api/jobs every 2 s, flash on change; no host paths in assets
 ```
 
 What exists:
@@ -168,7 +186,12 @@ src/turbochickens/
 │                          # spec 15: POST /api/jobs/validate (bundle {files: {path: base64}} → daemon
 │                          # jobs_upload; 200 valid+stored / 422 field-named errors / 413 cap / 400 malformed)
 │                          # and POST /api/runs also accepts {files: …} (store+validate+enqueue by the stored
-│                          # path); client_max_size backstop from UPLOAD_MAX_HTTP_BODY
+│                          # path); client_max_size backstop from UPLOAD_MAX_HTTP_BODY;
+│                          # spec 16: GET /api/schedule (schedule_list mirror), POST /api/schedule (by
+│                          # spec_path or {files} bundle → store+validate+schedule_add; 200 ok / 422
+│                          # daemon-refused with the inline error / 413 cap / 400 malformed), DELETE
+│                          # /api/schedule/{job_id} (schedule_rm; 404 unknown job) — 200 {daemon.up=false}
+│                          # when the socket is dead on all three
 │   └── coop_static/       # the dependency-free SPA (index.html + app.js + styles.css + lucide icons as
 │                          # local SVGs, no build step, no runtime CDN): 240px sidebar shell, wordmark +
 │                          # egg dot, nav, login card (sessionStorage bearer, no cookies), Dashboard with
@@ -181,11 +204,15 @@ src/turbochickens/
 │                          # daemon-down banner + per-view empty states; spec 15: Jobs view upload form
 │                          # (job.toml + prompt + schema + attachments file inputs with bundle-path fields,
 │                          # 48px fields, per-field errors rendered under their fields, one primary
-│                          # Validate→"Run job" button that re-POSTs the bundle to /api/runs) — built to
+│                          # Validate→"Run job" button that re-POSTs the bundle to /api/runs);
+│                          # spec 16: Schedules view (pick-a-spec select fed by /api/jobs' spec_path +
+│                          # one "Add schedule" primary button + inline error, table with mono cron +
+│                          # live next_run + per-row Remove, 2 s polling) — built to
 │                          # specs/00-design-system.md
 ├── storage.py             # init_db(): full MVP SQLite schema + `schedules` table (spec 06) +
-│                          # `job_usage_stats` percentile columns (spec 08, schema_version=3, with
-│                          # in-place migration of v2 DBs) + append-only triggers + schema_meta
+│                          # `job_usage_stats` percentile columns (spec 08, schema_version=3→4 migration)
+│                          # + `job_specs.spec_path` (spec 16, schema_version=4, in-place ALTER migration
+│                          # of v3 DBs) + append-only triggers + schema_meta
 ├── audit.py               # AuditLog: append-only JSONL (open "a" only, fsync per row) — never TTL-deleted;
 │                          # spec 13: tail(limit, event) — last N rows newest first, defensive read
 ├── stats.py               # spec 08 pure seam: percentile (linear interpolation) + rollup_usage
@@ -226,7 +253,9 @@ src/turbochickens/
 │                          # ping/status/shutdown/enqueue/runs_list/runs_show/runs_logs/results_get/
 │                          # schedule_add/schedule_list/schedule_rm (spec 06)/stats_list/stats_show/
 │                          # retention_sweep (spec 08)/jobs_list/audit_tail/settings_get (spec 13,
-│                          # read-only GUI ops; settings_get never includes the coop token);
+│                          # read-only GUI ops; settings_get never includes the coop token;
+│                          # spec 16: jobs_list rows also carry spec_path, the in-container path the
+│                          # job was registered from (persisted into job_specs at enqueue/schedule_add);
 │                          # spec 14: runs_list takes optional job=/status= filters + result_valid per row;
 │                          # results_get returns quarantined raw_output + schema_errors (never valid) and
 │                          # reports expired for artifacts the retention sweep removed (valid or quarantined);
@@ -316,6 +345,13 @@ tests/
                            # 401s; dead-socket daemon-down payloads incl. POST; served Runs SPA markup; and a
                            # subprocess e2e (`tc coop start` + fake vibe): HTTP-triggered run → succeeded →
                            # validated result over HTTP + CLI
+└── test_coop_schedule.py  # spec 16: GET/POST /api/schedule + DELETE /api/schedule/{job_id} against a
+                           # thread daemon (HTTP == socket parity, CLI parity, re-add replaces, 404 on
+                           # unknown rm, 422 inline rejections for manual/invalid/mismatch, {files}
+                           # bundle add, auth-required 401s, dead-socket daemon-down payloads), one
+                           # real next-minute cron firing over HTTP → trigger=cron run → succeeded +
+                           # attested + audited + result over HTTP, served SPA Schedules view markup,
+                           # and a subprocess e2e (`tc coop start` + fake vibe): add/list/rm over HTTP
 └── test_coop_upload.py    # spec 15: jobs_upload socket op standalone (valid bundle stored under
                            # uploads/<job>-<hash>/ + enqueueable by that path; invalid → field-named errors,
                            # nothing stored/registered; cap, unsafe paths, base64, shape), POST
@@ -331,7 +367,7 @@ examples/weekly-incidents-digest/   # baseline-format example job (job.toml, pro
 examples/hello-vibe-cli/            # manual vibe-cli example job (job.toml, prompt, schema)
 examples/providers.toml             # spec 05 reference provider registry (mistral presets + pricing,
                            # commented other-provider example) — copy to ~/.turbochickens/providers.toml
-pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.11, deps: pydantic, typer, rich, croniter,
+pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.12, deps: pydantic, typer, rich, croniter,
                            # jsonschema (+ rfc3339-validator for format checks), httpx, apscheduler (spec 06),
                            # aiohttp (spec 12, coop web server); dev: pytest
 ```
@@ -693,10 +729,54 @@ Spec-15 deliverables, concretely:
   paths in assets), and a subprocess e2e creating + running a brand-new job entirely
   over HTTP with the fake vibe binary, result fetched over HTTP + CLI parity.
 
+Spec-16 deliverables, concretely:
+
+- **Registration path** (`storage.py` + `daemon.py`): `job_specs` gains a
+  nullable `spec_path` column (schema_version 4, in-place `ALTER TABLE`
+  migration of v3 DBs — the append-only triggers guard row UPDATE/DELETE, not
+  DDL). Both registration sites (`enqueue`, `schedule_add`) persist the
+  resolved in-container path, and `jobs_list` returns it per row (`None` for
+  pre-v4 rows) — this is what lets the Schedules add form offer registered
+  specs to pick from.
+- **HTTP** (`coop.py`): `GET /api/schedule` (mirror of `schedule_list` — job,
+  cron, live `next_run`, `added_at`, `spec_hash`), `POST /api/schedule` —
+  `{"spec_path": …, "spec_hash"?}` for a registered/uploaded in-container
+  spec, or `{"files": …}` to store+validate+schedule a bundle in one call —
+  200 with the `schedule_add` response (job_id, schedule, next_run), 422
+  carrying the socket error when the daemon refuses (manual-trigger spec,
+  invalid cron, hash mismatch, unreadable spec) so the form shows it inline,
+  413/422 via the upload mapping for bundles, 400 on a malformed body,
+  200 structured `daemon.up=false` when the socket is dead. `DELETE
+  /api/schedule/{job_id}` mirrors `schedule_rm` — 200, 404 when no schedule is
+  registered, daemon-down payload 200. Same bearer rules as every `/api/*`
+  route; `/api/ping` stays open.
+- **SPA Schedules view** (`coop_static/`): header action = pick-a-spec
+  `<select>` (populated from `/api/jobs` rows with a `spec_path`, labeled
+  `name · sha256:…`, value = the path, carrying the spec hash for the
+  mismatch check) + the one filled "Add schedule" button; the table (job,
+  mono cron, mono live next_run, added_at) with a per-row "Remove" action;
+  rejections render as an inline error under the header. The view polls
+  `/api/schedule` + `/api/jobs` every 2 s, flashes the card once on change,
+  and renders the daemon-down empty state. Re-adding an already-scheduled job
+  replaces it (the daemon's INSERT OR REPLACE semantics), so the select keeps
+  scheduled jobs too.
+- **Tests** (`test_coop_schedule.py`, 9): HTTP==socket parity for
+  list/add/rm + CLI parity (`tc schedule list` shows next_run; re-add of an
+  edited spec replaces; rm → "no schedules", 404 on unknown) with DB/audit/
+  status assertions and the new `jobs_list.spec_path`; one real next-minute
+  cron firing added over HTTP → `trigger=cron` run through the full pipeline
+  (succeeded, attested, `schedule.fired` + `run.queued(trigger=cron)` audit,
+  result over HTTP, `tc runs list` shows it); rejections (manual 422, bad
+  cron 422 field-named, hash mismatch 422, unreadable path 422, malformed 400,
+  bundle add 200 + invalid bundle 422); auth-required 401s; dead-socket
+  daemon-down payloads on all three routes (never 500); served SPA markup with
+  no host paths; and a subprocess e2e (`tc coop start` + fake vibe) doing
+  add/list/rm entirely over HTTP.
+
 | 13 | Jobs / Audit / Settings views (read-only socket ops) | **done** (2026-11-12) | 12 |
 | 14 | Runs from the GUI (trigger, watch, results/quarantine) | **done** (2026-11-12) | 12 |
 | 15 | Upload + validate job specs from the browser | **done** (2026-11-12) | 14 |
-| 16 | Schedules from the GUI | ready-for-agent | 12, 13 |
+| 16 | Schedules from the GUI | **done** (2026-11-12) | 12, 13 |
 | 17 | Stats + retention from the GUI | ready-for-agent | 12 |
 | 18 | coop Docker container | ready-for-agent | 12 |
 | 19 | Auth & access management UI (seat sessions, provider auth modes, access scope for tools/data/MCP/connectors) | ready-for-agent (backlog) | 09, 12 |
@@ -760,7 +840,7 @@ tables deliberately excluded).
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 - **Version management is a human responsibility.** Coding agents can bump the
   last part of a version number (`0.0.X`) — every other bump (minor, major) is
-  human initiated. Current version: `0.0.11`.
+  human initiated. Current version: `0.0.12`.
 
 ## 7. Next up — the coop GUI roadmap
 
@@ -798,8 +878,20 @@ under `uploads/<job>-<spec_hash>/`; `POST /api/jobs/validate` mirrors it and
 gained the upload form (file inputs, per-field errors, one Validate → "Run job"
 button).
 
-Next backlog item is **spec 16** (schedules from the GUI), then 17–18, with
-**spec 19** (auth & access management UI) queued behind 12. The
+Spec 16 (schedules from the GUI) landed: `job_specs` persists the registered
+`spec_path` (schema v4, in-place migration) and `jobs_list` serves it, so the
+Schedules view's add form picks a registered spec from a dropdown;
+`GET /api/schedule` + `POST /api/schedule` (by spec path or `{files}` bundle)
++ `DELETE /api/schedule/{job_id}` mirror `schedule_list`/`schedule_add`/
+`schedule_rm` over the transport seam (422 with the inline error on
+manual-trigger/invalid-cron/hash-mismatch refusals, 404 on unknown remove,
+structured `daemon.up=false` when down); the SPA Schedules view is the table
+(job, mono cron, live next_run, per-row Remove) plus the add form with inline
+errors, polling every 2 s. A schedule added over HTTP fires a `trigger=cron`
+run through the normal pipeline (verified e2e with a next-minute cron).
+
+Next backlog item is **spec 17** (stats + retention from the GUI), then 18,
+with **spec 19** (auth & access management UI) queued behind 12. The
 MVP spec pipeline (01–10) is complete; what remains beyond the GUI is the
 post-MVP roadmap in baseline §13.
 

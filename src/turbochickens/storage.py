@@ -13,7 +13,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _TABLES = [
     """
@@ -22,7 +22,10 @@ _TABLES = [
         name TEXT NOT NULL,
         spec_hash TEXT NOT NULL,
         spec_toml TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        -- spec 16: the in-container path the spec was registered from, so the
+        -- GUI can offer registered specs to pick from (jobs_list); nullable
+        spec_path TEXT
     )
     """,
     """
@@ -124,6 +127,12 @@ def init_db(path: str | Path) -> sqlite3.Connection:
     for col in ("tokens_in_p50", "tokens_in_p95", "tokens_out_p50", "tokens_out_p95"):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE job_usage_stats ADD COLUMN {col} REAL")
+    # spec 16 migration: DBs created before schema_version 4 lack spec_path on
+    # job_specs; add it in place (DDL — the append-only triggers guard row
+    # UPDATE/DELETE, not ALTER TABLE; new INSERTs name the column explicitly).
+    job_specs_cols = {row[1] for row in conn.execute("PRAGMA table_info(job_specs)")}
+    if "spec_path" not in job_specs_cols:
+        conn.execute("ALTER TABLE job_specs ADD COLUMN spec_path TEXT")
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),

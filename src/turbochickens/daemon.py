@@ -433,9 +433,9 @@ class Daemon:
         async with self._db_lock:
             assert self.db is not None
             self.db.execute(
-                "INSERT OR IGNORE INTO job_specs (id, name, spec_hash, spec_toml, created_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (job_id, spec.job.name, digest, spec_path.read_text(encoding="utf-8"), started_at),
+                "INSERT OR IGNORE INTO job_specs (id, name, spec_hash, spec_toml, created_at, spec_path)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (job_id, spec.job.name, digest, spec_path.read_text(encoding="utf-8"), started_at, str(spec_path.resolve())),
             )
             self.db.execute(
                 "INSERT INTO runs (id, job_id, status, trigger, started_at) VALUES (?, ?, ?, ?, ?)",
@@ -786,11 +786,13 @@ class Daemon:
 
     def _jobs_list(self) -> dict[str, Any]:
         """Registered job specs (the append-only `job_specs` table) with their
-        spec hashes — the Jobs view (spec 13)."""
+        spec hashes — the Jobs view (spec 13) — and, since spec 16, the
+        in-container spec path they were registered from (jobs can be picked
+        by path in the GUI)."""
         if self.db is None:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "db not ready"}
         rows = self.db.execute(
-            "SELECT id, name, spec_hash, created_at FROM job_specs ORDER BY created_at, id"
+            "SELECT id, name, spec_hash, created_at, spec_path FROM job_specs ORDER BY created_at, id"
         ).fetchall()
         jobs = [
             {
@@ -798,6 +800,9 @@ class Daemon:
                 "name": r[1],
                 "spec_hash": r[2],
                 "registered_at": r[3],
+                # spec 16: the in-container path the spec was registered from
+                # (None for pre-v4 rows), so the Schedules view can offer it
+                "spec_path": r[4],
             }
             for r in rows
         ]
@@ -1118,9 +1123,9 @@ class Daemon:
         async with self._db_lock:
             assert self.db is not None
             self.db.execute(
-                "INSERT OR IGNORE INTO job_specs (id, name, spec_hash, spec_toml, created_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (job_id, spec.job.name, digest, spec_path.read_text(encoding="utf-8"), utcnow_iso()),
+                "INSERT OR IGNORE INTO job_specs (id, name, spec_hash, spec_toml, created_at, spec_path)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (job_id, spec.job.name, digest, spec_path.read_text(encoding="utf-8"), utcnow_iso(), resolved),
             )
             self.db.execute(
                 "INSERT OR REPLACE INTO schedules (job_id, spec_path, schedule, spec_hash, added_at)"

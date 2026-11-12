@@ -13,6 +13,10 @@ output, or expired). Spec 15 adds the upload path: ``POST /api/jobs/validate``
 (validates — and, when valid, stores — a spec bundle sent as JSON with
 base64-encoded files, size-capped) and the bundle form of ``POST /api/runs``
 (store + validate + enqueue in one call, so the browser never needs a path).
+Spec 16 adds the schedule path: ``GET /api/schedule`` (schedule_list mirror),
+``POST /api/schedule`` (schedule_add by in-container spec path or by a files
+bundle — stored first, then scheduled by the stored path), and
+``DELETE /api/schedule/{job_id}`` (schedule_rm).
 
 Transport seam: every API handler is a thin client of the existing Unix-socket
 protocol — it calls ``request(op, **payload)`` over the socket (spec 12) and
@@ -156,6 +160,10 @@ class CoopServer:
         app.router.add_get("/api/runs/{run_id}", self._api_run_show)
         app.router.add_get("/api/runs/{run_id}/logs", self._api_run_logs)
         app.router.add_get("/api/results/{run_id}", self._api_result_get)
+        # spec 16: schedules from the GUI
+        app.router.add_get("/api/schedule", self._api_schedule_list)
+        app.router.add_post("/api/schedule", self._api_schedule_add)
+        app.router.add_delete("/api/schedule/{job_id}", self._api_schedule_rm)
         app.router.add_get("/", self._index)
         app.router.add_get("/{tail:.*}", self._static_file)
         self._runner = web.AppRunner(app)
@@ -387,6 +395,72 @@ class CoopServer:
 
     async def _api_result_get(self, request: web.Request) -> web.Response:
         return await self._mirror_resource("results_get", run_id=request.match_info["run_id"])
+
+    # --- spec 16: schedules from the GUI ----------------------------------------
+
+    async def _api_schedule_list(self, request: web.Request) -> web.Response:
+        """GET /api/schedule — the schedules table with live next_run times
+        (mirror of the schedule_list socket op)."""
+        return await self._mirror("schedule_list")
+
+    async def _api_schedule_add(self, request: web.Request) -> web.Response:
+        """POST /api/schedule — add (or replace) a cron schedule, either by an
+        in-container spec path (``{"spec_path": …, "spec_hash"?}`` — a
+        registered or uploaded spec) or as a spec bundle (``{"files": …}``:
+        stored + validated by the daemon's jobs_upload op, then scheduled by
+        the stored path — the browser never needs one). The daemon
+        re-validates the spec itself; a refusal (manual-trigger spec, invalid
+        cron, hash mismatch, unreadable spec) is a 422 carrying the socket
+        response so the form can show the error inline, a malformed body a
+        400, and a dead socket the structured daemon-down payload (200)."""
+        body, err = await self._json_body(request)
+        if err is not None:
+            return err
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"ok": False, "op": "schedule_add", "error": "POST /api/schedule needs a JSON object body"},
+                status=400,
+            )
+        if isinstance(body.get("files"), dict):
+            upload_resp, upload_down = await self._call("jobs_upload", files=body["files"])
+            mapped = self._upload_error_response(upload_resp, upload_down)
+            if mapped is not None:
+                return mapped
+            assert upload_resp is not None and upload_resp.get("ok")
+            payload: dict[str, Any] = {
+                "spec_path": upload_resp["spec_path"],
+                "spec_hash": upload_resp["spec_hash"],
+            }
+        else:
+            if not isinstance(body.get("spec_path"), str) or not body["spec_path"].strip():
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "op": "schedule_add",
+                        "error": "POST /api/schedule needs a JSON body with a spec_path string (an in-container path) or a files bundle",
+                    },
+                    status=400,
+                )
+            payload = {"spec_path": body["spec_path"].strip()}
+            if body.get("spec_hash"):
+                payload["spec_hash"] = str(body["spec_hash"])
+        resp, down = await self._call("schedule_add", **payload)
+        if down is not None:
+            return down
+        assert resp is not None
+        return web.json_response(resp, status=200 if resp.get("ok") else 422)
+
+    async def _api_schedule_rm(self, request: web.Request) -> web.Response:
+        """DELETE /api/schedule/{job_id} — remove a schedule; 404 when the job
+        has no registered schedule, 200 with the socket payload otherwise, and
+        the structured daemon-down payload (200) when the socket is dead."""
+        resp, down = await self._call("schedule_rm", job_id=request.match_info["job_id"])
+        if down is not None:
+            return down
+        assert resp is not None
+        if not resp.get("ok") and "no schedule registered" in str(resp.get("error", "")):
+            return web.json_response(resp, status=404)
+        return web.json_response(resp)
 
     # --- static SPA ----------------------------------------------------------
 

@@ -441,6 +441,33 @@ html, body {
 }
 .run-form input:focus-visible { outline: 2px solid var(--p-action); outline-offset: 1px; }
 
+/* --- schedules view (spec 16): pick-a-spec form + cron table --- */
+
+.sched-form { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; padding-bottom: 6px; }
+.sched-form label { font-size: 13px; font-weight: 500; color: var(--p-muted); padding-bottom: 2px; }
+.sched-form select {
+  height: 44px;
+  min-width: min(340px, 100%);
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-s);
+  background: var(--p-bg);
+  color: var(--p-ink);
+  font-size: 13px;
+  padding: 0 14px;
+}
+.sched-form select:focus-visible { outline: 2px solid var(--p-action); outline-offset: 1px; }
+.sched-remove { font-size: 13px; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0; border: 0;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
 .view-error { margin: -18px 0 18px; }
 
 .filter-rows { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }

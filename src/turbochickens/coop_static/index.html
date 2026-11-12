@@ -229,10 +229,24 @@
           <header class="view-header" data-enter>
             <div>
               <h2 id="schedules-heading">Schedules</h2>
-              <p class="intro">Cron schedules and their next run.</p>
+              <p class="intro">Cron schedules and their next run — polling every 2&nbsp;s.</p>
             </div>
+            <form class="view-actions sched-form" id="sched-form" novalidate>
+              <label for="sched-spec">Spec</label>
+              <select id="sched-spec" name="spec_path" required></select>
+              <button type="submit" class="btn btn-primary" id="sched-submit">Add schedule</button>
+            </form>
           </header>
-          <div class="card empty-state"><p>Schedules from the browser land next — <span class="mono">tc schedule add</span> works today.</p></div>
+          <p class="field-error view-error" id="sched-error" hidden></p>
+          <div class="card table-card" id="schedules-card" hidden>
+            <table class="data-table">
+              <thead>
+                <tr><th scope="col">Job</th><th scope="col">Cron</th><th scope="col">Next run</th><th scope="col">Added at</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr>
+              </thead>
+              <tbody id="schedules-tbody"></tbody>
+            </table>
+          </div>
+          <div class="card empty-state" id="schedules-empty"><p>No schedules yet — pick a cron-triggered spec above, or <span class="mono">tc schedule add &lt;job.toml&gt;</span>.</p></div>
         </section>
 
         <section class="view" id="view-stats" hidden aria-labelledby="stats-heading">

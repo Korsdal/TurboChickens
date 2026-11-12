@@ -104,14 +104,16 @@ def test_months_before_calendar_arithmetic() -> None:
 
 
 def test_schema_v3_adds_percentile_columns_and_migrates_v2_dbs(tmp_path) -> None:
-    # fresh DB: schema_version 3 with all percentile columns
+    # fresh DB: schema_version 4 with all percentile columns + job_specs.spec_path (spec 16)
     conn = init_db(tmp_path / "fresh.db")
     try:
-        assert SCHEMA_VERSION == 3
+        assert SCHEMA_VERSION == 4
         ver = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()[0]
-        assert ver == "3"
+        assert ver == "4"
         cols = {r[1] for r in conn.execute("PRAGMA table_info(job_usage_stats)")}
         assert {"tokens_in_p50", "tokens_in_p95", "tokens_out_p50", "tokens_out_p95"} <= cols
+        job_cols = {r[1] for r in conn.execute("PRAGMA table_info(job_specs)")}
+        assert "spec_path" in job_cols
     finally:
         conn.close()
     # a v2-era DB (old column set) is migrated in place by init_db
@@ -131,7 +133,33 @@ def test_schema_v3_adds_percentile_columns_and_migrates_v2_dbs(tmp_path) -> None
         cols = {r[1] for r in conn.execute("PRAGMA table_info(job_usage_stats)")}
         assert {"tokens_in_p50", "tokens_in_p95", "tokens_out_p50", "tokens_out_p95"} <= cols
         ver = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()[0]
-        assert ver == "3"
+        assert ver == "4"
+    finally:
+        conn.close()
+    # a v3-era DB (job_specs without spec_path) is migrated in place by init_db
+    v3 = tmp_path / "v3.db"
+    c = sqlite3.connect(str(v3))
+    c.execute(
+        "CREATE TABLE job_specs (id TEXT PRIMARY KEY, name TEXT NOT NULL, spec_hash TEXT NOT NULL,"
+        " spec_toml TEXT NOT NULL, created_at TEXT NOT NULL)"
+    )
+    c.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    c.execute("INSERT INTO schema_meta VALUES ('schema_version', '3')")
+    c.commit()
+    c.close()
+    conn = init_db(v3)
+    try:
+        job_cols = {r[1] for r in conn.execute("PRAGMA table_info(job_specs)")}
+        assert "spec_path" in job_cols
+        ver = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()[0]
+        assert ver == "4"
+        # the append-only guard still holds after the in-place migration
+        conn.execute(
+            "INSERT INTO job_specs (id, name, spec_hash, spec_toml, created_at, spec_path)"
+            " VALUES ('j', 'j', 'h', 't', 'now', '/p/job.toml')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE job_specs SET name = 'x' WHERE id = 'j'")
     finally:
         conn.close()
 

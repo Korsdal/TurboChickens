@@ -7,8 +7,8 @@
   const TOKEN_KEY = "tc.coop.token";
   const POLL_MS = 2000;
   const VIEWS = ["dashboard", "runs", "jobs", "schedules", "stats", "audit", "settings"];
-  /* views with a live /api loader (schedules/stats land in specs 16/17) */
-  const VIEW_LOADERS = { dashboard: loadStatus, runs: loadRuns, jobs: loadJobs, audit: loadAudit, settings: loadSettings };
+  /* views with a live /api loader (stats lands in spec 17) */
+  const VIEW_LOADERS = { dashboard: loadStatus, runs: loadRuns, jobs: loadJobs, schedules: loadSchedules, audit: loadAudit, settings: loadSettings };
 
   const RUN_STATUSES = ["queued", "provisioning", "running", "collecting", "finalizing", "succeeded", "failed"];
 
@@ -54,6 +54,26 @@
     let resp;
     try {
       resp = await fetch(path, { method: "POST", headers, body: JSON.stringify(body), cache: "no-store" });
+    } catch (err) {
+      return { __networkError: true };
+    }
+    if (resp.status === 401) {
+      showLogin();
+      return null;
+    }
+    try {
+      return await resp.json();
+    } catch (err) {
+      return { __networkError: true };
+    }
+  }
+
+  async function apiDelete(path) {
+    const headers = {};
+    if (token) headers["Authorization"] = "Bearer " + token;
+    let resp;
+    try {
+      resp = await fetch(path, { method: "DELETE", headers, cache: "no-store" });
     } catch (err) {
       return { __networkError: true };
     }
@@ -766,6 +786,143 @@
       setTimeout(() => { b.textContent = old; }, 1200);
     });
   });
+
+  /* --- schedules view (spec 16): table + add form (pick a spec) + remove --- */
+
+  let schedSpecSig = ""; // signature of the spec select, for one-shot re-render
+  let schedRowSig = ""; // signature of the table body, for the one-shot flash
+
+  function schedError(msg) {
+    const p = $("#sched-error");
+    if (!msg) {
+      p.hidden = true;
+      p.textContent = "";
+      return;
+    }
+    p.textContent = msg;
+    p.hidden = false;
+  }
+
+  function renderSpecSelect(jobs) {
+    const sel = $("#sched-spec");
+    const options = jobs.filter((j) => j.spec_path).map((j) => ({ value: j.spec_path, label: j.name + " · " + shortHash(j.spec_hash), hash: j.spec_hash }));
+    const sig = JSON.stringify(options);
+    if (schedSpecSig === sig) return;
+    schedSpecSig = sig;
+    const previous = sel.value;
+    sel.replaceChildren();
+    if (!options.length) {
+      const o = el("option", null, "No registered specs with a known path");
+      o.value = "";
+      sel.appendChild(o);
+      sel.disabled = true;
+      $("#sched-submit").disabled = true;
+      return;
+    }
+    sel.disabled = false;
+    $("#sched-submit").disabled = false;
+    for (const opt of options) {
+      const o = el("option", null, opt.label);
+      o.value = opt.value;
+      o.dataset.specHash = opt.hash;
+      sel.appendChild(o);
+    }
+    if (options.some((o) => o.value === previous)) sel.value = previous;
+  }
+
+  function renderSchedulesTable(schedules) {
+    if (!schedules.length) {
+      showEmpty("#schedules-empty", "#schedules-card", "No schedules yet — pick a cron-triggered spec above, or tc schedule add <job.toml>.");
+      schedRowSig = "";
+      return;
+    }
+    showCard("#schedules-empty", "#schedules-card");
+    const tbody = $("#schedules-tbody");
+    const card = $("#schedules-card");
+    const sig = JSON.stringify(schedules.map((s) => [s.job_id, s.schedule, s.next_run, s.added_at]));
+    if (tbody.dataset.sig === sig) return;
+    tbody.dataset.sig = sig;
+    tbody.replaceChildren();
+    for (const s of schedules) {
+      const tr = el("tr");
+      tr.appendChild(el("td", "mono job-name", s.job_id));
+      tr.appendChild(el("td", "mono", s.schedule));
+      tr.appendChild(el("td", "mono", s.next_run || "—"));
+      tr.appendChild(el("td", "mono muted", s.added_at || "—"));
+      const actionTd = el("td");
+      const rm = el("button", "linklike sched-remove", "Remove");
+      rm.type = "button";
+      rm.setAttribute("aria-label", "Remove schedule for " + s.job_id);
+      rm.addEventListener("click", () => removeSchedule(s.job_id));
+      actionTd.appendChild(rm);
+      tr.appendChild(actionTd);
+      tbody.appendChild(tr);
+    }
+    flashCard(card);
+  }
+
+  async function loadSchedules() {
+    const jobsData = await api("/api/jobs");
+    if (jobsData === null) return; /* 401 → login view shown */
+    if (!payloadDown(jobsData)) renderSpecSelect(jobsData.jobs || []);
+    const data = await api("/api/schedule");
+    if (data === null) return; /* 401 → login view shown */
+    if (payloadDown(data)) {
+      schedError("");
+      showEmpty("#schedules-empty", "#schedules-card", "Schedules unavailable — " + (data.error || "the supervisor is not reachable") + ".");
+      return;
+    }
+    renderSchedulesTable(data.schedules || []);
+  }
+
+  $("#sched-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    schedError("");
+    const sel = $("#sched-spec");
+    const specPath = sel.value;
+    if (!specPath) {
+      schedError("No registered spec to pick — run or upload a cron-triggered job first (Jobs view).");
+      return;
+    }
+    const opt = sel.selectedOptions[0];
+    const body = { spec_path: specPath };
+    if (opt && opt.dataset.specHash) body.spec_hash = opt.dataset.specHash;
+    const resp = await apiPost("/api/schedule", body);
+    if (resp === null) return; /* 401 → login view shown */
+    if (resp.__networkError) {
+      schedError("The GUI could not reach the coop server.");
+      return;
+    }
+    if (resp.daemon && resp.daemon.up === false) {
+      schedError("The supervisor is not reachable — " + (resp.error || "") + ".");
+      return;
+    }
+    if (!resp.ok) {
+      // manual-trigger spec, invalid cron, hash mismatch, unreadable spec — inline
+      schedError(resp.error || (resp.errors && resp.errors.map((e) => e.message).join("\n")) || "schedule refused");
+      return;
+    }
+    loadSchedules();
+  });
+
+  async function removeSchedule(jobId) {
+    schedError("");
+    const resp = await apiDelete("/api/schedule/" + encodeURIComponent(jobId));
+    if (resp === null) return; /* 401 → login view shown */
+    if (resp.__networkError) {
+      schedError("The GUI could not reach the coop server.");
+      return;
+    }
+    if (resp.daemon && resp.daemon.up === false) {
+      schedError("The supervisor is not reachable — " + (resp.error || "") + ".");
+      return;
+    }
+    if (!resp.ok) {
+      schedError(resp.error || "remove refused");
+      return;
+    }
+    loadSchedules();
+  }
 
   /* --- audit view (spec 13): mono tail, newest first, event filter chips --- */
 

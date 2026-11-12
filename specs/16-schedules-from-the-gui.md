@@ -6,10 +6,10 @@
 
 **Blocked by:** 12 (coop skeleton), 13 (Jobs view lists the registered specs to pick from)
 
-**Status:** ready-for-agent (2026-11-12)
+**Status:** done (2026-11-12) — 259/259 tests green, e2e smoke verified
 
-- [ ] A schedule added via HTTP appears in `tc schedule list` with its next_run; re-adding an edited spec replaces it
-- [ ] Remove via HTTP removes it; `tc schedule list` shows none
-- [ ] A schedule added via HTTP fires a `trigger=cron` run through the normal pipeline (next-minute cron e2e, audit shows schedule.fired)
-- [ ] Manual-trigger or invalid specs are rejected with a clear inline error in the form
-- [ ] Tests: socket + HTTP parity, CLI parity (`tc schedule add/list/rm`), one real cron firing
+- [x] A schedule added via HTTP appears in `tc schedule list` with its next_run; re-adding an edited spec replaces it
+- [x] Remove via HTTP removes it; `tc schedule list` shows none
+- [x] A schedule added via HTTP fires a `trigger=cron` run through the normal pipeline (next-minute cron e2e, audit shows schedule.fired)
+- [x] Manual-trigger or invalid specs are rejected with a clear inline error in the form
+- [x] Tests: socket + HTTP parity, CLI parity (`tc schedule add/list/rm`), one real cron firing
