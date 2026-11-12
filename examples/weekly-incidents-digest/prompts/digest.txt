@@ -1,0 +1,4 @@
+You are given the week's security incidents as CSV. Produce a JSON digest:
+a title, the generation timestamp, and an array of incidents, each with an
+id, a severity (low|medium|high|critical), and a one-paragraph summary.
+Match the provided JSON schema exactly.

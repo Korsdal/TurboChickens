@@ -1,0 +1,25 @@
+[job]
+name = "weekly-incidents-digest"
+description = "Summarize the week's security incidents into a structured digest"
+
+[trigger]
+type = "cron"            # "cron" | "manual"
+schedule = "0 7 * * 1"   # Monday 07:00, cron syntax
+
+[harness]
+adapter = "mistral-api"  # "mistral-api" | "vibe-cli"
+model = "mistral-large-latest"
+temperature = 0.1
+
+[resources]
+timeout_sec = 600        # hard kill: wall-clock budget
+max_context_mb = 2       # hard cap: prompt + attachments + injected state
+network = "none"         # MVP: declared policy; enforced post-MVP
+
+[input]
+prompt_file = "prompts/digest.txt"
+attachments = ["inputs/incidents.csv"]
+
+[output]
+format = "json"
+schema_file = "schemas/digest.schema.json"

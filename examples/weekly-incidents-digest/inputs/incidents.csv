@@ -1,0 +1,4 @@
+id,severity,summary
+INC-1042,high,"Phishing campaign targeting finance staff; 3 credentials rotated"
+INC-1043,medium,"Outdated TLS certificate on staging host renewed"
+INC-1044,low,"Failed login burst from a single IP, blocked at the edge"
