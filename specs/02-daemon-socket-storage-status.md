@@ -4,9 +4,9 @@
 
 **Blocked by:** 01 (package scaffold, job spec model, `tc` CLI)
 
-**Status:** ready-for-agent
+**Status:** done (2026-11-12)
 
-- [ ] Daemon starts, binds the Unix socket, and answers JSON-lines requests
-- [ ] `tc status` shows daemon up, empty queue, zero in-flight runs
-- [ ] SQLite schema is created with all MVP tables; the audit log appends rows and is append-only
-- [ ] Settings load with the documented defaults and allow overrides
+- [x] Daemon starts, binds the Unix socket, and answers JSON-lines requests
+- [x] `tc status` shows daemon up, empty queue, zero in-flight runs
+- [x] SQLite schema is created with all MVP tables; the audit log appends rows and is append-only
+- [x] Settings load with the documented defaults and allow overrides
