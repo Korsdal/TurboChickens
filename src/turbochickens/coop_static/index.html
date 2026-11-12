@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en" data-type="app" data-radius="soft" data-buttons="solid">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="page-type" content="app">
+  <meta name="site-kind" content="software">
+  <title>TurboChickens</title>
+  <meta name="description" content="TurboChickens — the coop GUI: local-first management for ephemeral AI agent jobs.">
+  <link rel="icon" href="/icons/egg.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="wordmark" href="#/dashboard" aria-label="TurboChickens — Dashboard">
+        <span class="egg" aria-hidden="true"></span>
+        <span class="wordmark-text">TurboChickens</span>
+      </a>
+      <nav class="nav" aria-label="Views">
+        <a href="#/dashboard" data-view="dashboard" aria-current="page"><img class="icon" src="/icons/layout-dashboard.svg" alt="" width="18" height="18">Dashboard</a>
+        <a href="#/runs" data-view="runs"><img class="icon" src="/icons/play.svg" alt="" width="18" height="18">Runs</a>
+        <a href="#/jobs" data-view="jobs"><img class="icon" src="/icons/file-text.svg" alt="" width="18" height="18">Jobs</a>
+        <a href="#/schedules" data-view="schedules"><img class="icon" src="/icons/calendar.svg" alt="" width="18" height="18">Schedules</a>
+        <a href="#/stats" data-view="stats"><img class="icon" src="/icons/bar-chart-3.svg" alt="" width="18" height="18">Stats</a>
+        <a href="#/audit" data-view="audit"><img class="icon" src="/icons/list.svg" alt="" width="18" height="18">Audit</a>
+        <a href="#/settings" data-view="settings"><img class="icon" src="/icons/settings.svg" alt="" width="18" height="18">Settings</a>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="pill" id="daemon-pill" title="coop status"><span class="pill-dot" id="pill-dot"></span><span id="pill-text">coop · …</span></span>
+        <button type="button" class="linklike" id="signout" hidden>Sign out</button>
+      </div>
+    </aside>
+    <main class="content" id="main">
+      <div class="wrap">
+        <div class="banner" id="banner" role="status" hidden></div>
+
+        <section class="view login-view" id="view-login" hidden aria-labelledby="login-heading">
+          <div class="card login-card" data-enter>
+            <span class="egg egg-lg" aria-hidden="true"></span>
+            <h1 id="login-heading">TurboChickens</h1>
+            <p class="muted">This coop is protected. Enter the access token printed once by <span class="mono">tc coop start</span> (or set <span class="mono">coop_auth_token</span> in settings).</p>
+            <form id="login-form" novalidate>
+              <label for="token-input">Access token</label>
+              <input id="token-input" name="token" type="password" autocomplete="off" spellcheck="false" required>
+              <p class="field-error" id="login-error" hidden></p>
+              <button type="submit" class="btn btn-primary">Sign in</button>
+            </form>
+          </div>
+        </section>
+
+        <section class="view" id="view-dashboard" hidden aria-labelledby="dashboard-heading">
+          <header class="view-header" data-enter>
+            <div>
+              <h2 id="dashboard-heading">Dashboard</h2>
+              <p class="intro">The flock at a glance — polling every 2&nbsp;s.</p>
+            </div>
+            <div class="view-actions"><span class="mono muted" id="coop-url"></span></div>
+          </header>
+          <div class="stat-row" id="stat-row">
+            <div class="card stat"><span class="stat-label">Uptime</span><span class="stat-value mono" data-stat="uptime">—</span></div>
+            <div class="card stat"><span class="stat-label">Queue depth</span><span class="stat-value mono" data-stat="queue_depth">—</span></div>
+            <div class="card stat"><span class="stat-label">In flight</span><span class="stat-value mono" data-stat="in_flight">—</span></div>
+            <div class="card stat"><span class="stat-label">Alerts</span><span class="stat-value mono" data-stat="alerts">—</span></div>
+            <div class="card stat"><span class="stat-label">Schedules</span><span class="stat-value mono" data-stat="schedules">—</span></div>
+            <div class="card stat"><span class="stat-label">Retention</span><span class="stat-value mono stat-value-small" data-stat="retention">—</span></div>
+          </div>
+          <div class="card diagram-card" id="diagram-card">
+            <div class="diagram-head">
+              <h3>The flock</h3>
+              <p class="muted">Queue and schedules feed the daemon; runs fly out in flight toward results.</p>
+            </div>
+            <svg class="diagram" viewBox="0 0 640 280" role="img" aria-label="Flock diagram: queue and schedules feed the daemon hub; in-flight runs leave as lanes toward results">
+              <g class="edges">
+                <line class="flow flow-a" x1="118" y1="80" x2="288" y2="128"></line>
+                <line class="flow flow-b" x1="118" y1="200" x2="288" y2="152"></line>
+                <line class="flow flow-c" x1="352" y1="128" x2="522" y2="70"></line>
+                <line class="flow flow-d" x1="352" y1="140" x2="522" y2="120"></line>
+                <line class="flow flow-e" x1="352" y1="152" x2="522" y2="170"></line>
+                <line class="flow flow-f" x1="352" y1="140" x2="522" y2="210"></line>
+              </g>
+              <g class="node">
+                <circle cx="90" cy="80" r="26" class="node-circle"></circle>
+                <text x="90" y="126" class="node-label">queue</text>
+                <text x="90" y="56" class="node-count mono" id="dg-queue">0</text>
+              </g>
+              <g class="node">
+                <circle cx="90" cy="200" r="26" class="node-circle"></circle>
+                <text x="90" y="246" class="node-label">schedules</text>
+                <text x="90" y="176" class="node-count mono" id="dg-schedules">0</text>
+              </g>
+              <g class="node node-hub">
+                <circle cx="320" cy="140" r="36" class="hub-circle"></circle>
+                <circle cx="320" cy="140" r="36" class="hub-pulse"></circle>
+                <circle cx="320" cy="140" r="10" class="hub-dot"></circle>
+                <text x="320" y="200" class="node-label">daemon</text>
+              </g>
+              <g class="node">
+                <circle cx="550" cy="120" r="26" class="node-circle"></circle>
+                <text x="550" y="166" class="node-label">in flight</text>
+                <text x="550" y="96" class="node-count mono" id="dg-inflight">0</text>
+              </g>
+              <g class="node">
+                <circle cx="550" cy="210" r="26" class="node-circle"></circle>
+                <text x="550" y="256" class="node-label">results</text>
+              </g>
+            </svg>
+          </div>
+        </section>
+
+        <section class="view" id="view-runs" hidden aria-labelledby="runs-heading">
+          <header class="view-header" data-enter>
+            <div>
+              <h2 id="runs-heading">Runs</h2>
+              <p class="intro">The runs table and live run detail.</p>
+            </div>
+          </header>
+          <div class="card empty-state"><p>Runs from the browser land next on the coop roadmap — <span class="mono">tc runs list</span> shows the same data today.</p></div>
+        </section>
+
+        <section class="view" id="view-jobs" hidden aria-labelledby="jobs-heading">
+          <header class="view-header" data-enter>
+            <div>
+              <h2 id="jobs-heading">Jobs</h2>
+              <p class="intro">Registered job specs, validated uploads.</p>
+            </div>
+          </header>
+          <div class="card empty-state"><p>Job upload and validation from the browser land next — <span class="mono">tc jobs validate</span> works today.</p></div>
+        </section>
+
+        <section class="view" id="view-schedules" hidden aria-labelledby="schedules-heading">
+          <header class="view-header" data-enter>
+            <div>
+              <h2 id="schedules-heading">Schedules</h2>
+              <p class="intro">Cron schedules and their next run.</p>
+            </div>
+          </header>
+          <div class="card empty-state"><p>Schedules from the browser land next — <span class="mono">tc schedule add</span> works today.</p></div>
+        </section>
+
+        <section class="view" id="view-stats" hidden aria-labelledby="stats-heading">
+          <header class="view-header" data-enter>
+            <div>
+              <h2 id="stats-heading">Stats</h2>
+              <p class="intro">Per-job usage and expected cost per run.</p>
+            </div>
+          </header>
+          <div class="card empty-state"><p>Stats from the browser land next — <span class="mono">tc stats list</span> works today.</p></div>
+        </section>
+
+        <section class="view" id="view-audit" hidden aria-labelledby="audit-heading">
+          <header class="view-header" data-enter>
+            <div>
+              <h2 id="audit-heading">Audit</h2>
+              <p class="intro">The append-only event log, newest first.</p>
+            </div>
+          </header>
+          <div class="card empty-state"><p>The audit tail from the browser lands next — the log itself stays append-only under the data dir.</p></div>
+        </section>
+
+        <section class="view" id="view-settings" hidden aria-labelledby="settings-heading">
+          <header class="view-header" data-enter>
+            <div>
+              <h2 id="settings-heading">Settings</h2>
+              <p class="intro">The effective settings, read-only.</p>
+            </div>
+          </header>
+          <div class="card empty-state"><p>The settings view lands next — <span class="mono">tc status</span> prints the same fields today.</p></div>
+        </section>
+      </div>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -42,6 +42,22 @@ class Settings(BaseModel):
         description="Explicit providers.toml path (spec 05); else $TURBOCHICKENS_PROVIDERS, "
         "else <data_dir>/providers.toml, else built-in defaults.",
     )
+    # spec 12 (coop): the daemon serves the TurboChickens GUI over HTTP in its
+    # own event loop when enabled — `tc coop start`, or `tc daemon start` with
+    # coop_enabled = true (the coop container's CMD)
+    coop_enabled: bool = False
+    coop_host: str = "127.0.0.1"
+    coop_port: int = Field(default=8737, gt=0, le=65535)
+    coop_auth_token: str | None = Field(
+        default=None,
+        description="Shared bearer token for the coop HTTP surface. Required when bound "
+        "non-loopback; when unset there, an ephemeral token is generated at startup and "
+        "printed once to stdout. Never written to the audit log.",
+    )
+
+    @property
+    def coop_url(self) -> str:
+        return f"http://{self.coop_host}:{self.coop_port}/"
 
     @property
     def socket_path(self) -> Path:

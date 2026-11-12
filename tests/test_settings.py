@@ -36,6 +36,42 @@ def test_defaults_when_no_settings_file() -> None:
     assert s.audit_log_path == s.data_dir / "audit.jsonl"
 
 
+def test_coop_defaults() -> None:
+    s = Settings()
+    assert s.coop_enabled is False
+    assert s.coop_host == "127.0.0.1"
+    assert s.coop_port == 8737
+    assert s.coop_auth_token is None
+    assert s.coop_url == "http://127.0.0.1:8737/"
+
+
+def test_coop_fields_from_file(tmp_path) -> None:
+    f = tmp_path / "settings.toml"
+    f.write_text(
+        f'data_dir = "{tmp_path / "data"}"\n'
+        "coop_enabled = true\n"
+        'coop_host = "0.0.0.0"\n'
+        "coop_port = 9000\n"
+        'coop_auth_token = "tok-123"\n'
+    )
+    s = load_settings(f)
+    assert s.coop_enabled is True
+    assert s.coop_host == "0.0.0.0"
+    assert s.coop_port == 9000
+    assert s.coop_auth_token == "tok-123"
+    assert s.coop_url == "http://0.0.0.0:9000/"
+
+
+def test_coop_bad_port_rejected(tmp_path) -> None:
+    f = tmp_path / "settings.toml"
+    f.write_text("coop_port = 0\n")
+    with pytest.raises(SettingsError, match="coop_port"):
+        load_settings(f)
+    f.write_text("coop_port = 70000\n")
+    with pytest.raises(SettingsError, match="coop_port"):
+        load_settings(f)
+
+
 def test_model_defaults_match_documented() -> None:
     s = Settings()
     assert s.audit_retention == "forever"

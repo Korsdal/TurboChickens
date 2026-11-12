@@ -14,6 +14,13 @@ cron schedule submits an ``enqueue`` with ``trigger="cron"`` over this same
 socket, so manual and cron runs share one queue and one admission path.
 Runs flow through one queue with resource-weight admission control; over-budget
 runs backlog in ``pending``, never rejected.
+
+Spec 12 (coop): when ``coop_enabled`` is set, the same process also serves the
+TurboChickens GUI over HTTP (aiohttp, same event loop) — static SPA at ``/``
+and ``/api/ping`` + ``/api/status`` under ``/api``, thin mirrors of the socket
+ops called over the daemon's own socket. Loopback + no token → open;
+non-loopback (or any configured token) → bearer required, with an ephemeral
+token printed once at startup when none is configured.
 """
 
 from __future__ import annotations
@@ -64,6 +71,7 @@ class Daemon:
         self.providers: ProvidersConfig | None = None
         self.cron: CronScheduler | None = None
         self._server: asyncio.AbstractServer | None = None
+        self.coop: Any | None = None  # CoopServer when coop_enabled (spec 12)
         self._stop: asyncio.Event | None = None
         self._db_lock = asyncio.Lock()
         self._sched_task: asyncio.Task | None = None
@@ -116,6 +124,20 @@ class Daemon:
         self._load_schedules()
         self._server = await asyncio.start_unix_server(self._handle_client, path=str(s.socket_path))
         os.chmod(s.socket_path, 0o600)
+        # spec 12: coop — serve the GUI over HTTP in this same event loop
+        if s.coop_enabled:
+            from turbochickens.coop import CoopServer  # lazy: coop imports client, client imports this module
+
+            self.coop = CoopServer(s)
+            await self.coop.start()
+            self.audit.append(
+                {
+                    "event": "coop.started",
+                    "url": self.coop.url,
+                    "auth_required": self.coop.auth.required,
+                    # the token itself is never audited — printed once to stdout only
+                }
+            )
         serve_task = asyncio.create_task(self._server.serve_forever())
         stop_task = asyncio.create_task(self._stop.wait())
         self._sched_task = asyncio.create_task(self._scheduler())
@@ -123,6 +145,12 @@ class Daemon:
         try:
             await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         finally:
+            if self.coop is not None:
+                with contextlib.suppress(Exception):
+                    await self.coop.stop()
+                if self.audit is not None:
+                    self.audit.append({"event": "coop.stopped", "url": self.coop.url})
+                self.coop = None
             self._server.close()
             serve_task.cancel()
             stop_task.cancel()
@@ -269,7 +297,15 @@ class Daemon:
                 "results_retention_months": self.settings.results_retention_months,
                 "last_sweep": self._last_retention,
             },
+            "coop": self._coop_block(),
         }
+
+    def _coop_block(self) -> dict[str, Any]:
+        """The coop block of the status op — url + whether auth is required;
+        never the token (spec 12)."""
+        if self.coop is not None:
+            return self.coop.status_block()
+        return {"enabled": False, "url": None, "auth_required": False}
 
     def _schedule_count(self) -> int:
         if self.db is None:

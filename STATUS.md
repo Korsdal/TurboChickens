@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 10 landed (188/188 tests green, e2e smoke verified).
+**Last updated:** 2026-11-12, after spec 12 landed (213/213 tests green, e2e smoke verified).
 
 ---
 
@@ -26,7 +26,7 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, and the spec-10 commit).
+**Spec 01 through spec 10 and spec 12 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, and the spec-12 commit). Spec 11 is the parent GUI spec; its first slice (spec 12, the skeleton) is landed, the rest of its stories land via specs 13–18.
 
 **Spec 19 (auth & access management UI) is backlogged** — `specs/19-auth-access-management-ui.md`, status ready-for-agent, not started. Note spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality.
 Verified this session:
@@ -90,6 +90,17 @@ Verified this session:
 #   → tc jobs validate <mistral-api job, model without pricing preset> → warning on stderr + OK, rc 0;
 #     unknown provider → error harness.model … known providers, rc 1; vibe-cli model not in the probed
 #     catalog → error naming the offered models, rc 1
+# spec-12 smoke (temp settings, coop_enabled=true, coop_host="0.0.0.0", no coop_auth_token; `tc daemon start`):
+#   → stdout prints exactly one "coop auth token: …" line at startup (never in audit/status)
+#   → GET /api/ping → 200 unauthenticated; GET /api/status → 401 without bearer, 200 with bearer,
+#     body == socket `status` response incl. coop={enabled, url, auth_required}
+#   → GET / → 200 text/html (shell: sidebar, wordmark + egg dot, nav, login card, Dashboard stat row +
+#     flock diagram); /app.js → application/javascript; /styles.css → text/css; /icons/*.svg → image/svg+xml;
+#     unknown path → 404; traversal → 404; loopback+no-token → open (200 without auth)
+#   → tc status prints "coop: <url> auth=required|open"; tc coop start (coop_enabled forced) serves the same;
+#     tc daemon stop → rc 0, HTTP port refuses connections afterwards, audit has coop.started/coop.stopped
+#   → daemon-socket-unreachable seam (CoopServer with dead-socket transport): /api/status → 200 with
+#     daemon.up=false, /api/ping → 503 — the SPA renders a banner, not a broken page
 ```
 
 What exists:
@@ -98,7 +109,18 @@ What exists:
 src/turbochickens/
 ├── __main__.py            # python -m turbochickens → CLI
 ├── util.py                # utcnow / utcnow_iso (UTC, ms precision, Z suffix)
-├── settings.py            # Settings (Pydantic, extra=forbid) + load_settings(); defaults below
+├── settings.py            # Settings (Pydantic, extra=forbid) + load_settings(); defaults below;
+│                          # spec 12: coop_enabled/coop_host/coop_port/coop_auth_token + coop_url
+├── coop.py                # spec 12: CoopServer — aiohttp HTTP server inside the daemon's event loop;
+│                          # /api/ping (unauthenticated healthcheck) + /api/status (bearer unless loopback+
+│                          # no token; ephemeral token minted+printed once when non-loopback and none
+│                          # configured); static SPA at /; transport seam = client.request_async over the
+│                          # daemon socket (web layer never opens DB/artifacts); pure coop_auth() seam
+│   └── coop_static/       # the dependency-free SPA (index.html + app.js + styles.css + lucide icons as
+│                          # local SVGs, no build step, no runtime CDN): 240px sidebar shell, wordmark +
+│                          # egg dot, nav, login card (sessionStorage bearer, no cookies), Dashboard with
+│                          # stat row + pulsing flock diagram, 2 s polling, flash-on-change, daemon-down
+│                          # banner — built to specs/00-design-system.md
 ├── storage.py             # init_db(): full MVP SQLite schema + `schedules` table (spec 06) +
 │                          # `job_usage_stats` percentile columns (spec 08, schema_version=3, with
 │                          # in-place migration of v2 DBs) + append-only triggers + schema_meta
@@ -144,7 +166,12 @@ src/turbochickens/
 │                          # backlogs, never rejects); a firing cron submits enqueue trigger=cron over
 │                          # the daemon's own socket; retention sweep at startup + hourly (spec 08);
 │                          # results_get reports expired artifacts; status carries a retention block
-├── client.py              # request(socket, op, **payload) → parsed response; DaemonUnreachable
+│                          # + a coop block (spec 12: enabled/url/auth_required, never the token);
+│                          # spec 12: with coop_enabled, serve() also starts the coop HTTP server in
+│                          # the same loop and shutdown tears it down (audit coop.started/stopped)
+├── client.py              # request(socket, op, **payload) → parsed response; DaemonUnreachable;
+│                          # spec 12: request_async(...) — the same exchange awaitable inside a running
+│                          # loop (used by the coop web layer's SocketTransport)
 ├── models.py              # spec 10: model discovery, on-demand per invocation (no daemon state) —
 │                          # fetch_models (GET {base_url}/models, bearer from the allowlisted env var
 │                          # or the seat session token; token never printed/logged), list_provider_catalogs
@@ -159,7 +186,8 @@ src/turbochickens/
 └── cli/main.py            # Typer app `tc`: run [--wait] | runs list/show/logs | results get |
                            # jobs validate (spec 10: model checks) | daemon start/stop | status |
                            # schedule add/list/rm | stats list/show (spec 08) |
-                           # auth login/status/logout (spec 09, local) | models list (spec 10, local)
+                           # auth login/status/logout (spec 09, local) | models list (spec 10, local) |
+                           # coop start (spec 12: daemon with the GUI forced on; status prints coop:)
 tests/
 ├── test_spec_model.py     # pure-function seam: parser/model/hash
 ├── test_cli_validate.py   # CLI seam: tc jobs validate behavior
@@ -194,6 +222,11 @@ tests/
                            # rc 0, env-key/401/seat-session credential paths), vibe catalog via a fake
                            # vibe binary (probe parse + broken binary), and tc jobs validate
                            # warn/error model checks
+├── test_coop.py           # spec 12: coop auth seam (loopback/token/ephemeral), HTTP API against a thread
+│                          # daemon on a temp port (ping/status mirrors, pages + content types, 401/200 auth,
+│                          # token never in status/audit, ephemeral token printed once, shutdown tears HTTP
+│                          # down, coop-disabled status block, daemon-down payload via dead-socket transport),
+│                          # and subprocess e2e of `tc coop start` (open + non-loopback ephemeral-token modes)
 ├── test_api_adapter.py    # spec 05: providers seam, MistralAPIAdapter contract seam (MockTransport:
                            # JSON-mode shape, exp backoff on 429/5xx, no retry on 4xx, Retry-After,
                            # timeout, missing credential), e2e via daemon thread + subprocess against
@@ -202,9 +235,9 @@ examples/weekly-incidents-digest/   # baseline-format example job (job.toml, pro
 examples/hello-vibe-cli/            # manual vibe-cli example job (job.toml, prompt, schema)
 examples/providers.toml             # spec 05 reference provider registry (mistral presets + pricing,
                            # commented other-provider example) — copy to ~/.turbochickens/providers.toml
-pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.7, deps: pydantic, typer, rich, croniter,
-                           # jsonschema (+ rfc3339-validator for format checks), httpx, apscheduler (spec 06);
-                           # dev: pytest
+pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.11, deps: pydantic, typer, rich, croniter,
+                           # jsonschema (+ rfc3339-validator for format checks), httpx, apscheduler (spec 06),
+                           # aiohttp (spec 12, coop web server); dev: pytest
 ```
 
 Spec-02 deliverables, concretely:
@@ -434,6 +467,15 @@ Spec-10 deliverables, concretely:
 - **`tc jobs validate`** (now takes `--settings` for providers resolution): a `mistral-api` model whose *provider* is unknown → `error harness.model: unknown provider …` (exit 1); a known provider without a pricing preset for the model → `warning harness.model: … no pricing preset …` on stderr, still `OK` exit 0 (the live catalog may offer it — check `tc models list`); a `vibe-cli` model not in the probed catalog → `error harness.model: unknown model … the vibe binary offers: …` (exit 1), skipped when the probe can't determine the catalog. Enqueue-time behavior is unchanged (spec 05: unresolvable model/provider still fails fast at the daemon).
 - **Tests** (`test_models.py`, 22): `fetch_models` contract over `MockTransport` (id parsing, bearer only with a token, 500/malformed/transport errors, token never in errors); `model_issues` pure seam; `tc models list` e2e over a hermetic loopback fake /models server (live ids + pricing marks, dead-port provider row rc 0, env-key vs no-key vs 401 vs seat-session credential paths, key/token never in output); vibe catalog via a fake vibe binary (probe parse, broken binary → reachable=no rc 0); and the `tc jobs validate` warn/error cases.
 
+Spec-12 deliverables, concretely:
+
+- **Settings** (`settings.py`): `coop_enabled` (false), `coop_host` (`127.0.0.1`), `coop_port` (8737), `coop_auth_token` (none), derived `coop_url`; `extra="forbid"` intact (bad ports rejected).
+- **Web module** (`coop.py`): `CoopServer` runs an aiohttp server **inside the daemon's event loop** when `coop_enabled` (spec 11's single new dependency, asyncio-native). Routes: `GET /api/ping` (unauthenticated healthcheck; 503 structured payload if the socket is unreachable), `GET /api/status` (mirror of the socket `status` op; 200 with `daemon.up=false` when the socket is unreachable so the SPA shows a banner), `GET /` + static assets with correct content types (traversal blocked). `coop_auth()` pure seam: loopback + no token → open; non-loopback or any configured token → bearer required; configured token wins, else an ephemeral `secrets.token_urlsafe` token is **printed exactly once to stdout** at startup — never written to the audit log or the status payload. Auth middleware covers `/api/*` except `/api/ping`; static assets stay open so the SPA can load and show its login card on 401. No cookies; the SPA keeps the token in `sessionStorage` and sends `Authorization: Bearer …`.
+- **Transport seam:** `SocketTransport.request(op, **payload)` calls the new `client.request_async` over the daemon's own Unix socket — the web layer never opens the SQLite DB or artifact files, so no GUI path can bypass queue/admission/validation/quarantine/attestation/append-only.
+- **Daemon integration** (`daemon.py`): `serve()` starts/stops the coop server with the daemon (audit `coop.started`/`coop.stopped`, token never audited); `status` gains a `coop` block `{enabled, url, auth_required}`; shutdown tears the HTTP server down cleanly. CLI: `tc coop start` (forces `coop_enabled`) behaves like `tc daemon start` with `coop_enabled = true`; `tc status` prints the `coop:` line.
+- **SPA** (`coop_static/`, bundled in the wheel): dependency-free `index.html` + `app.js` + `styles.css` + lucide icons as local SVGs (no build step, no runtime CDN), built to `specs/00-design-system.md` — 240px sidebar on the paper ground with hairline, TurboChickens wordmark + egg dot, nav (Dashboard/Runs/Jobs/Schedules/Stats/Audit/Settings), daemon pill at the foot ("coop · up 3h 12m"); login card on 401 (token field, one primary button); Dashboard = stat row (uptime, queue depth, in-flight vs weight budget, alerts, schedules, retention) + the flock diagram (daemon hub, queue/schedules in, in-flight lanes out, pulses in 2.5–4 s cycles restarting on hover), polling `/api/status` every 2 s with changed values flashing once and a clear daemon-down banner. Other views render their headers + honest empty states until specs 13–17.
+- **Tests** (`test_coop.py`, 22 + 3 settings): pure `coop_auth`/`is_loopback` seam; HTTP API against a thread daemon on a temp port (ping/status mirror the socket ops, pages + content types, 404/traversal, auth 401/200, token never in status/audit, ephemeral token printed exactly once, shutdown tears HTTP down, coop-disabled status block); the daemon-down payload through a dead-socket transport; and subprocess e2e for both `tc coop start` (open mode, no token printed) and non-loopback (ephemeral token from stdout, 401/200, clean stop). No browser automation.
+
 | Spec | Title | Status | Blocked by |
 | --- | --- | --- | --- |
 | 01 | Scaffold + job spec model + `tc jobs validate` | **done** (`f8b8061`) | — |
@@ -447,8 +489,8 @@ Spec-10 deliverables, concretely:
 | 00 | Design system — TurboChickens GUI | **settled** (2026-11-12; governs 12–18) | — |
 | 09 | Seat/subscription auth, no API key | **done** (2026-11-12) | 05 |
 | 10 | Model discovery (`tc models list`) | **done** (2026-11-12) | 05 |
-| 11 | TurboChickens GUI in the coop container (parent spec) | ready-for-agent | 02–08 |
-| 12 | Coop skeleton: daemon serves GUI (HTTP + auth + shell + Dashboard) | ready-for-agent | — |
+| 11 | TurboChickens GUI in the coop container (parent spec) | in progress — skeleton slice landed via 12 | 02–08 |
+| 12 | Coop skeleton: daemon serves GUI (HTTP + auth + shell + Dashboard) | **done** (2026-11-12) | — |
 | 13 | Jobs / Audit / Settings views (read-only socket ops) | ready-for-agent | 12 |
 | 14 | Runs from the GUI (trigger, watch, results/quarantine) | ready-for-agent | 12 |
 | 15 | Upload + validate job specs from the browser | ready-for-agent | 14 |
@@ -516,21 +558,24 @@ tables deliberately excluded).
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 - **Version management is a human responsibility.** Coding agents can bump the
   last part of a version number (`0.0.X`) — every other bump (minor, major) is
-  human initiated. Current version: `0.0.10`.
+  human initiated. Current version: `0.0.11`.
 
 ## 7. Next up — the coop GUI roadmap
 
-Spec 10 (model discovery) landed: `tc models list` queries each provider's
-live `GET /models` catalog (and `--adapter vibe-cli` probes the vibe binary's
-own model list), marking which live models have pricing presets, with
-spec-05/09 credential handling and no daemon state; `tc jobs validate` warns
-on unpriced mistral-api models and errors on models unknown to the chosen
-harness.
+Spec 12 (coop skeleton) landed: with `coop_enabled = true` the daemon serves
+the TurboChickens GUI over HTTP in its own event loop — `/api/ping` +
+`/api/status` as thin mirrors of the socket ops (transport seam:
+`client.request_async` over the daemon socket, never the DB), bearer auth
+when bound non-loopback (ephemeral token printed once at startup, sessionStorage
+in the SPA, no cookies), the design-system shell (240px sidebar, wordmark + egg
+dot, nav, login card) and the Dashboard (stat row + flock diagram, 2 s polling)
+per `specs/00-design-system.md`; `tc coop start` runs the same thing locally.
 
-Next backlog item is the coop GUI roadmap — **specs 11–18** (governed by
-spec 00), with **spec 19** (auth & access management UI) queued behind
-spec 12. The MVP spec pipeline (01–10) is complete; what remains beyond the
-GUI is the post-MVP roadmap in baseline §13.
+Next backlog item is **spec 13** (Jobs / Audit / Settings views — the three new
+read-only socket ops `jobs_list` / `audit_tail` / `settings_get` plus their
+`/api` mirrors), then 14–18, with **spec 19** (auth & access management UI)
+queued behind 12. The MVP spec pipeline (01–10) is complete; what remains
+beyond the GUI is the post-MVP roadmap in baseline §13.
 
 **Deferred (backlog notes):**
 - *Async seat broker:* `SeatBroker` does its HTTP synchronously (httpx.Client)

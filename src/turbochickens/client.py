@@ -15,10 +15,13 @@ class DaemonUnreachable(Exception):
     """The daemon socket does not answer (daemon down or wrong path)."""
 
 
-def request(socket_path: str | Path, op: str, timeout: float = 5.0, **payload: Any) -> dict[str, Any]:
-    """Send one JSON-lines request, return the parsed response object."""
-
-    async def _go() -> dict[str, Any]:
+async def request_async(
+    socket_path: str | Path, op: str, timeout: float = 5.0, **payload: Any
+) -> dict[str, Any]:
+    """Send one JSON-lines request from inside a running event loop (spec 12:
+    the coop web layer calls the daemon over this socket from the daemon's own
+    loop), return the parsed response object."""
+    try:
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
             req = {"op": op, "protocol": PROTOCOL_VERSION, **payload}
@@ -35,8 +38,17 @@ def request(socket_path: str | Path, op: str, timeout: float = 5.0, **payload: A
             writer.close()
             with contextlib.suppress(OSError):
                 await writer.wait_closed()
+    except OSError as e:
+        raise DaemonUnreachable(f"no daemon at {socket_path}: {e}") from e
+
+
+def request(socket_path: str | Path, op: str, timeout: float = 5.0, **payload: Any) -> dict[str, Any]:
+    """Send one JSON-lines request, return the parsed response object."""
+
+    async def _go() -> dict[str, Any]:
+        return await request_async(socket_path, op, timeout=timeout, **payload)
 
     try:
         return asyncio.run(asyncio.wait_for(_go(), timeout=timeout))
-    except (OSError, asyncio.TimeoutError) as e:
-        raise DaemonUnreachable(f"no daemon at {socket_path}: {e}") from e
+    except asyncio.TimeoutError as e:
+        raise DaemonUnreachable(f"no daemon at {socket_path}: timed out after {timeout}s") from e

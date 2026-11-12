@@ -35,6 +35,7 @@ schedule_app = typer.Typer(help="Manage cron schedules.", no_args_is_help=True)
 stats_app = typer.Typer(help="Per-job usage statistics (spec 08).", no_args_is_help=True)
 auth_app = typer.Typer(help="Seat/subscription auth (spec 09) — local, no daemon needed.", no_args_is_help=True)
 models_app = typer.Typer(help="Model discovery (spec 10) — local, no daemon needed.", no_args_is_help=True)
+coop_app = typer.Typer(help="Coop — the TurboChickens GUI served by the daemon over HTTP (spec 12).", no_args_is_help=True)
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(runs_app, name="runs")
@@ -43,6 +44,7 @@ app.add_typer(schedule_app, name="schedule")
 app.add_typer(stats_app, name="stats")
 app.add_typer(auth_app, name="auth")
 app.add_typer(models_app, name="models")
+app.add_typer(coop_app, name="coop")
 
 err_console = Console(stderr=True)
 console = Console()
@@ -185,6 +187,40 @@ def daemon_start(
     typer.echo("daemon stopped")
 
 
+@coop_app.command("start")
+def coop_start(
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Start the daemon with the coop GUI enabled — HTTP at coop_host:coop_port serving / and /api/*.
+
+    Identical to `tc daemon start` with coop_enabled = true in settings (the coop
+    container's CMD). Loopback with no coop_auth_token → open; otherwise a bearer
+    token is required and an ephemeral one is printed once to stdout."""
+    from turbochickens.coop import coop_auth
+
+    try:
+        settings = load_settings(settings_path)
+    except SettingsError as e:
+        err_console.print(f"[bold red]error[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+    settings = settings.model_copy(update={"coop_enabled": True})
+    auth = coop_auth(settings)
+    typer.echo(
+        f"daemon starting: socket={settings.socket_path} "
+        f"db={settings.db_path} audit_log={settings.audit_log_path} "
+        f"weight_budget={settings.weight_budget}"
+    )
+    typer.echo(
+        f"coop: gui at {settings.coop_url} auth={'required (bearer token)' if auth.required else 'open (loopback, no token configured)'}"
+    )
+    try:
+        asyncio.run(run_daemon(settings))
+    except DaemonAlreadyRunning as e:
+        err_console.print(f"[bold red]error[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+    typer.echo("daemon stopped")
+
+
 @daemon_app.command("stop")
 def daemon_stop(
     settings_path: Path | None = _settings_opt(),
@@ -238,6 +274,11 @@ def status(
         typer.echo(
             f"retention: audit_log={retention.get('audit_retention')} "
             f"results_retention_months={retention.get('results_retention_months')}"
+        )
+    coop = resp.get("coop") or {}
+    if coop.get("enabled"):
+        typer.echo(
+            f"coop: {coop.get('url')} auth={'required' if coop.get('auth_required') else 'open'}"
         )
     if in_flight:
         table = Table(title="In-flight runs")
