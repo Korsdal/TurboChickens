@@ -4,8 +4,12 @@ When ``coop_enabled`` is set (``tc coop start``, or ``tc daemon start`` with
 ``coop_enabled = true`` — the coop container's CMD), the daemon process also
 runs a small aiohttp server **in the same asyncio event loop**, serving the
 static SPA at ``/`` and a JSON API under ``/api`` — ``/api/ping`` +
-``/api/status`` (spec 12) and the spec 13 read-only mirrors ``/api/jobs``,
-``/api/audit?limit=&event=``, ``/api/settings``.
+``/api/status`` (spec 12), the spec 13 read-only mirrors ``/api/jobs``,
+``/api/audit?limit=&event=``, ``/api/settings``, and the spec 14 runs path:
+``POST /api/runs`` (enqueue by in-container spec path, trigger=manual),
+``GET /api/runs?job=&status=``, ``GET /api/runs/{id}``, ``GET /api/runs/{id}/logs``,
+``GET /api/results/{run_id}`` (validated output, or quarantine errors + raw
+output, or expired).
 
 Transport seam: every API handler is a thin client of the existing Unix-socket
 protocol — it calls ``request(op, **payload)`` over the socket (spec 12) and
@@ -26,6 +30,7 @@ to the audit log.
 from __future__ import annotations
 
 import ipaddress
+import json
 import secrets
 from dataclasses import dataclass
 from importlib.resources import files
@@ -135,6 +140,12 @@ class CoopServer:
         app.router.add_get("/api/jobs", self._api_jobs)
         app.router.add_get("/api/audit", self._api_audit)
         app.router.add_get("/api/settings", self._api_settings)
+        # spec 14: runs from the GUI
+        app.router.add_post("/api/runs", self._api_run_enqueue)
+        app.router.add_get("/api/runs", self._api_runs_list)
+        app.router.add_get("/api/runs/{run_id}", self._api_run_show)
+        app.router.add_get("/api/runs/{run_id}/logs", self._api_run_logs)
+        app.router.add_get("/api/results/{run_id}", self._api_result_get)
         app.router.add_get("/", self._index)
         app.router.add_get("/{tail:.*}", self._static_file)
         self._runner = web.AppRunner(app)
@@ -175,16 +186,23 @@ class CoopServer:
             )
         return web.json_response(resp)
 
-    async def _mirror(self, op: str, **payload: Any) -> web.Response:
-        """Forward one socket op over the transport seam. When the daemon socket
-        is unreachable, answer 200 with a structured `daemon.up=false` payload so
-        the SPA renders a clear empty state/banner instead of a broken page
-        (spec 11, story 24)."""
+    async def _call(self, op: str, **payload: Any) -> tuple[dict[str, Any] | None, web.Response | None]:
+        """One socket op over the transport seam. Returns (resp, None), or
+        (None, down_response) when the daemon socket is unreachable — the SPA
+        renders a clear empty state/banner instead of a broken page (spec 11,
+        story 24)."""
         try:
-            resp = await self.transport.request(op, **payload)
+            return await self.transport.request(op, **payload), None
         except DaemonUnreachable as e:
-            return web.json_response({"ok": False, "op": op, "daemon": {"up": False}, "error": str(e)})
-        return web.json_response(resp)
+            return None, web.json_response(
+                {"ok": False, "op": op, "daemon": {"up": False}, "error": str(e)}
+            )
+
+    async def _mirror(self, op: str, **payload: Any) -> web.Response:
+        """Forward one socket op over the transport seam as a 200 JSON response
+        (ok:false payloads included), or the structured daemon-down payload."""
+        resp, down = await self._call(op, **payload)
+        return down if down is not None else web.json_response(resp)  # type: ignore[arg-type]
 
     async def _api_status(self, request: web.Request) -> web.Response:
         return await self._mirror("status")
@@ -212,6 +230,71 @@ class CoopServer:
 
     async def _api_settings(self, request: web.Request) -> web.Response:
         return await self._mirror("settings_get")
+
+    # --- spec 14: runs from the GUI -------------------------------------------
+
+    async def _api_run_enqueue(self, request: web.Request) -> web.Response:
+        """POST /api/runs — enqueue a manual run by in-container spec path.
+        The daemon re-validates the spec itself; a refused enqueue is a 422
+        carrying the socket response, a malformed body a 400."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            body = None
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("spec_path"), str)
+            or not body["spec_path"].strip()
+        ):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "op": "enqueue",
+                    "error": "POST /api/runs needs a JSON body with a spec_path string (an in-container path)",
+                },
+                status=400,
+            )
+        payload: dict[str, Any] = {"spec_path": body["spec_path"].strip(), "trigger": "manual"}
+        if body.get("spec_hash"):
+            payload["spec_hash"] = str(body["spec_hash"])
+        resp, down = await self._call("enqueue", **payload)
+        if down is not None:
+            return down
+        assert resp is not None
+        return web.json_response(resp, status=200 if resp.get("ok") else 422)
+
+    async def _api_runs_list(self, request: web.Request) -> web.Response:
+        """GET /api/runs?job=&status= — the runs table, filterable."""
+        payload: dict[str, Any] = {}
+        job = request.query.get("job")
+        if job:
+            payload["job"] = job
+        status = request.query.get("status")
+        if status:
+            payload["status"] = status
+        return await self._mirror("runs_list", **payload)
+
+    async def _mirror_resource(self, op: str, **payload: Any) -> web.Response:
+        """GET mirror of a single-resource op: 200 with the payload — including
+        ok:false flags the SPA renders (quarantined/expired) — 404 when the
+        daemon reports the resource itself missing, 200 structured when down."""
+        resp, down = await self._call(op, **payload)
+        if down is not None:
+            return down
+        assert resp is not None
+        error = str(resp.get("error", ""))
+        if not resp.get("ok") and ("unknown run" in error or "no result stored" in error):
+            return web.json_response(resp, status=404)
+        return web.json_response(resp)
+
+    async def _api_run_show(self, request: web.Request) -> web.Response:
+        return await self._mirror_resource("runs_show", run_id=request.match_info["run_id"])
+
+    async def _api_run_logs(self, request: web.Request) -> web.Response:
+        return await self._mirror_resource("runs_logs", run_id=request.match_info["run_id"])
+
+    async def _api_result_get(self, request: web.Request) -> web.Response:
+        return await self._mirror_resource("results_get", run_id=request.match_info["run_id"])
 
     # --- static SPA ----------------------------------------------------------
 

@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 13 landed (226/226 tests green, e2e smoke verified).
+**Last updated:** 2026-11-12, after spec 14 landed (236/236 tests green, e2e smoke verified).
 
 ---
 
@@ -26,7 +26,7 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10 and specs 12–13 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, and the spec-13 commit). Spec 11 is the parent GUI spec; its first two slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views) are landed, the rest of its stories land via specs 14–18.
+**Spec 01 through spec 10 and specs 12–14 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, and the spec-14 commit). Spec 11 is the parent GUI spec; its first three slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs) are landed, the rest of its stories land via specs 15–18.
 
 **Spec 19 (auth & access management UI) is backlogged** — `specs/19-auth-access-management-ui.md`, status ready-for-agent, not started. Note spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality.
 Verified this session:
@@ -114,6 +114,21 @@ Verified this session:
 #   → GET / serves the SPA with the Jobs table (jobs-tbody), Audit mono tail + event chips
 #     (audit-chips/audit-log) and Settings rows (settings-list); app.js polls /api/jobs, /api/audit,
 #     /api/settings every 2 s on the active view
+# spec-14 smoke (temp settings, coop_enabled=true, `tc coop start` subprocess, fake vibe binary):
+#   → POST /api/runs {spec_path} → 200 {ok, run_id, status=queued, weight=1.0}; `tc runs list` shows
+#     the run trigger=manual; poll GET /api/runs/{id} → succeeded; GET /api/runs/{id} == socket
+#     runs_show (manifest: spec hash, harness vibe-cli 9.9.9-fake, model, temperature, budget.outcome=ok,
+#     usage tokens); GET /api/runs/{id}/logs == runs_logs (sanitized harness lines)
+#   → GET /api/runs?job=&status= == socket runs_list with the same filters; rows carry result_valid
+#   → GET /api/results/{run_id} → 200 {ok, output} == socket results_get == `tc results get` (rc 0, same JSON)
+#   → strict-schema job → run failed; GET /api/results/{run_id} → 200 {ok:false, quarantined, schema_errors,
+#     raw_output}; `tc results get` rc 1, never the payload; POST with bad body → 400, missing file → 422,
+#     unknown run/result → 404; run without a result yet → 404 "no result stored"
+#   → backdated run + retention_sweep → GET /api/results/{run_id} → 200 {ok:false, expired:true}, no payload
+#   → auth-required mode: all /api/runs* + /api/results/* → 401 without bearer, 200/404 with; /api/ping open;
+#     dead-socket transport → 200 {ok:false, daemon.up=false} on all of them (POST included, not 500)
+#   → GET / serves the Runs view (run-form, runs-tbody, filter chips, run-detail with Manifest/Logs/Result
+#     tabs, copy buttons); app.js polls /api/runs (+ open run's show/logs/results) every 2 s, row flash on change
 ```
 
 What exists:
@@ -128,17 +143,23 @@ src/turbochickens/
 ├── coop.py                # spec 12: CoopServer — aiohttp HTTP server inside the daemon's event loop;
 │                          # /api/ping (unauthenticated healthcheck) + /api/status (bearer unless loopback+
 │                          # no token; ephemeral token minted+printed once when non-loopback and none
-│                          # configured); spec 13: /api/jobs + /api/audit?limit=&event= + /api/settings —
-│                          # thin mirrors of the socket ops, 200 {daemon.up=false} when the socket is dead;
-│                          # static SPA at /; transport seam = client.request_async over the
-│                          # daemon socket (web layer never opens DB/artifacts); pure coop_auth() seam
+│                          # configured); spec 13: /api/jobs + /api/audit?limit=&event= + /api/settings;
+│                          # spec 14: POST /api/runs (enqueue by in-container spec path, trigger=manual; 400 bad
+│                          # body, 422 daemon-refused), GET /api/runs?job=&status=, /api/runs/{id},
+│                          # /api/runs/{id}/logs, /api/results/{run_id} (200 with quarantined/expired flags,
+│                          # 404 unknown resource) — thin mirrors of the socket ops, 200 {daemon.up=false}
+│                          # when the socket is dead; static SPA at /; transport seam = client.request_async
+│                          # over the daemon socket (web layer never opens DB/artifacts); coop_auth() seam
 │   └── coop_static/       # the dependency-free SPA (index.html + app.js + styles.css + lucide icons as
 │                          # local SVGs, no build step, no runtime CDN): 240px sidebar shell, wordmark +
 │                          # egg dot, nav, login card (sessionStorage bearer, no cookies), Dashboard with
 │                          # stat row + pulsing flock diagram, spec 13: Jobs table, Audit mono tail with
-│                          # event-type chips, Settings read-only rows — each view polls its /api/* every
-│                          # 2 s, flash-on-change, daemon-down banner + per-view empty states — built to
-│                          # specs/00-design-system.md
+│                          # event-type chips, Settings read-only rows, spec 14: Runs view (run-by-spec-path
+│                          # form, job/status filter chips, table with status egg-dots — queued hollow,
+│                          # in-flight pulsing amber, succeeded green, failed red, quarantined amber — and a
+│                          # detail pane with Manifest/Logs/Result-or-Quarantine tabs, copy buttons, quarantine
+│                          # + expired states) — each view polls its /api/* every 2 s, flash-on-change,
+│                          # daemon-down banner + per-view empty states — built to specs/00-design-system.md
 ├── storage.py             # init_db(): full MVP SQLite schema + `schedules` table (spec 06) +
 │                          # `job_usage_stats` percentile columns (spec 08, schema_version=3, with
 │                          # in-place migration of v2 DBs) + append-only triggers + schema_meta
@@ -183,6 +204,9 @@ src/turbochickens/
 │                          # schedule_add/schedule_list/schedule_rm (spec 06)/stats_list/stats_show/
 │                          # retention_sweep (spec 08)/jobs_list/audit_tail/settings_get (spec 13,
 │                          # read-only GUI ops; settings_get never includes the coop token);
+│                          # spec 14: runs_list takes optional job=/status= filters + result_valid per row;
+│                          # results_get returns quarantined raw_output + schema_errors (never valid) and
+│                          # reports expired for artifacts the retention sweep removed (valid or quarantined);
 │                          # admission-control scheduler (over-budget
 │                          # backlogs, never rejects); a firing cron submits enqueue trigger=cron over
 │                          # the daemon's own socket; retention sweep at startup + hourly (spec 08);
@@ -254,6 +278,14 @@ tests/
                            # (/api/jobs, /api/audit?limit=&event=, /api/settings), auth-required mode,
                            # empty-state + filter behaviour over HTTP, dead-socket daemon-down payloads,
                            # and the served SPA markup for the three views
+└── test_coop_runs.py      # spec 14: runs_list job/status filters + result_valid over the socket; POST
+                           # /api/runs enqueue over HTTP with CLI parity (`tc runs list` trigger=manual) and
+                           # pipeline to terminal; /api/runs(+filters)/{id}/{id}/logs /api/results/{id} HTTP ==
+                           # socket parity; quarantine over HTTP (schema_errors + raw_output, never valid);
+                           # expired artifacts → 200 expired state; 400/422/404 request handling; auth-required
+                           # 401s; dead-socket daemon-down payloads incl. POST; served Runs SPA markup; and a
+                           # subprocess e2e (`tc coop start` + fake vibe): HTTP-triggered run → succeeded →
+                           # validated result over HTTP + CLI
 ├── test_api_adapter.py    # spec 05: providers seam, MistralAPIAdapter contract seam (MockTransport:
                            # JSON-mode shape, exp backoff on 429/5xx, no retry on 4xx, Retry-After,
                            # timeout, missing credential), e2e via daemon thread + subprocess against
@@ -545,8 +577,47 @@ Spec-13 deliverables, concretely:
   absence), the `AuditLog.tail` pure seam (incl. a torn final line), HTTP/socket payload parity for
   all three mirrors, auth-required mode (401/200), empty-state and filter behaviour over HTTP,
   dead-socket daemon-down payloads (200 structured + 503 ping), and the served SPA markup.
+Spec-14 deliverables, concretely:
+
+- **Socket ops** (`daemon.py`): `runs_list` accepts optional `job` (matches job id or
+  name) and `status` (exact) filters and adds `result_valid` (None until the run
+  reaches collecting) to every row, so the runs table can show the quarantined
+  state. `results_get` now returns the quarantined `raw_output` alongside
+  `schema_errors` (held in the append-only row — still never a valid result) and
+  reports `expired` for on-disk artifacts the retention sweep removed, for valid
+  and quarantined rows alike; the payload itself is never served once expired.
+- **HTTP API** (`coop.py`): `POST /api/runs` (JSON body `{"spec_path": …, "spec_hash"?}` →
+  `enqueue` with `trigger="manual"`; 400 on a malformed body, 422 with the socket
+  response when the daemon refuses, e.g. invalid/missing spec), `GET /api/runs?job=&status=`
+  (mirror of `runs_list` with filters), `GET /api/runs/{run_id}` (full manifest via
+  `runs_show`), `GET /api/runs/{run_id}/logs` (`runs_logs`), `GET /api/results/{run_id}`
+  (`results_get`). Single-resource GETs answer 200 with the payload — including the
+  `quarantined`/`expired` flags the SPA renders — and 404 when the resource itself is
+  missing ("unknown run" / "no result stored"); all of them answer 200 with a
+  structured `daemon.up=false` payload when the socket is dead (POST included). Same
+  bearer auth rules as every other `/api/*` route; `/api/ping` stays open.
+- **SPA Runs view** (`coop_static/`): header action = spec-path input + the one filled
+  "Run job" button (inline field error on 400/422/daemon-down; on success the new run's
+  detail pane opens); job filter chips (from `/api/jobs`) + status filter chips; the
+  runs table (run id button, job, status egg-dot + label, trigger, started, finished)
+  with row click → detail pane; status egg-dots per the design system — queued hollow,
+  in-flight pulsing yolk, succeeded green, failed red, quarantined amber (failed +
+  `result_valid=false`); changed rows flash once; the detail pane has tabs Manifest
+  (full run JSON incl. spec hash, harness/provider/model/temperature, budget block,
+  usage, attestation), Logs (sanitized streamed events, follows the tail only when
+  already at the bottom) and Result-or-Quarantine (validated JSON, or the quarantine
+  note + schema errors + raw output, or the expired state) — mono panes with a copy
+  button. The view polls `/api/runs` (plus the open run's three endpoints) every 2 s,
+  so statuses move without a reload.
+- **Tests** (`test_coop_runs.py`, 10): socket filter/`result_valid` seam; POST
+  `/api/runs` over HTTP with CLI parity and pipeline-to-terminal, HTTP==socket parity
+  for list/filters/show/logs/results; quarantine over HTTP (never valid); expired
+  over HTTP; 400/422/404 handling; no-result-yet 404; auth-required 401s; dead-socket
+  daemon-down payloads; served Runs SPA markup; subprocess e2e with the fake vibe
+  binary (HTTP-triggered run → succeeded → validated result over HTTP + CLI).
+
 | 13 | Jobs / Audit / Settings views (read-only socket ops) | **done** (2026-11-12) | 12 |
-| 14 | Runs from the GUI (trigger, watch, results/quarantine) | ready-for-agent | 12 |
+| 14 | Runs from the GUI (trigger, watch, results/quarantine) | **done** (2026-11-12) | 12 |
 | 15 | Upload + validate job specs from the browser | ready-for-agent | 14 |
 | 16 | Schedules from the GUI | ready-for-agent | 12, 13 |
 | 17 | Stats + retention from the GUI | ready-for-agent | 12 |
@@ -631,10 +702,21 @@ Spec 13 (Jobs / Audit / Settings views) landed: the read-only socket ops
 (Jobs table, Audit mono tail with event-type chips, Settings rows, each polling
 every 2 s with daemon-down/empty states).
 
-Next backlog item is **spec 14** (Runs from the GUI), then 15–18, with
-**spec 19** (auth & access management UI) queued behind 12. The MVP spec
-pipeline (01–10) is complete; what remains beyond the GUI is the post-MVP
-roadmap in baseline §13.
+Spec 14 (Runs from the GUI) landed: `POST /api/runs` enqueues a manual run by
+in-container spec path (400/422 on bad input, daemon re-validates), `GET
+/api/runs?job=&status=` + `/api/runs/{id}` + `/api/runs/{id}/logs` +
+`/api/results/{run_id}` mirror the socket ops over the transport seam (404 on
+unknown resources, structured `daemon.up=false` when down), and the SPA Runs
+view is the full table with status egg-dots, job/status filters, a run-by-path
+form, and the Manifest / Logs / Result-or-Quarantine detail pane — quarantine
+shows schema errors + raw output (never a valid result), expired artifacts show
+an expired state. `runs_list` gained the `job`/`status` filters + `result_valid`;
+`results_get` gained the quarantined `raw_output` and the `expired` report.
+
+Next backlog item is **spec 15** (upload + validate job specs from the browser),
+then 16–18, with **spec 19** (auth & access management UI) queued behind 12. The
+MVP spec pipeline (01–10) is complete; what remains beyond the GUI is the
+post-MVP roadmap in baseline §13.
 
 **Deferred (backlog notes):**
 - *Async seat broker:* `SeatBroker` does its HTTP synchronously (httpx.Client)

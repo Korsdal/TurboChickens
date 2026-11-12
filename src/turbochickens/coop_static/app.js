@@ -7,8 +7,10 @@
   const TOKEN_KEY = "tc.coop.token";
   const POLL_MS = 2000;
   const VIEWS = ["dashboard", "runs", "jobs", "schedules", "stats", "audit", "settings"];
-  /* views with a live /api loader (runs/schedules/stats land in specs 14/16/17) */
-  const VIEW_LOADERS = { dashboard: loadStatus, jobs: loadJobs, audit: loadAudit, settings: loadSettings };
+  /* views with a live /api loader (schedules/stats land in specs 16/17) */
+  const VIEW_LOADERS = { dashboard: loadStatus, runs: loadRuns, jobs: loadJobs, audit: loadAudit, settings: loadSettings };
+
+  const RUN_STATUSES = ["queued", "provisioning", "running", "collecting", "finalizing", "succeeded", "failed"];
 
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -17,6 +19,12 @@
   let pollTimer = null;
   let lastStats = {};
   let auditFilter = null; // active event-type filter chip, null = all
+  let runsJobFilter = null; // active runs job filter chip, null = all
+  let runsStatusFilter = null; // active runs status filter chip, null = all
+  let selectedRunId = null; // open run detail pane
+  let runsTab = "manifest";
+  let lastRunSigs = {}; // run id -> signature, for the one-shot row flash
+  let jobChipSig = "";
 
   /* --- API --- */
 
@@ -26,6 +34,26 @@
     let resp;
     try {
       resp = await fetch(path, { headers, cache: "no-store" });
+    } catch (err) {
+      return { __networkError: true };
+    }
+    if (resp.status === 401) {
+      showLogin();
+      return null;
+    }
+    try {
+      return await resp.json();
+    } catch (err) {
+      return { __networkError: true };
+    }
+  }
+
+  async function apiPost(path, body) {
+    const headers = { "Content-Type": "application/json" };
+    if (token) headers["Authorization"] = "Bearer " + token;
+    let resp;
+    try {
+      resp = await fetch(path, { method: "POST", headers, body: JSON.stringify(body), cache: "no-store" });
     } catch (err) {
       return { __networkError: true };
     }
@@ -275,6 +303,301 @@
       flashCard(card);
     }
   }
+
+  /* --- runs view (spec 14): filterable table + run detail pane ------------- */
+
+  function statusDotInfo(r) {
+    if (r.status === "succeeded") return { cls: "dot-succeeded", label: "succeeded" };
+    if (r.status === "failed") {
+      return r.result_valid === false
+        ? { cls: "dot-quarantined", label: "quarantined" }
+        : { cls: "dot-failed", label: "failed" };
+    }
+    if (r.status === "queued") return { cls: "dot-queued", label: "queued" };
+    return { cls: "dot-running", label: r.status }; // in flight: pulsing yolk
+  }
+
+  function renderChipRow(rowSel, items, active, onPick) {
+    const row = $(rowSel);
+    const sig = JSON.stringify([items, active]);
+    if (row.dataset.sig === sig) return;
+    row.dataset.sig = sig;
+    row.replaceChildren();
+    const mk = (label, value) => {
+      const b = el("button", "chip", label);
+      b.type = "button";
+      b.setAttribute("aria-pressed", String(active === value));
+      b.addEventListener("click", () => onPick(value));
+      row.appendChild(b);
+    };
+    mk("all", null);
+    for (const it of items) mk(it, it);
+  }
+
+  function renderRunsTable(runs) {
+    if (!runs.length) {
+      const msg = runsJobFilter || runsStatusFilter
+        ? "No runs match the active filters."
+        : "No runs yet — run a job above, or with tc run <job.toml>.";
+      showEmpty("#runs-empty", "#runs-card", msg);
+      lastRunSigs = {};
+      return;
+    }
+    showCard("#runs-empty", "#runs-card");
+    const tbody = $("#runs-tbody");
+    const sig = JSON.stringify(runs.map((r) => [r.id, r.status, r.result_valid, r.finished_at, r.attested]));
+    if (tbody.dataset.sig !== sig) {
+      tbody.dataset.sig = sig;
+      tbody.replaceChildren();
+      const seen = new Set();
+      for (const r of runs) {
+        seen.add(r.id);
+        const rowSig = JSON.stringify([r.status, r.result_valid, r.finished_at, r.attested]);
+        const changed = lastRunSigs[r.id] !== undefined && lastRunSigs[r.id] !== rowSig;
+        lastRunSigs[r.id] = rowSig;
+        const tr = el("tr", "run-row" + (r.id === selectedRunId ? " selected" : "") + (changed ? " flash" : ""));
+        tr.dataset.runId = r.id;
+        const idTd = el("td");
+        const openBtn = el("button", "linklike mono run-open", r.id);
+        openBtn.type = "button";
+        openBtn.setAttribute("aria-label", "Open run " + r.id);
+        openBtn.addEventListener("click", () => selectRun(r.id));
+        idTd.appendChild(openBtn);
+        tr.appendChild(idTd);
+        tr.appendChild(el("td", "mono job-name", r.job_name));
+        const dot = statusDotInfo(r);
+        const stTd = el("td");
+        const st = el("span", "status-cell");
+        st.appendChild(el("span", "dot " + dot.cls));
+        st.appendChild(el("span", "status-label", dot.label));
+        stTd.appendChild(st);
+        tr.appendChild(stTd);
+        tr.appendChild(el("td", "mono muted", r.trigger || "—"));
+        tr.appendChild(el("td", "mono muted", r.started_at || "—"));
+        tr.appendChild(el("td", "mono muted", r.finished_at || "—"));
+        tr.addEventListener("click", (ev) => {
+          if (ev.target.closest("button")) return; // the open button handles itself
+          selectRun(r.id);
+        });
+        tbody.appendChild(tr);
+      }
+      for (const id of Object.keys(lastRunSigs)) if (!seen.has(id)) delete lastRunSigs[id];
+    }
+  }
+
+  function selectRun(runId) {
+    selectedRunId = runId;
+    $("#run-detail").hidden = false;
+    $$("#runs-tbody tr").forEach((tr) => tr.classList.toggle("selected", tr.dataset.runId === runId));
+    loadRuns();
+  }
+
+  function setRunsTab(name) {
+    runsTab = name;
+    for (const t of ["manifest", "logs", "result"]) {
+      $("#tab-" + t).setAttribute("aria-selected", String(t === name));
+      $("#pane-" + t).hidden = t !== name;
+    }
+  }
+
+  function renderDetail(show, logs, result) {
+    const detail = $("#run-detail");
+    if (!show || show.__networkError || show.ok === false || (show.daemon && show.daemon.up === false)) {
+      detail.hidden = true;
+      selectedRunId = null;
+      return;
+    }
+    const run = show.run;
+    detail.hidden = false;
+    const dot = statusDotInfo(run);
+    const d = $("#detail-dot");
+    d.className = "dot " + dot.cls;
+    $("#detail-title").textContent = run.id;
+    $("#detail-job").textContent = run.job_name + " · " + run.trigger + " · " + run.status;
+    $("#tab-result").textContent = run.result && run.result.valid === false ? "Quarantine" : "Result";
+
+    const manifestPre = $("#manifest-pre");
+    const mSig = JSON.stringify(run);
+    if (manifestPre.dataset.sig !== mSig) {
+      manifestPre.dataset.sig = mSig;
+      manifestPre.textContent = JSON.stringify(run, null, 2);
+      $("#manifest-label").textContent = "manifest · spec " + shortHash((run.manifest && run.manifest.spec_hash) || "");
+    }
+
+    if (logs && !logs.__networkError && logs.ok !== false && !(logs.daemon && logs.daemon.up === false)) {
+      const logEl = $("#run-log");
+      const lSig = JSON.stringify(logs.events || []);
+      if (logEl.dataset.sig !== lSig) {
+        const nearBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 40;
+        logEl.dataset.sig = lSig;
+        logEl.replaceChildren();
+        for (const e of logs.events || []) {
+          const line = el("div", "log-line mono");
+          line.appendChild(el("span", "ts", e.ts || "—"));
+          line.appendChild(el("span", "ev", "[" + (e.level || "") + "] " + (e.source || "")));
+          line.appendChild(el("span", "detail", e.line || ""));
+          logEl.appendChild(line);
+        }
+        if (nearBottom) logEl.scrollTop = logEl.scrollHeight; // follow live output only when already at the end
+      }
+    }
+
+    renderResultPane(run, result);
+  }
+
+  function renderResultPane(run, result) {
+    const pre = $("#result-pre");
+    const state = $("#result-state");
+    const label = $("#result-label");
+    pre.dataset.sig = "";
+    pre.textContent = "";
+    state.replaceChildren();
+    state.hidden = true;
+    if (!result || result.__networkError || (result.daemon && result.daemon.up === false)) {
+      label.textContent = "result unavailable";
+      return;
+    }
+    if (result.ok === true && result.output !== undefined) {
+      label.textContent = "validated result";
+      pre.dataset.sig = JSON.stringify(result.output);
+      pre.textContent = JSON.stringify(result.output, null, 2);
+      return;
+    }
+    if (result.quarantined) {
+      label.textContent = "quarantined raw output";
+      state.hidden = false;
+      const note = el("div", "quarantine-note");
+      note.textContent = "Quarantined — the output failed schema validation. It is kept for inspection and never served as a valid result.";
+      state.appendChild(note);
+      if (result.schema_errors && result.schema_errors.length) {
+        const ul = el("ul", "schema-errors mono");
+        for (const e of result.schema_errors) ul.appendChild(el("li", null, e));
+        state.appendChild(ul);
+      }
+      pre.dataset.sig = "raw:" + (result.raw_output || "");
+      pre.textContent = result.raw_output || "";
+      return;
+    }
+    if (result.expired) {
+      label.textContent = "result";
+      state.hidden = false;
+      const note = el("div", "quarantine-note neutral-note");
+      note.textContent = "Expired — the on-disk artifacts were removed by the retention sweep; the append-only index row remains.";
+      state.appendChild(note);
+      return;
+    }
+    label.textContent = "result";
+    state.hidden = false;
+    const note = el("div", "quarantine-note neutral-note");
+    note.textContent = "No result yet — the run never reached collecting (it may still be running).";
+    state.appendChild(note);
+  }
+
+  async function loadRunDetail(runId) {
+    const enc = encodeURIComponent(runId);
+    const [show, logs, result] = await Promise.all([
+      api("/api/runs/" + enc),
+      api("/api/runs/" + enc + "/logs"),
+      api("/api/results/" + enc),
+    ]);
+    if (show === null) return; /* 401 → login view shown */
+    renderDetail(show, logs, result);
+  }
+
+  async function loadRuns() {
+    const jobsData = await api("/api/jobs");
+    if (jobsData === null) return; /* 401 → login view shown */
+    if (!jobsData.__networkError && jobsData.ok !== false) {
+      const names = (jobsData.jobs || []).map((j) => j.name).sort();
+      const sig = JSON.stringify(names);
+      if (jobChipSig !== sig) {
+        jobChipSig = sig;
+        if (runsJobFilter && !names.includes(runsJobFilter)) runsJobFilter = null;
+      }
+      renderChipRow("#runs-job-chips", names, runsJobFilter, (v) => {
+        runsJobFilter = v;
+        loadRuns();
+      });
+    }
+    renderChipRow("#runs-status-chips", RUN_STATUSES, runsStatusFilter, (v) => {
+      runsStatusFilter = v;
+      loadRuns();
+    });
+    const qs = new URLSearchParams();
+    if (runsJobFilter) qs.set("job", runsJobFilter);
+    if (runsStatusFilter) qs.set("status", runsStatusFilter);
+    const data = await api("/api/runs" + (qs.toString() ? "?" + qs.toString() : ""));
+    if (data === null) return; /* 401 → login view shown */
+    if (payloadDown(data)) {
+      showEmpty("#runs-empty", "#runs-card", "Runs unavailable — " + (data.error || "the supervisor is not reachable") + ".");
+      return;
+    }
+    renderRunsTable(data.runs || []);
+    if (selectedRunId) await loadRunDetail(selectedRunId);
+  }
+
+  $("#run-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const input = $("#run-spec-path");
+    const err = $("#run-error");
+    const specPath = input.value.trim();
+    if (!specPath) {
+      err.textContent = "Enter the in-container path of a job spec (job.toml).";
+      err.hidden = false;
+      return;
+    }
+    const resp = await apiPost("/api/runs", { spec_path: specPath });
+    if (resp === null) return; /* 401 → login view shown */
+    if (resp.__networkError) {
+      err.textContent = "The GUI could not reach the coop server.";
+      err.hidden = false;
+      return;
+    }
+    if (resp.daemon && resp.daemon.up === false) {
+      err.textContent = "The supervisor is not reachable — " + (resp.error || "") + ".";
+      err.hidden = false;
+      return;
+    }
+    if (!resp.ok) {
+      err.textContent = resp.error || "enqueue failed";
+      err.hidden = false;
+      return;
+    }
+    err.hidden = true;
+    input.value = "";
+    selectRun(resp.run_id);
+  });
+
+  $("#detail-close").addEventListener("click", () => {
+    selectedRunId = null;
+    $("#run-detail").hidden = true;
+    $$("#runs-tbody tr").forEach((tr) => tr.classList.remove("selected"));
+  });
+
+  for (const t of ["manifest", "logs", "result"]) {
+    $("#tab-" + t).addEventListener("click", () => setRunsTab(t));
+  }
+
+  $$(".btn-copy").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const pre = document.getElementById(b.dataset.copyTarget);
+      const text = pre ? pre.textContent : "";
+      if (!text) return;
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (err) {
+        const ta = el("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+      }
+      const old = b.textContent;
+      b.textContent = "Copied";
+      setTimeout(() => { b.textContent = old; }, 1200);
+    });
+  });
 
   /* --- audit view (spec 13): mono tail, newest first, event filter chips --- */
 

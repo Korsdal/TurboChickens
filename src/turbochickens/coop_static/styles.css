@@ -387,6 +387,107 @@ html, body {
 .data-table .mono { font-size: 13px; }
 .data-table .hash { overflow-wrap: anywhere; }
 
+/* --- runs view (spec 14): run form, filters, egg-dot table, detail pane --- */
+
+.run-form { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; padding-bottom: 6px; }
+.run-form label { font-size: 13px; font-weight: 500; color: var(--p-muted); padding-bottom: 2px; }
+.run-form input {
+  height: 44px;
+  width: min(340px, 100%);
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-s);
+  background: var(--p-bg);
+  color: var(--p-ink);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 0 14px;
+}
+.run-form input:focus-visible { outline: 2px solid var(--p-action); outline-offset: 1px; }
+
+.view-error { margin: -18px 0 18px; }
+
+.filter-rows { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+.filter-rows .chip-row { justify-content: flex-start; }
+
+.run-row { cursor: pointer; }
+.run-row.selected td { background: rgba(200, 127, 10, 0.08); }
+.run-row .run-open { font-size: 13px; }
+
+.status-cell { display: inline-flex; align-items: center; gap: 8px; }
+.status-label { font-size: 13px; font-weight: 500; }
+
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
+.dot-queued { border: 1.5px solid var(--p-muted); background: transparent; }
+.dot-running { background: var(--p-action); animation: dotpulse 1.2s ease-in-out infinite; }
+.dot-succeeded { background: var(--p-green); }
+.dot-failed { background: var(--p-red); }
+.dot-quarantined { background: var(--p-action); }
+@keyframes dotpulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.8); }
+}
+
+.detail-card { padding: 20px 24px; margin-top: 24px; }
+.detail-head { display: flex; align-items: center; gap: 10px; }
+.detail-title { font-size: 16px; font-weight: 500; }
+#detail-close { margin-left: auto; }
+
+.tab-row { display: flex; gap: 4px; border-bottom: 1px solid var(--hairline); margin-top: 16px; }
+.tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  padding: 10px 14px;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--p-muted);
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+.tab:hover { color: var(--p-ink); }
+.tab[aria-selected="true"] { color: var(--p-ink); border-bottom-color: var(--p-action); }
+
+.detail-pane { padding-top: 16px; }
+.pane-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 8px; font-size: 13px; }
+.btn-copy { height: 32px; padding: 0 14px; font-size: 13px; }
+
+.data-pane {
+  margin: 0;
+  padding: 16px;
+  background: var(--p-bg);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-s);
+  font-size: 13px;
+  line-height: 1.55;
+  max-height: 46vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.run-log {
+  max-height: 46vh;
+  overflow-y: auto;
+  background: var(--p-bg);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-s);
+  padding: 8px 0;
+}
+
+.quarantine-note {
+  border-left: 4px solid var(--p-action);
+  background: rgba(200, 127, 10, 0.08);
+  padding: 10px 14px;
+  border-radius: var(--radius-s);
+  font-size: 14px;
+  margin-bottom: 10px;
+}
+.neutral-note { border-left-color: var(--hairline-strong); background: transparent; }
+.schema-errors { margin: 0 0 10px; padding-left: 20px; font-size: 13px; color: var(--p-ink); }
+.schema-errors li { margin: 2px 0; overflow-wrap: anywhere; }
+
 /* --- audit: filter chips + mono log tail --- */
 
 .chip-row { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
@@ -467,6 +568,6 @@ html, body {
 /* --- reduced motion: everything rests --- */
 
 @media (prefers-reduced-motion: reduce) {
-  .flow, .hub-pulse, .flash, [data-enter] { animation: none !important; }
-  .btn, .nav a, .skip-link, .chip { transition: none; }
+  .flow, .hub-pulse, .flash, [data-enter], .dot-running { animation: none !important; }
+  .btn, .nav a, .skip-link, .chip, .tab { transition: none; }
 }

@@ -116,10 +116,54 @@
           <header class="view-header" data-enter>
             <div>
               <h2 id="runs-heading">Runs</h2>
-              <p class="intro">The runs table and live run detail.</p>
+              <p class="intro">Trigger a run by in-container spec path and watch it here — polling every 2&nbsp;s.</p>
             </div>
+            <form class="view-actions run-form" id="run-form" novalidate>
+              <label for="run-spec-path">Spec path</label>
+              <input id="run-spec-path" class="mono" name="spec_path" type="text" autocomplete="off" spellcheck="false" required>
+              <button type="submit" class="btn btn-primary">Run job</button>
+            </form>
           </header>
-          <div class="card empty-state"><p>Runs from the browser land next on the coop roadmap — <span class="mono">tc runs list</span> shows the same data today.</p></div>
+          <p class="field-error view-error" id="run-error" hidden></p>
+          <div class="filter-rows">
+            <div class="chip-row" id="runs-job-chips" role="group" aria-label="Filter by job"></div>
+            <div class="chip-row" id="runs-status-chips" role="group" aria-label="Filter by status"></div>
+          </div>
+          <div class="card table-card" id="runs-card" hidden>
+            <table class="data-table">
+              <thead>
+                <tr><th scope="col">Run</th><th scope="col">Job</th><th scope="col">Status</th><th scope="col">Trigger</th><th scope="col">Started</th><th scope="col">Finished</th></tr>
+              </thead>
+              <tbody id="runs-tbody"></tbody>
+            </table>
+          </div>
+          <div class="card empty-state" id="runs-empty"><p>No runs yet — run a job above, or with <span class="mono">tc run &lt;job.toml&gt;</span>.</p></div>
+
+          <div class="card detail-card" id="run-detail" hidden>
+            <div class="detail-head">
+              <span class="dot dot-queued" id="detail-dot" aria-hidden="true"></span>
+              <span class="mono detail-title" id="detail-title">run-…</span>
+              <span class="mono muted" id="detail-job"></span>
+              <button type="button" class="linklike" id="detail-close">Close</button>
+            </div>
+            <div class="tab-row" role="tablist" aria-label="Run detail">
+              <button type="button" class="tab" id="tab-manifest" role="tab" aria-selected="true">Manifest</button>
+              <button type="button" class="tab" id="tab-logs" role="tab" aria-selected="false">Logs</button>
+              <button type="button" class="tab" id="tab-result" role="tab" aria-selected="false">Result</button>
+            </div>
+            <div class="detail-pane" id="pane-manifest" role="tabpanel" aria-labelledby="tab-manifest">
+              <div class="pane-bar"><span class="muted" id="manifest-label">manifest</span><button type="button" class="btn btn-secondary btn-copy" data-copy-target="manifest-pre">Copy</button></div>
+              <pre class="mono data-pane" id="manifest-pre"></pre>
+            </div>
+            <div class="detail-pane" id="pane-logs" role="tabpanel" aria-labelledby="tab-logs" hidden>
+              <div class="log run-log" id="run-log"></div>
+            </div>
+            <div class="detail-pane" id="pane-result" role="tabpanel" aria-labelledby="tab-result" hidden>
+              <div class="pane-bar"><span class="muted" id="result-label">result</span><button type="button" class="btn btn-secondary btn-copy" data-copy-target="result-pre">Copy</button></div>
+              <div id="result-state" hidden></div>
+              <pre class="mono data-pane" id="result-pre"></pre>
+            </div>
+          </div>
         </section>
 
         <section class="view" id="view-jobs" hidden aria-labelledby="jobs-heading">

@@ -20,6 +20,11 @@ specs with hashes), ``audit_tail`` (last N audit rows, newest first, optional
 event-type filter), ``settings_get`` (effective settings, never the coop auth
 token).
 
+Spec 14 (runs from the GUI): ``runs_list`` accepts optional ``job``/``status``
+filters and reports each row's ``result_valid``; ``results_get`` additionally
+returns the quarantined ``raw_output`` with its schema errors (never as a
+valid result) and reports ``expired`` for artifacts the retention sweep removed.
+
 Spec 12 (coop): when ``coop_enabled`` is set, the same process also serves the
 TurboChickens GUI over HTTP (aiohttp, same event loop) — static SPA at ``/``
 and ``/api/ping`` + ``/api/status`` under ``/api``, thin mirrors of the socket
@@ -234,7 +239,7 @@ class Daemon:
         if op == "enqueue":
             return await self._enqueue(req)
         if op == "runs_list":
-            return self._runs_list()
+            return self._runs_list(req)
         if op == "runs_show":
             return self._runs_show(req)
         if op == "runs_logs":
@@ -499,13 +504,31 @@ class Daemon:
             ),
         }
 
-    def _runs_list(self) -> dict[str, Any]:
+    def _runs_list(self, req: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Runs, most recent first. Optional filters (spec 14, used by the GUI):
+        `job` matches the job id or name, `status` is an exact status match.
+        Each row also carries `result_valid` (None when the run never reached
+        collecting) so the runs table can show the quarantined state."""
         if self.db is None:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "db not ready"}
+        req = req or {}
+        conds: list[str] = []
+        params: list[Any] = []
+        job = req.get("job")
+        if job:
+            conds.append("(r.job_id = ? OR j.name = ?)")
+            params.extend([str(job), str(job)])
+        status = req.get("status")
+        if status:
+            conds.append("r.status = ?")
+            params.append(str(status))
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
         rows = self.db.execute(
             "SELECT r.id, r.job_id, j.name, r.status, r.trigger, r.started_at, r.finished_at,"
-            " (SELECT COUNT(*) FROM teardown_attestations t WHERE t.run_id = r.id)"
-            " FROM runs r JOIN job_specs j ON j.id = r.job_id ORDER BY r.rowid DESC"
+            " (SELECT COUNT(*) FROM teardown_attestations t WHERE t.run_id = r.id),"
+            " (SELECT valid FROM results WHERE run_id = r.id)"
+            f" FROM runs r JOIN job_specs j ON j.id = r.job_id{where} ORDER BY r.rowid DESC",
+            params,
         ).fetchall()
         runs = [
             {
@@ -517,6 +540,7 @@ class Daemon:
                 "started_at": r[5],
                 "finished_at": r[6],
                 "attested": bool(r[7]),
+                "result_valid": None if r[8] is None else bool(r[8]),
             }
             for r in rows
         ]
@@ -551,7 +575,10 @@ class Daemon:
 
     def _results_get(self, req: dict[str, Any]) -> dict[str, Any]:
         """Return the validated result for a run. Quarantined output (valid=0)
-        is an error, never a result — it stays in quarantine for inspection."""
+        is an error, never a result — but spec 14 lets the GUI inspect it: the
+        quarantined payload carries the recorded schema errors and the raw
+        output (held in the append-only row), never presented as valid.
+        Expired on-disk artifacts (spec 08) are reported as expired, never served."""
         run_id = str(req.get("run_id", ""))
         if self.db is None or self._run_row(run_id) is None:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"unknown run: {run_id!r}"}
@@ -566,17 +593,8 @@ class Daemon:
                 "error": f"no result stored for run {run_id!r} (the run never reached collecting)",
             }
         valid, output_json, artifacts_dir, schema_errors = row
-        if not valid:
-            return {
-                "ok": False,
-                "protocol": PROTOCOL_VERSION,
-                "error": f"run {run_id!r} is quarantined: output failed schema validation",
-                "quarantined": True,
-                "schema_errors": json.loads(schema_errors) if schema_errors else [],
-                "artifacts_dir": artifacts_dir,
-            }
         # spec 08: the on-disk artifacts may have expired under the retention
-        # TTL (the append-only row stays as the index)
+        # TTL (the append-only row stays as the index) — expired, never served
         if artifacts_dir and not Path(artifacts_dir).exists():
             return {
                 "ok": False,
@@ -587,6 +605,17 @@ class Daemon:
                 ),
                 "expired": True,
                 "run_id": run_id,
+                "valid": bool(valid),
+            }
+        if not valid:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": f"run {run_id!r} is quarantined: output failed schema validation",
+                "quarantined": True,
+                "schema_errors": json.loads(schema_errors) if schema_errors else [],
+                "raw_output": output_json,
+                "artifacts_dir": artifacts_dir,
             }
         return {
             "ok": True,
