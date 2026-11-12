@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 03 landed (72/72 tests green, e2e smoke verified).
+**Last updated:** 2026-11-12, after spec 04 landed (89/89 tests green, e2e smoke verified).
 
 ---
 
@@ -26,18 +26,20 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01, spec 02, and spec 03 are done** (commits `f8b8061`, the spec-02 commit, and the spec-03 commit).
+**Spec 01, spec 02, spec 03, and spec 04 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, and the spec-04 commit).
 Verified this session:
 
 ```
-.venv/bin/python -m pytest -q          → 72 passed
-.venv/bin/tc --help                     → works, shows `run`, `runs`, `jobs`, `daemon`, `status`
+.venv/bin/python -m pytest -q          → 89 passed
+.venv/bin/tc --help                     → works, shows `run`, `runs`, `jobs`, `daemon`, `results`, `status`
 .venv/bin/tc jobs validate examples/weekly-incidents-digest/job.toml
                                         → OK … sha256:18efbd8c…80b959
 # e2e smoke (fake vibe binary via $TURBOCHICKENS_VIBE_BIN): tc daemon start (background)
-#   → tc run examples/hello-vibe-cli/job.toml --wait → queued … → succeeded, rc 0
-#   → tc runs list/show/logs → manifest + sanitized events + attestation
-#   → tc status → queue_depth 0 / in_flight 0 / alerts: 0; tc daemon stop → rc 0
+#   → tc run <valid-output job> --wait → succeeded, rc 0
+#   → tc results get <run> → validated JSON on stdout, rc 0; results row valid=1 + data/results/<run>/output.json
+#   → tc run <invalid-output job> --wait → failed "output failed schema validation", rc 1
+#   → tc results get <run> → rc 1 "quarantined" + schema errors; results row valid=0 + data/quarantine/<run>/{raw_output.txt,schema_errors.json}
+#   → tc runs list/show/logs → manifest + validator events + attestation; tc status → alerts: 0; tc daemon stop → rc 0
 ```
 
 What exists:
@@ -53,26 +55,35 @@ src/turbochickens/
 │                          # extension point + VibeCLIAdapter (headless subprocess pinned to the
 │                          # workspace, sanitized streamed logs) + adapter weights (API 0.25 / CLI 1.0)
 ├── runner.py              # RunPipeline: lifecycle queued→…→succeeded/failed, fresh workspace +
-│                          # per-run env, manifest, run_events, teardown attestation + audit rows
+│                          # per-run env, manifest, run_events, spec-04 result store / quarantine
+│                          # at `collecting`, teardown attestation + audit rows
 ├── daemon.py              # Daemon: asyncio process, Unix socket, JSON-lines ops
-│                          # ping/status/shutdown/enqueue/runs_list/runs_show/runs_logs;
+│                          # ping/status/shutdown/enqueue/runs_list/runs_show/runs_logs/results_get;
 │                          # admission-control scheduler (over-budget backlogs, never rejects)
 ├── client.py              # request(socket, op, **payload) → parsed response; DaemonUnreachable
+├── validate.py            # spec 04 pure seam: validate_output(raw, schema_path) → OutputValidation
+│                          # (jsonschema Draft 2020-12 + format checker; never raises on bad output)
 ├── spec/
 │   ├── model.py           # Pydantic v2 model, all 6 sections, extra="forbid"
 │   └── loader.py          # load_spec(), SpecValidationError (field-named issues), spec_hash()
-└── cli/main.py            # Typer app `tc`: run [--wait] | runs list/show/logs | jobs validate | daemon start/stop | status
+└── cli/main.py            # Typer app `tc`: run [--wait] | runs list/show/logs | results get |
+                           # jobs validate | daemon start/stop | status
 tests/
 ├── test_spec_model.py     # pure-function seam: parser/model/hash
 ├── test_cli_validate.py   # CLI seam: tc jobs validate behavior
 ├── test_settings.py       # defaults, overrides, env var, error cases, weight-budget formula
 ├── test_storage.py        # schema tables, append-only triggers, audit log ordering/append-only
 ├── test_daemon.py         # protocol + CLI tests on a thread daemon + subprocess e2e
-└── test_run_e2e.py        # spec 03 e2e: thread + subprocess daemons, hermetic fake vibe binary
-                           # ($TURBOCHICKENS_VIBE_BIN), full lifecycle/attestation/admission tests
+├── test_run_e2e.py        # spec 03 e2e: thread + subprocess daemons, hermetic fake vibe binary
+│                          # ($TURBOCHICKENS_VIBE_BIN), full lifecycle/attestation/admission tests
+├── test_validate.py       # spec 04 pure seam: validate_output on valid/invalid/non-JSON outputs,
+│                          # nested error paths, format enforcement, fail-closed broken schemas
+└── test_results.py        # spec 04 e2e: valid → results row + artifacts + tc results get; invalid →
+                           # failed + quarantine + schema errors, never returned as valid; subprocess e2e
 examples/weekly-incidents-digest/   # baseline-format example job (job.toml, prompt, schema, csv)
 examples/hello-vibe-cli/            # manual vibe-cli example job (job.toml, prompt, schema)
-pyproject.toml             # uv/hatchling, Python >=3.12, version 0.3.0, deps: pydantic, typer, rich, croniter; dev: pytest
+pyproject.toml             # uv/hatchling, Python >=3.12, version 0.4.0, deps: pydantic, typer, rich, croniter,
+                           # jsonschema (+ rfc3339-validator for format checks); dev: pytest
 ```
 
 Spec-02 deliverables, concretely:
@@ -142,6 +153,27 @@ Spec-03 deliverables, concretely:
   list/show/logs`; `status` gains `alerts` (terminal runs missing an attestation or
   with a failed attestation flag) and `tc status` prints them.
 
+Spec-04 deliverables, concretely:
+
+- **Validation seam** (`validate.py`): `validate_output(raw_output, schema_path)` — pure function,
+  `jsonschema` Draft 2020-12 with the format checker enabled (`date-time` etc. enforced via
+  `rfc3339-validator`); never raises on bad output. Non-JSON output, schema violations, and even a
+  broken/missing schema file all return `OutputValidation(valid=False, schema_errors=[...])` with
+  `<json-path>: <message>` entries — fail closed.
+- **Pipeline plug-in point** (`runner.py` at `collecting`): valid output → `_store_result` writes the
+  append-only `results` row (`valid=1`, `output_json`, `artifacts_dir`, `schema_errors=NULL`) plus
+  `<data_dir>/results/<run_id>/output.json`, audit `result.stored`, then `finalizing → succeeded`.
+  Invalid output → `_quarantine` writes a `results` row with `valid=0` + recorded `schema_errors` and
+  keeps the evidence on disk at `<data_dir>/quarantine/<run_id>/{raw_output.txt,schema_errors.json}`,
+  audit `result.quarantined`, run `failed` with reason `output failed schema validation: …` —
+  never stored as valid, never discarded. Teardown attestation still happens on both paths.
+  `Settings` gains derived `results_dir` / `quarantine_dir`.
+- **Inspection:** socket op `results_get` (valid → `{ok, output, artifacts_dir}`; quarantined →
+  `ok:false, quarantined:true, schema_errors`; no result → error) + CLI `tc results get <run>`
+  printing the validated JSON on stdout (exit 1 with the schema errors for quarantined runs —
+  never the payload as a result). `runs_show`/`tc runs show` surface the result row
+  (`valid` / `QUARANTINED` + schema errors).
+
 Spec-01 deliverables, concretely:
 
 - Installable package `turbochickens` 0.1.0 with `tc` entry point (Typer + Rich).
@@ -166,7 +198,7 @@ Spec-01 deliverables, concretely:
 | 01 | Scaffold + job spec model + `tc jobs validate` | **done** (`f8b8061`) | — |
 | 02 | Daemon + Unix socket (JSON-lines) + SQLite schema + audit log + settings + `tc status` | **done** (2026-11-12) | 01 |
 | 03 | Manual run e2e via `vibe-cli` adapter (queue, admission, workspace, manifest, attestation, `tc run`/`tc runs`) | **done** (2026-11-12) | 02 |
-| 04 | Output validation + result store + quarantine + `tc results get` | ready-for-agent | 03 |
+| 04 | Output validation + result store + quarantine + `tc results get` | **done** (2026-11-12) | 03 |
 | 05 | `mistral-api` adapter + `providers.toml` + backoff on 429/5xx | ready-for-agent | 03, 04 |
 | 06 | Cron scheduling (APScheduler) + `tc schedule add/list/rm` | ready-for-agent | 03 |
 | 07 | Run budgets: wall-clock hard kill + injected-context cap | ready-for-agent | 03 |
@@ -226,11 +258,10 @@ tables deliberately excluded).
   <vibe@mistral.ai>`.
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 
-## 7. Next up — spec 04 (`specs/04-validation-results-quarantine.md`)
+## 7. Next up — spec 05 (`specs/05-mistral-api-adapter.md`)
 
-The validated-results channel on top of the spec-03 pipeline: at `collecting`,
-run the raw harness output through the job's JSON schema (`jsonschema`, add the
-dep); valid → `results` row + on-disk artifacts keyed by run ID → `succeeded`;
-invalid → quarantine (kept, `schema_errors` recorded, run `failed`), never
-stored as valid. CLI `tc results get <run>`. The pipeline's `collecting` step
-in `runner.py` is the plug-in point.
+The `mistral-api` adapter (blocked by 03+04, both done): OpenAI-compatible HTTP
+via `httpx` with JSON-mode structured responses, `providers.toml` for
+model/provider presets + pricing, and exponential backoff on 429/5xx. It plugs
+into the same `HarnessAdapter` protocol and the same `collecting` validation
+channel that spec 04 just built.

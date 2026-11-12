@@ -6,7 +6,9 @@ line. This socket is the one IPC contract — the CLI and the future scheduler
 both use it, so manual and cron runs flow through the same queue.
 
 Ops: ``ping``, ``status``, ``shutdown`` (spec 02) plus run submission and
-inspection (spec 03): ``enqueue``, ``runs_list``, ``runs_show``, ``runs_logs``.
+inspection (spec 03): ``enqueue``, ``runs_list``, ``runs_show``, ``runs_logs``,
+and validated results (spec 04): ``results_get`` — quarantined output is
+never returned as a valid result.
 Runs flow through one queue with resource-weight admission control; over-budget
 runs backlog in ``pending``, never rejected.
 """
@@ -173,6 +175,8 @@ class Daemon:
             return self._runs_show(req)
         if op == "runs_logs":
             return self._runs_logs(req)
+        if op == "results_get":
+            return self._results_get(req)
         if op == "shutdown":
             self.request_stop()
             return {"ok": True, "op": "shutdown", "protocol": PROTOCOL_VERSION, "message": "shutting down"}
@@ -358,6 +362,10 @@ class Daemon:
             " FROM teardown_attestations WHERE run_id = ?",
             (run_id,),
         ).fetchone()
+        res = self.db.execute(
+            "SELECT valid, artifacts_dir, schema_errors FROM results WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
         return {
             "id": row[0],
             "job_id": row[1],
@@ -376,6 +384,15 @@ class Daemon:
                     "verified_at": att[3],
                 }
                 if att
+                else None
+            ),
+            "result": (
+                {
+                    "valid": bool(res[0]),
+                    "artifacts_dir": res[1],
+                    "schema_errors": json.loads(res[2]) if res[2] else None,
+                }
+                if res
                 else None
             ),
         }
@@ -426,6 +443,44 @@ class Daemon:
             "events": [
                 {"seq": e[0], "ts": e[1], "level": e[2], "source": e[3], "line": e[4]} for e in events
             ],
+        }
+
+    # --- validated results (spec 04) -----------------------------------------
+
+    def _results_get(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Return the validated result for a run. Quarantined output (valid=0)
+        is an error, never a result — it stays in quarantine for inspection."""
+        run_id = str(req.get("run_id", ""))
+        if self.db is None or self._run_row(run_id) is None:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"unknown run: {run_id!r}"}
+        row = self.db.execute(
+            "SELECT valid, output_json, artifacts_dir, schema_errors FROM results WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": f"no result stored for run {run_id!r} (the run never reached collecting)",
+            }
+        valid, output_json, artifacts_dir, schema_errors = row
+        if not valid:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": f"run {run_id!r} is quarantined: output failed schema validation",
+                "quarantined": True,
+                "schema_errors": json.loads(schema_errors) if schema_errors else [],
+                "artifacts_dir": artifacts_dir,
+            }
+        return {
+            "ok": True,
+            "op": "results_get",
+            "protocol": PROTOCOL_VERSION,
+            "run_id": run_id,
+            "valid": True,
+            "output": json.loads(output_json),
+            "artifacts_dir": artifacts_dir,
         }
 
 

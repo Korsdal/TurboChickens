@@ -51,6 +51,16 @@ class Settings(BaseModel):
         return self.data_dir / "audit.jsonl"
 
     @property
+    def results_dir(self) -> Path:
+        """On-disk result artifacts, keyed by run ID (spec 04)."""
+        return self.data_dir / "results"
+
+    @property
+    def quarantine_dir(self) -> Path:
+        """Quarantined (schema-invalid) output, kept for inspection (spec 04)."""
+        return self.data_dir / "quarantine"
+
+    @property
     def weight_budget(self) -> int:
         """Effective resource-weight budget (baseline v0.2, decision 2)."""
         if self.weight_budget_override is not None:

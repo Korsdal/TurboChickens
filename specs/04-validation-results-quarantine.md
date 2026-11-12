@@ -4,8 +4,8 @@
 
 **Blocked by:** 03 (manual run pipeline end-to-end)
 
-**Status:** ready-for-agent
+**Status:** done (2026-11-12)
 
-- [ ] A run whose output matches the job schema stores the result and `tc results get` returns it
-- [ ] A run whose output violates the schema is marked failed, lands in quarantine with schema errors recorded, and is never stored as valid
-- [ ] Quarantined output is never returned by `tc results get` as a valid result
+- [x] A run whose output matches the job schema stores the result and `tc results get` returns it
+- [x] A run whose output violates the schema is marked failed, lands in quarantine with schema errors recorded, and is never stored as valid
+- [x] Quarantined output is never returned by `tc results get` as a valid result

@@ -26,9 +26,11 @@ app = typer.Typer(
 jobs_app = typer.Typer(help="Job spec commands.", no_args_is_help=True)
 daemon_app = typer.Typer(help="Daemon lifecycle commands.", no_args_is_help=True)
 runs_app = typer.Typer(help="Inspect runs.", no_args_is_help=True)
+results_app = typer.Typer(help="Fetch validated results.", no_args_is_help=True)
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(runs_app, name="runs")
+app.add_typer(results_app, name="results")
 
 err_console = Console(stderr=True)
 console = Console()
@@ -250,6 +252,14 @@ def runs_show(
         )
     elif r["status"] in TERMINAL_STATES:
         err_console.print("[bold red]ALERT: terminal run without a teardown attestation[/bold red]")
+    if r.get("result"):
+        res = r["result"]
+        if res["valid"]:
+            typer.echo(f"result: valid (artifacts: {res['artifacts_dir']})")
+        else:
+            typer.echo(f"result: QUARANTINED — output failed schema validation (artifacts: {res['artifacts_dir']})")
+            for e in res["schema_errors"] or []:
+                typer.echo(f"  schema error: {e}")
 
 
 @runs_app.command("logs")
@@ -261,6 +271,29 @@ def runs_logs(
     resp = _request_or_exit(settings_path, "runs_logs", run_id=run_id)
     for e in resp["events"]:
         typer.echo(f"{e['seq']:>4} {e['ts']} [{e['level']}] {e['source']}: {e['line']}")
+
+
+@results_app.command("get")
+def results_get(
+    run_id: str = typer.Argument(..., help="Run ID whose validated result to fetch."),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Print the schema-validated result of a run as JSON.
+
+    Only valid results are ever returned. A quarantined run (output failed
+    schema validation) exits 1 with the recorded schema errors — its output is
+    kept in quarantine for inspection, never served as a result.
+    """
+    resp = _daemon_request(settings_path, "results_get", run_id=run_id)
+    if not resp.get("ok"):
+        err_console.print(f"[bold red]error[/bold red] {resp.get('error', 'unknown error')}")
+        if resp.get("quarantined"):
+            for e in resp.get("schema_errors", []):
+                err_console.print(f"  schema error: {e}")
+            if resp.get("artifacts_dir"):
+                err_console.print(f"  quarantined artifacts: {resp['artifacts_dir']}")
+        raise typer.Exit(code=1) from None
+    typer.echo(json.dumps(resp["output"], indent=2, sort_keys=True, ensure_ascii=False))
 
 
 @app.callback()

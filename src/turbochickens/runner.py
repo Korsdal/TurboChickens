@@ -1,12 +1,13 @@
 """The run pipeline: one queued run driven through its lifecycle.
 
 queued → provisioning → running → collecting → finalizing → succeeded,
-with running → failed on harness error / timeout, and every terminal state
-closed by a teardown attestation plus audit rows (baseline v0.2 §5, §10).
+with running → failed on harness error / timeout and collecting → failed on
+schema-validation failure, and every terminal state closed by a teardown
+attestation plus audit rows (baseline v0.2 §5, §10).
 
 The pipeline owns all SQLite writes for a run: status transitions on `runs`,
-streamed `run_events`, the manifest, and the `teardown_attestations` row.
-Schema validation of the raw output is spec 04 and plugs in at `collecting`.
+streamed `run_events`, the manifest, the `results` row (spec 04: valid output
+stored, invalid output quarantined), and the `teardown_attestations` row.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from turbochickens.audit import AuditLog
 from turbochickens.settings import Settings
 from turbochickens.spec.loader import load_spec
 from turbochickens.util import utcnow_iso
+from turbochickens.validate import OutputValidation, validate_output
 
 TERMINAL_STATES = ("succeeded", "failed")
 
@@ -76,6 +78,56 @@ class RunPipeline:
         shutil.copyfile(spec_dir / ctx.spec.input.prompt_file, ws / "prompt.txt")
         for att in ctx.spec.input.attachments:
             shutil.copyfile(spec_dir / att, ws / Path(att).name)
+
+    # --- result store + quarantine (spec 04) --------------------------------
+
+    async def _store_result(self, run_id: str, outcome: OutputValidation) -> None:
+        """Valid output enters the append-only result store: one `results` row
+        plus on-disk artifacts keyed by run ID (baseline v0.2 §10.2, §12).
+        Artifacts live under data_dir, not the workspace — the workspace is
+        destroyed at teardown, the result survives."""
+        artifacts_dir = self.settings.results_dir / run_id
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (artifacts_dir / "output.json").write_text(
+            json.dumps(outcome.output, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        async with self._db_lock:
+            self.db.execute(
+                "INSERT INTO results (run_id, valid, output_json, artifacts_dir, schema_errors)"
+                " VALUES (?, 1, ?, ?, NULL)",
+                (run_id, json.dumps(outcome.output, ensure_ascii=False), str(artifacts_dir)),
+            )
+            self.db.commit()
+        self.audit.append(
+            {"event": "result.stored", "run_id": run_id, "artifacts_dir": str(artifacts_dir)}
+        )
+
+    async def _quarantine(self, run_id: str, raw_output: str, schema_errors: list[str]) -> None:
+        """Invalid output is quarantined: kept on disk with its schema errors
+        recorded in a `results` row with valid=0 — never stored as valid, never
+        discarded (baseline v0.2 §10.2)."""
+        qdir = self.settings.quarantine_dir / run_id
+        qdir.mkdir(parents=True, exist_ok=True)
+        (qdir / "raw_output.txt").write_text(raw_output, encoding="utf-8")
+        (qdir / "schema_errors.json").write_text(
+            json.dumps(schema_errors, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        async with self._db_lock:
+            self.db.execute(
+                "INSERT INTO results (run_id, valid, output_json, artifacts_dir, schema_errors)"
+                " VALUES (?, 0, ?, ?, ?)",
+                (run_id, raw_output, str(qdir), json.dumps(schema_errors, ensure_ascii=False)),
+            )
+            self.db.commit()
+        self.audit.append(
+            {
+                "event": "result.quarantined",
+                "run_id": run_id,
+                "artifacts_dir": str(qdir),
+                "schema_errors": schema_errors,
+            }
+        )
 
     # --- manifest ---------------------------------------------------------
 
@@ -162,8 +214,25 @@ class RunPipeline:
                 await self._event(
                     run_id, "harness", "output", sanitize_log_line(result.raw_output, OUTPUT_EVENT_MAX_LEN)
                 )
-                await self._set_status(run_id, "finalizing")
-                status, reason = "succeeded", "ok"
+                # spec 04: raw output is untrusted until it passes the job schema
+                schema_path = ctx.spec_path.parent / ctx.spec.output.schema_file
+                outcome = validate_output(result.raw_output, schema_path)
+                if outcome.valid:
+                    await self._store_result(run_id, outcome)
+                    await self._event(
+                        run_id, "validator", "info", f"output matches schema {ctx.spec.output.schema_file}"
+                    )
+                    await self._set_status(run_id, "finalizing")
+                    status, reason = "succeeded", "ok"
+                else:
+                    await self._quarantine(run_id, result.raw_output, outcome.schema_errors)
+                    await self._event(
+                        run_id,
+                        "validator",
+                        "error",
+                        sanitize_log_line("; ".join(outcome.schema_errors), OUTPUT_EVENT_MAX_LEN),
+                    )
+                    status, reason = "failed", f"output failed schema validation: {outcome.schema_errors[0]}"
         except Exception as e:
             status, reason = "failed", f"{type(e).__name__}: {e}"
             with contextlib.suppress(Exception):
