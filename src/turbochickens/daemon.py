@@ -92,6 +92,15 @@ non-vibe-cli adapters (no harness runtime to inject into); the vibe-cli
 adapter injects the chosen gates into the run's vibe config at provisioning.
 ``auth_access`` now fills its ``connectors`` scope entry with the registered
 gate names.
+
+Spec 29 (the Beak) adds the read-only op ``workspace_peek``: the workspace
+file tree of a run, or one file's size-capped content when ``path`` is given.
+It is available only while the workspace exists (in-flight chickens) — a
+terminal run answers a clear "the beak is closed" error, because the
+abattoir's attested teardown already removed the workspace. Paths are locked
+inside that run's workspace (traversal refused) and the chicken's private
+harness config (``.vibe/``, the farmhand settings file) is never served — see
+``beak.py`` for the pure seam.
 """
 
 from __future__ import annotations
@@ -113,7 +122,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from turbochickens import __version__
+from turbochickens import __version__, beak
 from turbochickens.adapter import (
     BASE_ENV_KEYS,
     DEFAULT_CREDENTIAL_ALLOWLIST,
@@ -394,6 +403,8 @@ class Daemon:
             return self._runs_show(req)
         if op == "runs_logs":
             return self._runs_logs(req)
+        if op == "workspace_peek":
+            return self._workspace_peek(req)
         if op == "run_stop":
             return await self._run_stop(req)
         if op == "run_rerun":
@@ -871,6 +882,105 @@ class Daemon:
                 {"seq": e[0], "ts": e[1], "level": e[2], "source": e[3], "line": e[4]} for e in events
             ],
         }
+
+    # --- spec 29: the Beak — read-only live view into a running chicken -------
+
+    def _workspace_peek(self, req: dict[str, Any]) -> dict[str, Any]:
+        """The Beak: a running chicken's workspace file tree (no ``path``), or
+        one file's size-capped content (``path`` given, workspace-relative).
+        Available only while the workspace exists — terminal runs answer a
+        clear closed-beak error because the abattoir already removed the
+        workspace. This socket op is the single place that touches workspace
+        files; the coop web layer only mirrors it over the transport seam.
+        Path lock, size caps, and the private-config blocklist live in
+        ``beak.py``; tree paths are workspace-relative, so no host path ever
+        leaves the daemon in a payload."""
+        run_id = str(req.get("run_id", ""))
+        if not run_id:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "workspace_peek requires run_id"}
+        if self.db is None:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "db not ready"}
+        row = self.db.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"unknown chicken: {run_id!r}"}
+        status = row[0]
+        if status in TERMINAL_STATES:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": (
+                    f"the beak is closed: chicken {run_id!r} is terminal ({status}) —"
+                    " the abattoir already removed its workspace"
+                ),
+                "workspace_gone": True,
+                "run_id": run_id,
+                "status": status,
+            }
+        ws = self.settings.data_dir / "workspaces" / run_id
+        if not ws.is_dir():
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": (
+                    f"the beak is closed: chicken {run_id!r} has no workspace yet (status={status}) —"
+                    " the Hatchery provisions one when the egg hatches"
+                ),
+                "workspace_gone": True,
+                "run_id": run_id,
+                "status": status,
+            }
+        rel = req.get("path")
+        try:
+            if rel is None:
+                return {
+                    "ok": True,
+                    "op": "workspace_peek",
+                    "protocol": PROTOCOL_VERSION,
+                    "run_id": run_id,
+                    "status": status,
+                    "mode": "tree",
+                    "tree": beak.workspace_tree(ws),
+                }
+            rel = beak.safe_relpath(str(rel))
+            if rel is None:
+                return {
+                    "ok": False,
+                    "protocol": PROTOCOL_VERSION,
+                    "error": (
+                        f"unsafe workspace path: {str(req.get('path'))!r} — the beak only serves"
+                        " relative paths inside the chicken's workspace (no absolute paths, no '..')"
+                    ),
+                    "refused": "path",
+                    "run_id": run_id,
+                }
+            peeked = beak.peek_file(ws, rel)
+            if "error" in peeked:
+                return {
+                    "ok": False,
+                    "protocol": PROTOCOL_VERSION,
+                    "error": peeked["error"],
+                    "refused": peeked.get("refused"),
+                    "run_id": run_id,
+                    "path": rel,
+                }
+            return {
+                "ok": True,
+                "op": "workspace_peek",
+                "protocol": PROTOCOL_VERSION,
+                "run_id": run_id,
+                "status": status,
+                "mode": "file",
+                **peeked,
+            }
+        except OSError as e:
+            # raced with the abattoir: the workspace vanished mid-peek
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": f"the beak is closed: chicken {run_id!r} workspace disappeared mid-peek ({e})",
+                "workspace_gone": True,
+                "run_id": run_id,
+            }
 
     # --- spec 22: lifecycle ops — stop & re-run a chicken --------------------
 

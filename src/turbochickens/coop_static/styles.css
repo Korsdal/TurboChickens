@@ -550,6 +550,36 @@ html, body {
   font-size: 14px;
   margin-bottom: 10px;
 }
+
+/* --- spec 29: the Beak (live workspace view in the run detail) --- */
+
+.beak-grid {
+  display: grid;
+  grid-template-columns: minmax(200px, 320px) 1fr;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+.beak-subhead { font-size: 13px; margin: 12px 0 6px; }
+.beak-tree-wrap {
+  background: var(--p-bg);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-s);
+  padding: 8px 12px;
+  max-height: 32vh;
+  overflow-y: auto;
+}
+.beak-tree { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+.beak-entry { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; }
+.beak-dir { color: var(--p-muted); }
+.beak-file { text-align: left; overflow-wrap: anywhere; }
+.beak-file.selected { color: var(--p-action); text-decoration: underline; }
+.beak-file.beak-private { color: var(--p-muted); cursor: not-allowed; text-decoration: line-through; }
+.beak-size { font-size: 12px; flex: none; }
+.beak-pre { min-height: 120px; }
+.beak-log { max-height: 24vh; }
+@media (max-width: 720px) {
+  .beak-grid { grid-template-columns: 1fr; }
+}
 .neutral-note { border-left-color: var(--hairline-strong); background: transparent; }
 .schema-errors { margin: 0 0 10px; padding-left: 20px; font-size: 13px; color: var(--p-ink); }
 .schema-errors li { margin: 2px 0; overflow-wrap: anywhere; }

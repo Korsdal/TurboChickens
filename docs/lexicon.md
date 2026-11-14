@@ -48,7 +48,7 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 | **Coop** | The management GUI / container | `coop.py`, `coop_static/` |
 | **Coopd** | The always-on supervisor daemon | `daemon.py` |
 | **Farmhand** | The MCP — a hired helper who does chores through the farm's tools | MCP (future) |
-| **Beak** | *Reserved*: an in-GUI terminal view | — |
+| **Beak** | The read-only live view into a running Chicken — workspace file tree + single-file peek + log tail (`workspace_peek` socket op, `GET /api/runs/{id}/workspace`, the Beak tab in the coop). The Beak is honest about ephemerality: it is open only while the workspace exists (in-flight chickens); once the Abattoir tears the chicken down, the Beak is closed. It never serves the chicken's private harness config (`.vibe/`, the farmhand settings file) — resolved gate/env secrets live there | `beak.py`, `workspace_peek`, the Beak tab |
 
 ## Reserved
 

@@ -21,6 +21,7 @@
   let runsJobFilter = null; // active runs job filter chip, null = all
   let runsStatusFilter = null; // active runs status filter chip, null = all
   let selectedRunId = null; // open run detail pane
+  let beakSelectedPath = null; // workspace file selected in the Beak tab (spec 29)
   let runsTab = "manifest";
   let lastRunSigs = {}; // run id -> signature, for the one-shot row flash
   let jobChipSig = "";
@@ -651,6 +652,7 @@
 
   function selectRun(runId) {
     selectedRunId = runId;
+    beakSelectedPath = null; // a different chicken → a different workspace
     $("#run-detail").hidden = false;
     $$("#runs-tbody tr").forEach((tr) => tr.classList.toggle("selected", tr.dataset.runId === runId));
     loadRuns();
@@ -658,13 +660,13 @@
 
   function setRunsTab(name) {
     runsTab = name;
-    for (const t of ["manifest", "logs", "result"]) {
+    for (const t of ["manifest", "logs", "result", "beak"]) {
       $("#tab-" + t).setAttribute("aria-selected", String(t === name));
       $("#pane-" + t).hidden = t !== name;
     }
   }
 
-  function renderDetail(show, logs, result) {
+  function renderDetail(show, logs, result, ws, wsFile) {
     const detail = $("#run-detail");
     if (!show || show.__networkError || show.ok === false || (show.daemon && show.daemon.up === false)) {
       detail.hidden = true;
@@ -708,6 +710,117 @@
     }
 
     renderResultPane(run, result);
+    renderBeakPane(run, logs, ws, wsFile);
+  }
+
+  /* --- spec 29: the Beak — live workspace tree + file peek + log tail ------- */
+
+  const BEAK_TAIL_LINES = 40;
+
+  function beakLogLine(e) {
+    const line = el("div", "log-line mono");
+    line.appendChild(el("span", "ts", e.ts || "—"));
+    line.appendChild(el("span", "ev", "[" + (e.level || "") + "] " + (e.source || "")));
+    line.appendChild(el("span", "detail", e.line || ""));
+    return line;
+  }
+
+  function isBeakPrivate(path) {
+    return path.split("/")[0] === ".vibe" || path === ".tc-farmhand-settings.toml";
+  }
+
+  function renderBeakPane(run, logs, ws, wsFile) {
+    const state = $("#beak-state");
+    const grid = $("#beak-grid");
+    const tree = $("#beak-tree");
+    const pre = $("#beak-pre");
+    const label = $("#beak-label");
+    state.replaceChildren();
+    state.hidden = true;
+    const note = (text, neutral) => {
+      state.hidden = false;
+      state.appendChild(el("div", "quarantine-note" + (neutral ? " neutral-note" : ""), text));
+    };
+
+    // workspace tree (polled with the rest of the detail every 2 s)
+    if (!ws || ws.__networkError || (ws.daemon && ws.daemon.up === false)) {
+      label.textContent = "workspace unavailable";
+      grid.hidden = true;
+      note("coopd is not reachable — the beak cannot see the workspace right now.", true);
+    } else if (ws.ok === false) {
+      // terminal run (abattoir removed the workspace) or not hatched yet — the honest empty state
+      label.textContent = "beak closed";
+      grid.hidden = true;
+      note(ws.error || "The beak is closed for this chicken.", true);
+    } else {
+      grid.hidden = false;
+      const entries = (ws.tree && ws.tree.entries) || [];
+      const sig = JSON.stringify(entries);
+      if (tree.dataset.sig !== sig) {
+        const hadBefore = tree.dataset.sig !== undefined;
+        tree.dataset.sig = sig;
+        tree.replaceChildren();
+        for (const e of entries) {
+          const li = el("li", "beak-entry");
+          if (e.type === "dir") {
+            li.appendChild(el("span", "beak-dir mono", e.path + "/"));
+          } else if (e.type === "symlink") {
+            li.appendChild(el("span", "beak-dir mono", e.path + " → (link)"));
+          } else {
+            const b = el("button", "linklike mono beak-file" + (e.path === beakSelectedPath ? " selected" : ""), e.path);
+            b.type = "button";
+            if (isBeakPrivate(e.path)) {
+              b.disabled = true;
+              b.classList.add("beak-private");
+              b.title = "The chicken's private harness config — the beak never serves this file";
+              li.appendChild(b);
+            } else {
+              b.setAttribute("aria-label", "Peek at workspace file " + e.path);
+              b.addEventListener("click", () => {
+                beakSelectedPath = e.path;
+                loadRuns();
+              });
+              li.appendChild(b);
+              li.appendChild(el("span", "muted beak-size", e.size_bytes + " B"));
+            }
+          }
+          tree.appendChild(li);
+        }
+        if (hadBefore) flashCard(grid); // one-shot flash on change
+      }
+      if (ws.tree && ws.tree.truncated) note("Tree truncated at " + ws.tree.max_entries + " entries — the workspace is bigger.", true);
+      label.textContent = "workspace · " + (ws.tree ? ws.tree.n_entries : 0) + " entries · " + (ws.tree ? ws.tree.total_bytes : 0) + " B" + (run.status ? " · " + run.status : "");
+    }
+
+    // single-file peek
+    pre.dataset.sig = "";
+    pre.textContent = "";
+    if (beakSelectedPath && ws && ws.ok === true) {
+      if (wsFile && wsFile.__networkError) {
+        note("coopd is not reachable — the file peek failed.", true);
+      } else if (wsFile && wsFile.ok === true) {
+        pre.dataset.sig = JSON.stringify(wsFile);
+        pre.textContent = wsFile.content;
+        if (wsFile.truncated) {
+          note("Truncated — showing the first " + wsFile.served_bytes + " of " + wsFile.size_bytes + " bytes (cap " + wsFile.cap_bytes + " B).", true);
+        }
+      } else if (wsFile) {
+        note(wsFile.error || "The beak refused that file.", true);
+      }
+    }
+
+    // live log tail (same runs_logs payload as the Logs tab, last lines)
+    const blog = $("#beak-log");
+    if (logs && !logs.__networkError && logs.ok !== false && !(logs.daemon && logs.daemon.up === false)) {
+      const tail = (logs.events || []).slice(-BEAK_TAIL_LINES);
+      const bSig = JSON.stringify(tail);
+      if (blog.dataset.sig !== bSig) {
+        blog.dataset.sig = bSig;
+        blog.replaceChildren();
+        for (const e of tail) blog.appendChild(beakLogLine(e));
+        blog.scrollTop = blog.scrollHeight;
+      }
+    }
   }
 
   function renderResultPane(run, result) {
@@ -760,13 +873,18 @@
 
   async function loadRunDetail(runId) {
     const enc = encodeURIComponent(runId);
-    const [show, logs, result] = await Promise.all([
+    const fetches = [
       api("/api/runs/" + enc),
       api("/api/runs/" + enc + "/logs"),
       api("/api/results/" + enc),
-    ]);
+      api("/api/runs/" + enc + "/workspace"), // spec 29: the Beak — workspace tree
+    ];
+    if (beakSelectedPath) {
+      fetches.push(api("/api/runs/" + enc + "/workspace?path=" + encodeURIComponent(beakSelectedPath)));
+    }
+    const [show, logs, result, ws, wsFile] = await Promise.all(fetches);
     if (show === null) return; /* 401 → login view shown */
-    renderDetail(show, logs, result);
+    renderDetail(show, logs, result, ws, wsFile || null);
   }
 
   async function loadRuns() {
@@ -835,11 +953,12 @@
 
   $("#detail-close").addEventListener("click", () => {
     selectedRunId = null;
+    beakSelectedPath = null;
     $("#run-detail").hidden = true;
     $$("#runs-tbody tr").forEach((tr) => tr.classList.remove("selected"));
   });
 
-  for (const t of ["manifest", "logs", "result"]) {
+  for (const t of ["manifest", "logs", "result", "beak"]) {
     $("#tab-" + t).addEventListener("click", () => setRunsTab(t));
   }
 

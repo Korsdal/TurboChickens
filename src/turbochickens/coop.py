@@ -9,7 +9,13 @@ static SPA at ``/`` and a JSON API under ``/api`` — ``/api/ping`` +
 ``POST /api/runs`` (enqueue by in-container spec path, trigger=manual),
 ``GET /api/runs?job=&status=``, ``GET /api/runs/{id}``, ``GET /api/runs/{id}/logs``,
 ``GET /api/results/{run_id}`` (validated output, or quarantine errors + raw
-output, or expired). Spec 15 adds the upload path: ``POST /api/jobs/validate``
+output, or expired). Spec 29 (the Beak) adds ``GET /api/runs/{run_id}/workspace``
+(optionally ``?path=…`` for one size-capped file) — a mirror of the
+``workspace_peek`` socket op: the running chicken's workspace tree / file
+content, path-locked inside that run's workspace, available only while the
+workspace exists (terminal runs answer a 200 with the closed-beak payload,
+unknown runs a 404, dead socket the structured daemon-down payload).
+Spec 15 adds the upload path: ``POST /api/jobs/validate``
 (validates — and, when valid, stores — a spec bundle sent as JSON with
 base64-encoded files, size-capped) and the bundle form of ``POST /api/runs``
 (store + validate + enqueue in one call, so the browser never needs a path).
@@ -196,6 +202,8 @@ class CoopServer:
         app.router.add_get("/api/runs", self._api_runs_list)
         app.router.add_get("/api/runs/{run_id}", self._api_run_show)
         app.router.add_get("/api/runs/{run_id}/logs", self._api_run_logs)
+        # spec 29: the Beak — live workspace view of a running chicken
+        app.router.add_get("/api/runs/{run_id}/workspace", self._api_run_workspace)
         app.router.add_get("/api/results/{run_id}", self._api_result_get)
         # spec 16: schedules from the GUI
         app.router.add_get("/api/schedule", self._api_schedule_list)
@@ -452,6 +460,21 @@ class CoopServer:
 
     async def _api_run_logs(self, request: web.Request) -> web.Response:
         return await self._mirror_resource("runs_logs", run_id=request.match_info["run_id"])
+
+    async def _api_run_workspace(self, request: web.Request) -> web.Response:
+        """GET /api/runs/{run_id}/workspace(?path=…) — the Beak (spec 29): the
+        workspace tree of a running chicken, or one file's size-capped content
+        when ``path`` is given. A thin mirror of the ``workspace_peek`` socket
+        op over the transport seam (the web layer never touches the workspace
+        itself): 200 with the payload — including the closed-beak ok:false
+        payload for terminal runs, which the SPA renders as its empty state —
+        404 for an unknown chicken, and the structured daemon-down payload
+        (200) when the socket is dead."""
+        payload: dict[str, Any] = {"run_id": request.match_info["run_id"]}
+        path = request.query.get("path")
+        if path is not None:
+            payload["path"] = path
+        return await self._mirror_resource("workspace_peek", **payload)
 
     async def _api_result_get(self, request: web.Request) -> web.Response:
         return await self._mirror_resource("results_get", run_id=request.match_info["run_id"])

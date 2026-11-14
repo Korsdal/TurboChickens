@@ -4,11 +4,11 @@
 
 **Blocked by:** 22 (terminal states `cancelled`/`stopped` define when the workspace is gone)
 
-**Status:** ready-for-agent (split from spec 21 via to-tickets, 2026-11-14)
+**Status:** done (2026-11-14)
 
-- [ ] Socket op `workspace_peek`: file tree + single-file content for a running run; size-capped content; path-locked inside the run's workspace (traversal attempts refused); unknown run or terminal run → clear not-available response (workspace gone)
-- [ ] `GET /api/runs/{id}/workspace` mirrors the socket op exactly (parity rule: identical payload; dead-socket transport returns `200 {ok:false, daemon.up:false}` like every other endpoint)
-- [ ] GUI: run detail gains a Beak tab — live log tail (existing `runs_logs` polling), workspace tree, file peek; read-only (no shell, no write affordances); built to `specs/00-design-system.md`, 2 s poll with flash-on-change, empty state for terminal runs, daemon-down banner, bearer 401s like specs 12–19
-- [ ] Secrecy: no token/seat material in tree, file contents served, or any response (workspace files are the chicken's own, but env dumps must never be exposed)
-- [ ] Tests: socket + HTTP parity, path-lock and size-cap refusals, terminal-run behavior; served-markup smoke for the tab; full suite green
-- [ ] `STATUS.md` updated at the slice boundary
+- [x] Socket op `workspace_peek`: file tree + single-file content for a running run; size-capped content (64 KiB served, `truncated` flag; tree capped at 1000 entries); path-locked inside the run's workspace (traversal attempts refused); unknown run or terminal run → clear not-available response (workspace gone)
+- [x] `GET /api/runs/{id}/workspace` mirrors the socket op exactly (parity rule: identical payload; dead-socket transport returns `200 {ok:false, daemon.up:false}` like every other endpoint; 404 unknown run; 200 closed-beak payload for terminal runs; bearer 401 when required)
+- [x] GUI: run detail gains a Beak tab — live log tail (existing `runs_logs` polling), workspace tree, file peek; read-only (no shell, no write affordances); built to `specs/00-design-system.md`, 2 s poll with flash-on-change, empty state for terminal runs, daemon-down banner, bearer 401s like specs 12–19
+- [x] Secrecy: no token/seat material in tree, file contents served, or any response (workspace files are the chicken's own, but env dumps must never be exposed — the private harness config `.vibe/` + `.tc-farmhand-settings.toml` is refused by name, since resolved gate/env secrets live there)
+- [x] Tests: socket + HTTP parity, path-lock and size-cap refusals, terminal-run behavior; served-markup smoke for the tab; full suite green (402 passed)
+- [x] `STATUS.md` updated at the slice boundary

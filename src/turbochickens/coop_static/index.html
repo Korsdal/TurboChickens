@@ -165,6 +165,7 @@
               <button type="button" class="tab" id="tab-manifest" role="tab" aria-selected="true">Manifest</button>
               <button type="button" class="tab" id="tab-logs" role="tab" aria-selected="false">Logs</button>
               <button type="button" class="tab" id="tab-result" role="tab" aria-selected="false">Clutch</button>
+              <button type="button" class="tab" id="tab-beak" role="tab" aria-selected="false">Beak</button>
             </div>
             <div class="detail-pane" id="pane-manifest" role="tabpanel" aria-labelledby="tab-manifest">
               <div class="pane-bar"><span class="muted" id="manifest-label">manifest</span><button type="button" class="btn btn-secondary btn-copy" data-copy-target="manifest-pre">Copy</button></div>
@@ -177,6 +178,19 @@
               <div class="pane-bar"><span class="muted" id="result-label">clutch</span><button type="button" class="btn btn-secondary btn-copy" data-copy-target="result-pre">Copy</button></div>
               <div id="result-state" hidden></div>
               <pre class="mono data-pane" id="result-pre"></pre>
+            </div>
+            <div class="detail-pane" id="pane-beak" role="tabpanel" aria-labelledby="tab-beak" hidden>
+              <div class="pane-bar"><span class="muted" id="beak-label">workspace</span><button type="button" class="btn btn-secondary btn-copy" data-copy-target="beak-pre">Copy</button></div>
+              <div id="beak-state" hidden></div>
+              <div class="beak-grid" id="beak-grid" hidden>
+                <div class="beak-tree-wrap">
+                  <div class="muted beak-subhead">Workspace files</div>
+                  <ul class="beak-tree mono" id="beak-tree"></ul>
+                </div>
+                <pre class="mono data-pane beak-pre" id="beak-pre"></pre>
+              </div>
+              <div class="muted beak-subhead" id="beak-log-head">Live log tail</div>
+              <div class="log run-log beak-log" id="beak-log"></div>
             </div>
           </div>
         </section>
