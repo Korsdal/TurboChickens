@@ -212,7 +212,8 @@ class SeatBroker:
             return {k: v for k in allow if (v := os.environ.get(k)) is not None}
         # vibe-cli and any future subprocess adapter: env allowlist only. A
         # seat-configured vibe profile is picked up by the vibe binary itself
-        # from ~/.vibe/config.toml (HOME/XDG_* pass through BASE_ENV_KEYS).
+        # from the sanitized profile materialized into the chicken's Scratch
+        # (per-run HOME — see adapter.materialize_scratch_home).
         return {k: v for k in self.env_allowlist if (v := os.environ.get(k)) is not None}
 
     def auth_telemetry(self, run: RunContext) -> dict[str, Any]:

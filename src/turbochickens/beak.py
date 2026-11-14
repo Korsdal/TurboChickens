@@ -43,8 +43,9 @@ WORKSPACE_PEEK_MAX_ENTRIES = 1000
 #: refs resolved against the daemon environment (spec 28), and the farmhand
 #: settings file (spec 27) points at daemon-internal paths; neither is ever
 #: exposed. (The settings file is token-free, but it is still daemon config,
-#: not chicken work.)
-BEAK_PRIVATE_DIRS = frozenset({".vibe"})
+#: not chicken work.) The Scratch (``.tc-home/``, spec 32 ticket 12 — the
+#: chicken's per-run HOME/XDG with the sanitized vibe profile) is private too.
+BEAK_PRIVATE_DIRS = frozenset({".vibe", ".tc-home"})
 BEAK_PRIVATE_FILES = frozenset({".tc-farmhand-settings.toml"})
 
 

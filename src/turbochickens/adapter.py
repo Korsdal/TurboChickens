@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import subprocess
+import tomllib
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,15 +34,39 @@ ADAPTER_WEIGHTS: dict[str, float] = {"mistral-api": 0.25, "vibe-cli": 1.0}
 
 VIBE_BIN_ENVVAR = "TURBOCHICKENS_VIBE_BIN"
 
-#: Env keys copied from the daemon environment into the per-run env. Everything
-#: else (ambient secrets included) is left out — credentials enter only through
-#: the credential provider, as per-run env vars.
+#: Env keys the per-run env always carries. Only `PASSTHROUGH_ENV_KEYS` are
+#: copied verbatim from the daemon environment — everything else (ambient
+#: secrets included) is left out; credentials enter only through the
+#: credential provider, as per-run env vars.
 BASE_ENV_KEYS = (
     "PATH",
     "HOME",
     "LANG",
     "LC_ALL",
     "TERM",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "VIBE_HOME",
+)
+
+#: The subset of BASE_ENV_KEYS still passed through from the daemon env.
+#: HOME / TMPDIR / XDG_* / VIBE_HOME are deliberately NOT passthrough anymore
+#: (review G9, spec 32 ticket 12): they are repointed at the per-run Scratch
+#: inside the chicken's own workspace (see `materialize_scratch_home`), so a
+#: chicken can neither read nor write the operator's real $HOME, and nothing
+#: it plants in its "home" survives the abattoir's teardown.
+PASSTHROUGH_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "TERM")
+
+#: The per-run Scratch (lexicon): a directory inside the chicken's own
+#: workspace holding HOME, TMPDIR, XDG_* and VIBE_HOME plus a sanitized vibe
+#: profile. It is removed with the workspace at teardown.
+SCRATCH_HOME_DIRNAME = ".tc-home"
+
+#: The BASE_ENV_KEYS repointed at the Scratch instead of the daemon env.
+SCRATCH_ENV_KEYS = (
+    "HOME",
     "TMPDIR",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
@@ -149,8 +174,8 @@ class EnvAllowlistCredentialProvider:
     def auth_telemetry(self, run: RunContext) -> dict[str, Any]:
         """Spec 09: non-secret auth mode for the manifest/audit. An env
         credential present → "api-key"; absent → "none" (a subprocess harness
-        like vibe-cli may then use its own profile, e.g. browser auth from
-        ~/.vibe/config.toml, which is outside this platform's knowledge)."""
+        like vibe-cli may then use its own browser-auth profile, materialized
+        sanitized into the chicken's Scratch — see `materialize_scratch_home`)."""
         present = any(os.environ.get(k) is not None for k in self.allowlist)
         return {"mode": "api-key" if present else "none", "token_expires_at": None}
 
@@ -167,10 +192,125 @@ def auth_telemetry_of(provider: CredentialProvider, run: RunContext) -> dict[str
     return {"mode": "api-key", "token_expires_at": None}
 
 
+def scratch_home_env(workspace: Path) -> dict[str, str]:
+    """The HOME/XDG/TMPDIR/VIBE_HOME mapping of the per-run Scratch: every one
+    of them resolves inside the chicken's own workspace (review G9)."""
+    scratch = workspace / SCRATCH_HOME_DIRNAME
+    return {
+        "HOME": str(scratch),
+        "TMPDIR": str(scratch / "tmp"),
+        "XDG_CONFIG_HOME": str(scratch / "config"),
+        "XDG_DATA_HOME": str(scratch / "data"),
+        "XDG_CACHE_HOME": str(scratch / "cache"),
+        "VIBE_HOME": str(scratch / "vibe"),
+    }
+
+
+def _operator_vibe_config_text() -> str | None:
+    """The operator's own vibe profile text (read by the daemon, never by the
+    chicken): $VIBE_HOME/config.toml, else $XDG_CONFIG_HOME/vibe/config.toml,
+    else $HOME/.vibe/config.toml — first existing file wins."""
+    candidates: list[Path] = []
+    vibe_home = os.environ.get("VIBE_HOME")
+    if vibe_home:
+        candidates.append(Path(vibe_home) / "config.toml")
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        candidates.append(Path(xdg) / "vibe" / "config.toml")
+    home = os.environ.get("HOME")
+    if home:
+        candidates.append(Path(home) / ".vibe" / "config.toml")
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return cand.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return None
+
+
+def _toml_value(value: Any) -> str | None:
+    """Encode one profile value as a TOML value, or None when it is not a
+    plain scalar/array of scalars (tables are walked separately)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value)  # JSON basic strings are valid TOML basic strings
+    if isinstance(value, list):
+        items = [_toml_value(v) for v in value]
+        if all(i is not None for i in items):
+            return "[" + ", ".join(items) + "]"
+    return None
+
+
+def sanitize_vibe_profile(text: str | None) -> str:
+    """Whitelist copy of the operator's vibe profile for a chicken's Scratch
+    (review G9, spec 32 ticket 12): only ``browser_auth*`` fields survive —
+    they carry no secret material, and they keep the browser-auth seat flow
+    working inside the chicken. API keys, tokens, MCP server entries (gate
+    secrets), and every other setting are dropped. Unparseable or missing
+    input yields a minimal, explicitly sanitized profile."""
+    kept: dict[tuple[str, ...], list[tuple[str, Any]]] = {}
+    if text:
+        try:
+            data = tomllib.loads(text)
+        except (tomllib.TOMLDecodeError, ValueError):
+            data = {}
+
+        def walk(prefix: tuple[str, ...], table: dict[str, Any]) -> None:
+            for key, value in table.items():
+                if key.startswith("browser_auth") and _toml_value(value) is not None:
+                    kept.setdefault(prefix, []).append((key, value))
+                elif isinstance(value, dict):
+                    walk(prefix + (key,), value)
+
+        if isinstance(data, dict):
+            walk((), data)
+    lines = [
+        "# spec 32 ticket 12 (review G9): sanitized per-run vibe profile for the",
+        "# chicken's Scratch — only browser_auth* fields of the operator's profile",
+        "# are kept; api keys, tokens, and MCP server entries never reach a chicken.",
+    ]
+    for path in sorted(kept):
+        if path:
+            lines.append("")
+            lines.append("[" + ".".join(path) + "]")
+        for key, value in kept[path]:
+            encoded = _toml_value(value)
+            if encoded is not None:
+                lines.append(f"{key} = {encoded}")
+    return "\n".join(lines) + "\n"
+
+
+def materialize_scratch_home(run: RunContext) -> dict[str, str]:
+    """Create the per-run Scratch inside the chicken's own workspace and
+    materialize only a sanitized vibe profile in it. Returns the
+    HOME/TMPDIR/XDG_*/VIBE_HOME env pointing at the Scratch. Everything under
+    it is removed with the workspace at teardown — nothing a chicken plants in
+    its "home" survives the abattoir."""
+    env = scratch_home_env(run.workspace)
+    scratch = run.workspace / SCRATCH_HOME_DIRNAME
+    for sub in ("tmp", "config", "data", "cache", ".vibe", "vibe"):
+        (scratch / sub).mkdir(parents=True, exist_ok=True)
+    profile = sanitize_vibe_profile(_operator_vibe_config_text())
+    # every location vibe may resolve as its user-level profile, all sanitized
+    for rel in (".vibe/config.toml", "vibe/config.toml", "config/vibe/config.toml"):
+        target = scratch / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(profile)
+    return env
+
+
 def build_per_run_env(run: RunContext, credentials: dict[str, str]) -> dict[str, str]:
-    """Fresh per-run environment: base keys + injected credentials + run vars.
-    Deliberately not a copy of os.environ — no ambient secrets."""
-    env = {k: os.environ[k] for k in BASE_ENV_KEYS if k in os.environ}
+    """Fresh per-run environment: passthrough keys + the Scratch-pointed
+    HOME/XDG/TMPDIR/VIBE_HOME + injected credentials + run vars. Deliberately
+    not a copy of os.environ — no ambient secrets, and no real $HOME either."""
+    env = {k: os.environ[k] for k in PASSTHROUGH_ENV_KEYS if k in os.environ}
+    env.update(materialize_scratch_home(run))
     env.update(credentials)
     env["TURBOCHICKENS_RUN_ID"] = run.run_id
     env["TURBOCHICKENS_JOB_ID"] = run.job_id

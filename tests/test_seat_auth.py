@@ -821,10 +821,12 @@ print(json.dumps({"message": "hello from fake vibe"}))
 
 
 def test_e2e_vibe_cli_without_env_key_uses_its_own_profile(seat_env, tmp_path, monkeypatch) -> None:
-    """vibe-cli needs no API key: HOME/XDG_* pass through BASE_ENV_KEYS, so a
-    browser-auth provider registered in ~/.vibe/config.toml (vibe's own
-    ProviderConfig browser_auth_* fields) is picked up by the vibe binary
-    itself. TurboChickens injects no credential and records mode "none"."""
+    """vibe-cli needs no API key: HOME/XDG_* point at the chicken's Scratch,
+    which holds a sanitized copy of the operator's ~/.vibe/config.toml
+    (browser_auth_* fields only, spec 32 ticket 12), so a browser-auth provider
+    registered there (vibe's own ProviderConfig browser_auth_* fields) is still
+    picked up by the vibe binary itself. TurboChickens injects no credential
+    and records mode "none"."""
     bin_path = tmp_path / "fake-vibe"
     bin_path.write_text(FAKE_VIBE_ENVFACT)
     bin_path.chmod(0o755)
@@ -847,7 +849,7 @@ def test_e2e_vibe_cli_without_env_key_uses_its_own_profile(seat_env, tmp_path, m
         logs = request(settings.socket_path, "runs_logs", run_id=run_id, timeout=2.0)["events"]
         envfacts = [e["line"] for e in logs if "ENVFACT" in e["line"]]
         assert envfacts, f"fake vibe env report missing from logs: {[e['line'] for e in logs]}"
-        assert "home=set" in envfacts[0]  # HOME passthrough → ~/.vibe/config.toml reachable
+        assert "home=set" in envfacts[0]  # HOME → the Scratch → sanitized profile reachable
         assert "mistral_api_key=unset" in envfacts[0]
         assert "seatco_token=unset" in envfacts[0]
     finally:
