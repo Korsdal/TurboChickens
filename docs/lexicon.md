@@ -37,7 +37,7 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 | Term | Meaning | Maps to |
 |---|---|---|
 | **Rooster** | Cron-style scheduler — it wakes the jobs up | `scheduler.py` |
-| **Fox** | Security module — foxes eat Eggs *and* Chickens | security (future) |
+| **Fox** | Security module — foxes eat Eggs *and* Chickens; it watches the fence: all state the daemon creates is restrictive (dirs 0700, files 0600, restrictive umask at start — no umask window) | `fox.py` (perms hardening) |
 | **Perch** | Seat-based auth — a seat is a perch | `seat.py` |
 | **Headcount** | Audit log — a farmer's headcount | `audit.py` |
 

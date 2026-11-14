@@ -62,7 +62,7 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import web
 from mcp.server.mcpserver import MCPServer
 
-from turbochickens import client
+from turbochickens import client, fox
 from turbochickens.client import DaemonUnreachable
 from turbochickens.settings import SOCKET_STREAM_LIMIT, UPLOAD_MAX_HTTP_BODY, Settings
 
@@ -207,19 +207,22 @@ def attach_farmhand_to_run(run: "RunContext", settings: Settings) -> dict[str, A
     Returns the manifest block describing the attachment."""
     command, args = farmhand_serve_command()
     vibe_dir = run.workspace / ".vibe"
-    vibe_dir.mkdir(parents=True, exist_ok=True)
+    # spec 32 (G11, the Fox): the injected harness config is written
+    # restrictive — .vibe 0700, config.toml and the farmhand settings file
+    # 0600 at creation (resolved secrets live in the merged config)
+    fox.ensure_dir(vibe_dir)
     config_path = vibe_dir / "config.toml"
-    config_path.write_text(
+    fox.write_text_0600(
+        config_path,
         "# spec 27 (ChickenSubs): the Farmhand attached to this chicken's harness\n"
         "# runtime over stdio — enqueue sub-eggs and read the flock through the\n"
         "# farm's own contract. Spawned by the harness with the run's env.\n"
         "[mcp_servers.farmhand]\n"
         f"command = {_toml_value(command)}\n"
         f"args = [{', '.join(_toml_value(a) for a in args)}]\n",
-        encoding="utf-8",
     )
     settings_path = run.workspace / ".tc-farmhand-settings.toml"
-    settings_path.write_text(settings_toml_for_farmhand(settings), encoding="utf-8")
+    fox.write_text_0600(settings_path, settings_toml_for_farmhand(settings))
     run.env["TURBOCHICKENS_SETTINGS"] = str(settings_path)
     if run.parent_run_id:
         run.env["TURBOCHICKENS_PARENT_RUN_ID"] = run.parent_run_id

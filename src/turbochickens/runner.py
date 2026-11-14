@@ -72,6 +72,7 @@ from turbochickens.adapter import (
     make_adapter,
     sanitize_log_line,
 )
+from turbochickens import fox
 from turbochickens.audit import AuditLog
 from turbochickens.chaining import (
     NestboxError,
@@ -193,7 +194,11 @@ class RunPipeline:
         cannot be bypassed by chaining) and the resolved chaining sources for
         the manifest (injected trajectory state is post-MVP)."""
         ws = ctx.workspace
-        ws.mkdir(parents=True, exist_ok=True)
+        # spec 32 (G11, the Fox): workspaces are created restrictive — the
+        # workspaces root and the per-run workspace are both 0700 (also
+        # tightening pre-existing looser dirs)
+        fox.ensure_dir(ws.parent)
+        fox.ensure_dir(ws)
         spec_dir = ctx.spec_path.parent
         prompt_src = spec_dir / ctx.spec.input.prompt_file
         shutil.copyfile(prompt_src, ws / "prompt.txt")
@@ -233,10 +238,13 @@ class RunPipeline:
         Artifacts live under data_dir, not the workspace — the workspace is
         destroyed at teardown, the result survives."""
         artifacts_dir = self.settings.results_dir / run_id
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        (artifacts_dir / "output.json").write_text(
+        # spec 32 (G11, the Fox): clutch artifacts are state at rest — dirs
+        # 0700, files 0600 at creation
+        fox.ensure_dir(self.settings.results_dir)
+        fox.ensure_dir(artifacts_dir)
+        fox.write_text_0600(
+            artifacts_dir / "output.json",
             json.dumps(outcome.output, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-            encoding="utf-8",
         )
         async with self._db_lock:
             self.db.execute(
@@ -254,10 +262,14 @@ class RunPipeline:
         recorded in a `results` row with valid=0 — never stored as valid, never
         discarded (baseline v0.2 §10.2)."""
         qdir = self.settings.quarantine_dir / run_id
-        qdir.mkdir(parents=True, exist_ok=True)
-        (qdir / "raw_output.txt").write_text(raw_output, encoding="utf-8")
-        (qdir / "schema_errors.json").write_text(
-            json.dumps(schema_errors, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        # spec 32 (G11, the Fox): quarantine evidence is state at rest too —
+        # dirs 0700, files 0600 at creation
+        fox.ensure_dir(self.settings.quarantine_dir)
+        fox.ensure_dir(qdir)
+        fox.write_text_0600(qdir / "raw_output.txt", raw_output)
+        fox.write_text_0600(
+            qdir / "schema_errors.json",
+            json.dumps(schema_errors, indent=2, ensure_ascii=False) + "\n",
         )
         async with self._db_lock:
             self.db.execute(

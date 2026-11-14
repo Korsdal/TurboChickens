@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from turbochickens.util import utcnow_iso
+from turbochickens import fox
 
 #: legacy (pre-spec-20) event names → lexicon event names. Applied on
 #: read/display only; rows on disk are never rewritten.
@@ -61,10 +62,18 @@ class AuditLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         row = {"ts": utcnow_iso(), **event}
         line = json.dumps(row, ensure_ascii=False, sort_keys=True)
-        with open(self.path, "a", encoding="utf-8") as f:  # append-only: never opened for write/truncate
-            f.write(line + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        # spec 32 (G11, the Fox): the Headcount is state at rest — created
+        # 0600 at creation and fchmod-ed on every append (a pre-existing
+        # looser file is tightened), still append-only: never opened for
+        # write/truncate
+        fd = fox.open_append_0600(self.path)
+        try:
+            with os.fdopen(fd, "a", encoding="utf-8", closefd=False) as f:
+                f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        finally:
+            os.close(fd)
         return row
 
     def read_all(self) -> list[dict[str, Any]]:
