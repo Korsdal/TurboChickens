@@ -89,7 +89,9 @@ registry (resolved exactly like ``providers.toml``: ``settings.connectors_path``
 > ``$TURBOCHICKENS_CONNECTORS`` > ``<data_dir>/connectors.toml``), audit-logged
 as ``gate.registered`` / ``gate.removed`` / ``gate.rejected`` with name +
 transport only — never env/header material. ``connectors_list`` serves
-non-secret summaries only (stdio env as key names, https headers as refs).
+non-secret summaries only (stdio env as key names, https headers as refs only —
+a literal header secret is refused at `connectors_add` with a field-named
+``connectors.<name>.headers`` error and withheld from every listing).
 ``enqueue`` refuses ``harness.connectors`` names that are not registered
 (field-named ``harness.connectors`` error) and refuses the list for
 non-vibe-cli adapters (no harness runtime to inject into); the vibe-cli

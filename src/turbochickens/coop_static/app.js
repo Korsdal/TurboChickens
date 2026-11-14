@@ -2076,7 +2076,10 @@
       const env = (g.env_keys || []).join(", ");
       return (g.command || "—") + (args ? " " + args : "") + (env ? "  ·  env: " + env : "");
     }
-    const headers = Object.entries(g.headers || {}).map(([k, v]) => k + ": " + v).join(", ");
+    // refs only: a header value without a $ref is a literal — never rendered
+    const headers = Object.entries(g.headers || {})
+      .map(([k, v]) => k + ": " + (String(v).includes("$") ? v : "<withheld>"))
+      .join(", ");
     return (g.url || "—") + (headers ? "  ·  headers: " + headers : "");
   }
 
