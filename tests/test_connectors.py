@@ -472,7 +472,9 @@ def test_connectors_crud_over_socket(daemon, tmp_path, monkeypatch) -> None:
     removed = [r for r in rows if r["event"] == "gate.removed"]
     assert [(r["name"], r["transport"]) for r in removed] == [("webx", "https")]
     rejected = [r for r in rows if r["event"] == "gate.rejected"]
-    assert len(rejected) == 5 and all(set(r) <= {"event", "ts", "name", "fields"} for r in rejected)
+    # spec 32 ticket 24: rows carry the additive `via` actor (socket here)
+    assert len(rejected) == 5 and all(set(r) <= {"event", "ts", "name", "fields", "via"} for r in rejected)
+    assert all(r["via"] == "socket" for r in rejected)
     audit_text = settings.audit_log_path.read_text()
     assert SECRET not in audit_text
     assert "Bearer $TC_GATE_SECRET" not in audit_text  # header refs are not audited either

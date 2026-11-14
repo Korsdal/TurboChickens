@@ -39,7 +39,7 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 | **Rooster** | Cron-style scheduler — it wakes the jobs up | `scheduler.py` |
 | **Fox** | Security module — foxes eat Eggs *and* Chickens | security (future) |
 | **Perch** | Seat-based auth — a seat is a perch | `seat.py` |
-| **Headcount** | Audit log — a farmer's headcount | `audit.py` |
+| **Headcount** | Audit log — a farmer's headcount. Every mutating row also carries a `via` actor — `socket` (local CLI / direct socket), `http` (the Coop's API), `farmhand` (the Farmhand's tools), `rooster` (a cron crow) — stamped server-side from the verified connection, never taken from a client request | `audit.py` |
 
 ## The Interface Layer
 
