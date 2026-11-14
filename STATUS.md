@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-14, after spec 22 landed (lifecycle ops — socket ops `run_stop`/`run_rerun`, CLI `tc runs stop`/`tc runs rerun`, terminal states `cancelled`/`stopped` with attested teardown on every stop path, `egg.cancelled`/`chicken.stopped` Headcount rows, `rerun_of` lineage, lexicon terms added first; full suite green, 298 passed). Same day earlier: spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier then: 22, 24, 25); still no code changed.
+**Last updated:** 2026-11-14, after spec 24 landed (Feed Budget cost cap — optional per-egg `resources.max_cost_usd` in USD, off by default, enforced finalize-only: over cap → run failed with `budget.outcome = "cost_cap"` in the existing manifest budget block, cost/token telemetry still recorded, teardown attested as usual; pure seam `cost_cap_exceeded`; full suite green, 307 passed). Same day earlier: spec 22 landed (lifecycle ops — socket ops `run_stop`/`run_rerun`, CLI `tc runs stop`/`tc runs rerun`, terminal states `cancelled`/`stopped` with attested teardown on every stop path, `egg.cancelled`/`chicken.stopped` Headcount rows, `rerun_of` lineage, lexicon terms added first; full suite green, 298 passed). Same day earlier: spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier then: 22, 24, 25); still no code changed.
 
 ---
 
@@ -27,7 +27,7 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10, specs 12–20, and spec 22 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, the spec-20 commit, and the spec-22 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
+**Spec 01 through spec 10, specs 12–20, and specs 22 and 24 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, the spec-20 commit, the spec-22 commit, and the spec-24 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
 
 Spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality. Spec 19 gave seat auth a GUI surface (see below).
 Verified this session:
@@ -244,6 +244,21 @@ Verified this session:
 #     status_reason; audit_tail ?event=chicken.stopped / egg.cancelled filters work; stop on an
 #     unknown or already-terminal chicken → rc 1 "unknown chicken" / "already terminal"
 #   → full suite: 298 passed (291 + 7 new tests/test_lifecycle_ops.py)
+# spec-24 smoke (subprocess daemon, temp data_dir, fake priced provider on loopback via
+#   $TURBOCHICKENS_PROVIDERS + fake vibe binary via $TURBOCHICKENS_VIBE_BIN):
+#   → tc run <api job max_cost_usd=0.0001> --wait → rc 1 "chicken run-… → failed (feed budget
+#     exceeded at finalize: measured cost_usd=0.00018 > max_cost_usd=0.0001)"; manifest
+#     budget={outcome=cost_cap, cost_exceeded=true, max_cost_usd=0.0001} + usage cost_usd/tokens;
+#     teardown attested (1,1,1); no results row; tc results get → rc 1; tc runs show prints cost_cap;
+#     stats_show still rolls n=1 (telemetry recorded); alerts: 0
+#   → tc run <api job max_cost_usd=0.00018 (== measured cost)> --wait → succeeded rc 0,
+#     budget.outcome=ok, clutch stored, tc results get rc 0
+#   → tc run <vibe-cli job max_cost_usd=0.0005, harness cost 0.001> --wait → failed cost_cap
+#   → tc run <api job, no max_cost_usd> --wait → succeeded; budget.max_cost_usd=null;
+#     tc stats show → expected_cost_usd_per_run: 0.00018
+#   → tc jobs validate examples/weekly-incidents-digest/job.toml → sha256:18efbd8c… (unchanged,
+#     None excluded from the spec hash); tc daemon stop → rc 0
+#   → full suite: 307 passed (298 + 9 new tests/test_cost_cap.py)
 ```
 
 What exists:
@@ -366,7 +381,12 @@ src/turbochickens/
 │                          # STOP_TERM_GRACE_SEC, terminal `stopped`, output never collected, audit
 │                          # chicken.stopped; cancel_queued() terminal-cancels a pecking-order egg
 │                          # (manifest + attestation + egg.cancelled, never hatches); manifests carry
-│                          # `rerun_of` lineage for run_rerun
+│                          # `rerun_of` lineage for run_rerun; spec 24: the optional Feed Budget cost
+│                          # cap `resources.max_cost_usd` (USD, off by default) enforced finalize-only
+│                          # via the pure seam `cost_cap_exceeded` — over cap → failed with
+│                          # budget.outcome="cost_cap" (budget block gains max_cost_usd/cost_exceeded,
+│                          # resources mirror gains max_cost_usd), no clutch stored, telemetry +
+│                          # attestation as usual; at cap exactly succeeds; seat runs (cost 0.0) never trip
 ├── scheduler.py           # spec 06: CronScheduler over APScheduler AsyncIOScheduler; standard
 │                          # POSIX cron semantics (aps_trigger resolves the day-of-week field via
 │                          # croniter because APScheduler numbers 0=Monday); schedules re-registered
@@ -425,7 +445,10 @@ src/turbochickens/
 │                          # (jsonschema Draft 2020-12 + format checker; never raises on bad output)
 ├── spec/
 │   ├── model.py           # Pydantic v2 model, all 6 sections, extra="forbid"
+│   │                      # (spec 24: resources.max_cost_usd — optional USD cost cap,
+│   │                      #  positive-only, default None = off; still no max_tokens)
 │   └── loader.py          # load_spec(), SpecValidationError (field-named issues), spec_hash()
+│                          # (spec_hash excludes None optionals, so pre-24 spec hashes are unchanged)
 └── cli/main.py            # Typer app `tc`: run [--wait] | runs list/show/logs/stop/rerun (spec 22:
                            # stop = run_stop — queued egg → cancelled, running chicken → SIGTERM then hard
                            # kill → stopped, rc 0 / clear error for unknown or already-terminal; rerun =
@@ -538,11 +561,19 @@ tests/
                            # trigger=rerun, rerun_of in manifest + egg.queued, normal queue/admission/
                            # pipeline to succeeded, rerun-after-cancel, CLI parity + errors), and a
                            # subprocess-daemon e2e (fake vibe) doing cancel + stop + rerun end to end
+└── test_cost_cap.py         # spec 24: the finalize cost-cap seam (over / at cap / no cap / seat cost 0 /
+                           # unmeasured), the ResourcesSection.max_cost_usd model checks (optional,
+                           # positive-only, extra=forbid intact, field-named errors via load_spec), and
+                           # e2e over a thread daemon: over-cap API run (fake priced provider) → failed
+                           # cost_cap + manifest cap/usage + attestation + no clutch + stats rollup +
+                           # tc runs show; at-cap run → succeeded; no-cap run → telemetry + stats;
+                           # vibe-cli over/at cap via the fake vibe binary; seat run with a tiny cap →
+                           # succeeded (cost_usd 0.0)
 examples/weekly-incidents-digest/   # baseline-format example job (job.toml, prompt, schema, csv; mistral-api)
 examples/hello-vibe-cli/            # manual vibe-cli example job (job.toml, prompt, schema)
 examples/providers.toml             # spec 05 reference provider registry (mistral presets + pricing,
                            # commented other-provider example) — copy to ~/.turbochickens/providers.toml
-pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.14, deps: pydantic, typer, rich, croniter,
+pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.15, deps: pydantic, typer, rich, croniter,
                            # jsonschema (+ rfc3339-validator for format checks), httpx, apscheduler (spec 06),
                            # aiohttp (spec 12, coop web server); dev: pytest
 Dockerfile                 # spec 18: the coop image — python:3.12-slim, pip install . (the wheel ships
@@ -1044,6 +1075,7 @@ Spec-18 deliverables, concretely:
 | 20 | Lexicon adoption — every surface speaks farm (`docs/lexicon.md` rolled out to Headcount events, GUI copy, CLI output, errors, docs; machine interfaces unchanged; legacy rows aliased on read) | **done** (2026-11-14) | 01–19 |
 | 21 | Hatchery & Farmhand overview v0.1 — lifecycle ops (stop/re-run), Free-Range, cost cap (off by default), chaining, Farmhand MCP (stdio/https/both), ChickenSubs, connectors registry, GUI for everything | overview v0.1 — **not ready-for-agent**; split into slices 22+ via to-tickets before implementation | 01–20 |
 | 22 | Lifecycle ops — `run_stop` (queued → `cancelled`, running → SIGTERM/hard kill → `stopped`, attested) + `run_rerun` (lineage) over socket, CLI, and audit | **done** (2026-11-14) | 02–04 |
+| 24 | Feed Budget cost cap — `resources.max_cost_usd` (USD, off by default, finalize-only `budget.outcome = "cost_cap"`, telemetry always recorded) | **done** (2026-11-14) | 05, 08 |
 
 ## 5. Non-negotiable invariants (baseline v0.2 — do not regress these)
 
@@ -1110,7 +1142,7 @@ tables deliberately excluded).
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 - **Version management is a human responsibility.** Coding agents can bump the
   last part of a version number (`0.0.X`) — every other bump (minor, major) is
-  human initiated. Current version: `0.0.14`.
+  human initiated. Current version: `0.0.15`.
 - **No agent as a contributor on GitHub.** See the commits bullet above: the
   `Co-Authored-By` agent trailer is what made GitHub list `mistral-vibe` as a
   contributor — it is banned from commits; humans only in the contributor
@@ -1238,6 +1270,24 @@ Stopped / Re-run + the `egg.cancelled` / `chicken.stopped` event names were
 added to `docs/lexicon.md` before use. Verified e2e through a thread daemon and
 a subprocess daemon with the fake vibe binary (incl. a SIGTERM-trapping fake
 forcing the hard-kill path); full suite 298 passed.
+
+Spec 24 (Feed Budget cost cap) landed: `resources.max_cost_usd` (USD, `float |
+None`, off by default, positive-only with a field-named error on zero/negative;
+`extra="forbid"` and the no-`max_tokens` invariant intact, and `spec_hash`
+excludes the None default so existing egg hashes are unchanged). Enforcement is
+finalize-only via the pure seam `cost_cap_exceeded(usage, cap)` in `runner.py`:
+when a chicken's measured `usage.cost_usd` is strictly over the egg's cap, the
+run fails at finalize with `budget.outcome = "cost_cap"` in the same manifest
+budget block as timeout/context-cap (the block gains `max_cost_usd` +
+`cost_exceeded`, the `resources` mirror gains `max_cost_usd`) — no clutch
+stored, cost/token telemetry still recorded and rolled into the feed ledger,
+teardown attested (1,1,1) as usual. At the cap exactly the run succeeds; with no
+cap set, behavior is unchanged. Seat runs (spec 09, `cost_usd = 0.0`) can never
+trip a positive cap. Operator-facing copy speaks farm ("feed budget exceeded at
+finalize: measured cost_usd=… > max_cost_usd=…"); the machine value `cost_cap`
+joins the budget outcomes. Verified e2e against a hermetic loopback fake priced
+provider and the fake vibe binary (over / at / no cap, plus a seat run with a
+tiny cap), full suite 307 passed.
 
 The MVP spec pipeline (01–10) and the GUI spec 11 slices (12–20) are
 complete; what remains is the post-MVP roadmap in baseline §13.

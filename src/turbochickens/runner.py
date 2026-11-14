@@ -12,6 +12,11 @@ harness process gets SIGTERM, then a hard kill after `STOP_TERM_GRACE_SEC`).
 Both stop paths end in the same teardown attestation as any terminal state, and
 `run_rerun` lineage lands in the manifest as `rerun_of`.
 
+Spec 24 adds the optional Feed Budget cost cap (`resources.max_cost_usd`, USD,
+off by default): enforced finalize-only — a chicken whose measured
+`usage.cost_usd` exceeds the egg's cap fails with `budget.outcome = "cost_cap"`
+(no clutch stored, telemetry still recorded, teardown attested as usual).
+
 The pipeline owns all SQLite writes for a chicken: status transitions on
 `runs`, streamed `run_events`, the manifest, the `results` row (spec 04: a
 valid clutch is stored in the nest box, an invalid one quarantined), and the
@@ -55,6 +60,21 @@ TERMINAL_STATES = ("succeeded", "failed", "cancelled", "stopped")
 STOP_TERM_GRACE_SEC = 5.0
 
 OUTPUT_EVENT_MAX_LEN = 20_000
+
+
+def cost_cap_exceeded(usage: dict[str, Any], max_cost_usd: float | None) -> bool:
+    """Spec 24 pure seam: the finalize-only Feed Budget cost check. Returns
+    True only when a cap is set AND the run's measured ``usage.cost_usd`` is
+    strictly over it — at the cap exactly is allowed, no cap set means never.
+    A missing/unmeasured cost can never trip a cap, and seat runs (spec 09)
+    report ``cost_usd = 0.0``, which no positive cap can exceed. USD only —
+    never a token count."""
+    if max_cost_usd is None:
+        return False
+    cost = usage.get("cost_usd") if isinstance(usage, dict) else None
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return False
+    return float(cost) > float(max_cost_usd)
 
 
 class RunPipeline:
@@ -261,6 +281,7 @@ class RunPipeline:
             "resources": {
                 "timeout_sec": spec.resources.timeout_sec,
                 "max_context_mb": spec.resources.max_context_mb,
+                "max_cost_usd": spec.resources.max_cost_usd,
                 "network": spec.resources.network,
             },
             "input": {
@@ -277,7 +298,8 @@ class RunPipeline:
             "timed_out": bool(result and result.timed_out),
             # spec 07: the enforced budget outcome — wall-clock timeout and
             # injected-context cap. Token usage stays telemetry (usage above),
-            # never a budget.
+            # never a budget. Spec 24 adds the optional USD cost cap
+            # (`max_cost_usd`), enforced finalize-only.
             "budget": budget,
         }
         # spec 22: re-run lineage — this chicken was enqueued by `run_rerun`
@@ -314,9 +336,11 @@ class RunPipeline:
         budget: dict[str, Any] = {
             "timeout_sec": spec.resources.timeout_sec,
             "max_context_mb": spec.resources.max_context_mb,
+            "max_cost_usd": spec.resources.max_cost_usd,
             "injected_context_bytes": None,
             "timed_out": False,
             "context_exceeded": False,
+            "cost_exceeded": False,
             "outcome": "ok",
         }
         # spec 09: auth telemetry for the manifest/audit — mode + token expiry,
@@ -395,25 +419,39 @@ class RunPipeline:
                 await self._event(
                     run_id, "harness", "output", sanitize_log_line(result.raw_output, OUTPUT_EVENT_MAX_LEN)
                 )
-                # spec 04: raw output is untrusted until it passes the job schema
-                schema_path = ctx.spec_path.parent / ctx.spec.output.schema_file
-                outcome = validate_output(result.raw_output, schema_path)
-                if outcome.valid:
-                    await self._store_result(run_id, outcome)
-                    await self._event(
-                        run_id, "validator", "info", f"clutch matches schema {ctx.spec.output.schema_file}"
+                if cost_cap_exceeded(result.usage, spec.resources.max_cost_usd):
+                    # spec 24: finalize-only Feed Budget cost cap — the chicken
+                    # ran to completion, but its measured cost exceeded the
+                    # egg's cap, so the run fails here at finalize (no clutch
+                    # stored, like a timeout); telemetry stays recorded
+                    budget["cost_exceeded"] = True
+                    budget["outcome"] = "cost_cap"
+                    cost = float(result.usage.get("cost_usd") or 0.0)
+                    status, reason = "failed", (
+                        f"feed budget exceeded at finalize: measured cost_usd={cost:.6g}"
+                        f" > max_cost_usd={spec.resources.max_cost_usd:.6g}"
                     )
-                    await self._set_status(run_id, "finalizing")
-                    status, reason = "succeeded", "ok"
+                    await self._event(run_id, "supervisor", "error", reason)
                 else:
-                    await self._quarantine(run_id, result.raw_output, outcome.schema_errors)
-                    await self._event(
-                        run_id,
-                        "validator",
-                        "error",
-                        sanitize_log_line("; ".join(outcome.schema_errors), OUTPUT_EVENT_MAX_LEN),
-                    )
-                    status, reason = "failed", f"clutch failed candling (schema validation): {outcome.schema_errors[0]}"
+                    # spec 04: raw output is untrusted until it passes the job schema
+                    schema_path = ctx.spec_path.parent / ctx.spec.output.schema_file
+                    outcome = validate_output(result.raw_output, schema_path)
+                    if outcome.valid:
+                        await self._store_result(run_id, outcome)
+                        await self._event(
+                            run_id, "validator", "info", f"clutch matches schema {ctx.spec.output.schema_file}"
+                        )
+                        await self._set_status(run_id, "finalizing")
+                        status, reason = "succeeded", "ok"
+                    else:
+                        await self._quarantine(run_id, result.raw_output, outcome.schema_errors)
+                        await self._event(
+                            run_id,
+                            "validator",
+                            "error",
+                            sanitize_log_line("; ".join(outcome.schema_errors), OUTPUT_EVENT_MAX_LEN),
+                        )
+                        status, reason = "failed", f"clutch failed candling (schema validation): {outcome.schema_errors[0]}"
         except Exception as e:
             status, reason = "failed", f"{type(e).__name__}: {e}"
             with contextlib.suppress(Exception):

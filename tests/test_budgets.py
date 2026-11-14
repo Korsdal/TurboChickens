@@ -235,9 +235,11 @@ def test_success_manifest_records_budget_outcome_ok(daemon, tmp_path) -> None:
     assert m["budget"] == {
         "timeout_sec": 30,
         "max_context_mb": 2,
+        "max_cost_usd": None,  # spec 24: no cost cap set by default
         "injected_context_bytes": len(prompt) + len(att),
         "timed_out": False,
         "context_exceeded": False,
+        "cost_exceeded": False,
         "outcome": "ok",
     }
 
@@ -251,6 +253,8 @@ def test_resources_section_has_no_token_cap() -> None:
             {"timeout_sec": 600, "max_context_mb": 2, "network": "none", "max_tokens": 4096}
         )
     assert ("max_tokens",) in [tuple(e["loc"]) for e in exc_info.value.errors()]
-    # the enforced budgets are exactly wall-clock timeout + injected-context cap
+    # the enforced budgets are wall-clock timeout + injected-context cap + the
+    # optional USD cost cap (spec 24) — still no token cap
     res = ResourcesSection.model_validate({"timeout_sec": 600, "max_context_mb": 2, "network": "none"})
-    assert set(res.model_dump()) == {"timeout_sec", "max_context_mb", "network"}
+    assert set(res.model_dump()) == {"timeout_sec", "max_context_mb", "max_cost_usd", "network"}
+    assert res.max_cost_usd is None  # off by default

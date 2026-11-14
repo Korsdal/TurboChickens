@@ -2,8 +2,9 @@
 
 Sections: [job], [trigger], [harness], [resources], [input], [output].
 There is deliberately no ``max_tokens`` knob anywhere — token usage is
-measured telemetry, not a declared budget. Any extra key (including
-``max_tokens``) is rejected with a field-named error.
+measured telemetry, not a declared budget. The only cost control is the
+optional USD cap ``resources.max_cost_usd`` (spec 24), enforced at finalize.
+Any extra key (including ``max_tokens``) is rejected with a field-named error.
 """
 
 from __future__ import annotations
@@ -68,6 +69,9 @@ class HarnessSection(_StrictModel):
 class ResourcesSection(_StrictModel):
     timeout_sec: int = Field(gt=0, description="hard wall-clock kill budget")
     max_context_mb: int = Field(gt=0, description="hard cap on injected context size")
+    # spec 24: optional Feed Budget cost cap in USD (never a token count),
+    # enforced finalize-only. Absent = no cap (off by default).
+    max_cost_usd: float | None = Field(default=None, gt=0.0, description="optional USD cost cap, enforced at finalize")
     network: Literal["none"] = "none"
 
 

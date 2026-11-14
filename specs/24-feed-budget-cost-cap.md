@@ -4,12 +4,12 @@
 
 **Blocked by:** None — specs 05 (cost telemetry from providers) and 08 (usage stats) are landed. Can start immediately.
 
-**Status:** ready-for-agent (split from spec 21 via to-tickets, 2026-11-14)
+**Status:** done (2026-11-14)
 
-- [ ] Spec model: `ResourcesSection` gains `max_cost_usd: float | None = None` (`extra = "forbid"` intact; negative/zero values rejected with a field-named error)
-- [ ] Over cap (e2e, fake provider with priced usage): run fails at finalize with `budget.outcome = "cost_cap"`, manifest carries measured `usage.cost_usd` and the cap; teardown attested as usual
-- [ ] At cap exactly (`cost_usd == max_cost_usd`) → not over → run succeeds (cap is exclusive only when exceeded)
-- [ ] No cap set → behavior unchanged, but `usage.cost_usd` / token telemetry still recorded on the run and visible to stats (spec 08)
-- [ ] Seat runs (`auth = "seat"`, `cost_usd = 0.0`) never trip the cap
-- [ ] Tests: pure seam for the finalize cost-cap check (over / at / no cap / seat-with-cost-0); e2e via fake vibe binary + fake priced provider; full suite green
-- [ ] `STATUS.md` updated at the slice boundary
+- [x] Spec model: `ResourcesSection` gains `max_cost_usd: float | None = None` (`extra = "forbid"` intact; negative/zero values rejected with a field-named error)
+- [x] Over cap (e2e, fake provider with priced usage): run fails at finalize with `budget.outcome = "cost_cap"`, manifest carries measured `usage.cost_usd` and the cap; teardown attested as usual
+- [x] At cap exactly (`cost_usd == max_cost_usd`) → not over → run succeeds (cap is exclusive only when exceeded)
+- [x] No cap set → behavior unchanged, but `usage.cost_usd` / token telemetry still recorded on the run and visible to stats (spec 08)
+- [x] Seat runs (`auth = "seat"`, `cost_usd = 0.0`) never trip the cap
+- [x] Tests: pure seam for the finalize cost-cap check (over / at / no cap / seat-with-cost-0); e2e via fake vibe binary + fake priced provider; full suite green
+- [x] `STATUS.md` updated at the slice boundary
