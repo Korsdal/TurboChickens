@@ -40,7 +40,12 @@ async def request_async(
             with contextlib.suppress(OSError):
                 await writer.wait_closed()
     except OSError as e:
-        raise DaemonUnreachable(f"no coopd at {socket_path}: {e}") from e
+        # spec 32 (G17): this message is served by the coop's dead-socket
+        # payloads, so it never carries the host socket path (the local CLI
+        # knows the configured path from its own settings)
+        raise DaemonUnreachable(
+            f"no coopd answering on the daemon socket: {e.strerror or type(e).__name__}"
+        ) from e
 
 
 def request(socket_path: str | Path, op: str, timeout: float = 5.0, **payload: Any) -> dict[str, Any]:
@@ -52,4 +57,5 @@ def request(socket_path: str | Path, op: str, timeout: float = 5.0, **payload: A
     try:
         return asyncio.run(asyncio.wait_for(_go(), timeout=timeout))
     except asyncio.TimeoutError as e:
-        raise DaemonUnreachable(f"no coopd at {socket_path}: timed out after {timeout}s") from e
+        # spec 32 (G17): path-free — this error is served by the coop layer too
+        raise DaemonUnreachable(f"no coopd answering on the daemon socket: timed out after {timeout}s") from e

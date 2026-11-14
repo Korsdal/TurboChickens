@@ -44,7 +44,12 @@ def load_spec(path: str | Path) -> JobSpec:
     try:
         raw = path.read_bytes()
     except OSError as e:
-        raise SpecValidationError([SpecIssue((), f"cannot read spec file: {e}")]) from e
+        # spec 32 (G17): the issue is served over the socket/HTTP, so it names
+        # the spec file only — never the host absolute path (which stays in
+        # coopd's own log)
+        raise SpecValidationError(
+            [SpecIssue((), f"cannot read spec file {path.name!r}: {e.strerror or type(e).__name__}")]
+        ) from e
     try:
         data = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
@@ -68,7 +73,9 @@ def _check_file_refs(spec_path: Path, spec: JobSpec) -> list[SpecIssue]:
         issues.append(
             SpecIssue(
                 ("output", "schema_file"),
-                f"schema file not found: {spec.output.schema_file!r} (resolved to {schema})",
+                # spec 32 (G17): the spec-relative ref only — the resolved host
+                # path is never embedded in the served error
+                f"schema file not found: {spec.output.schema_file!r} (not present next to the egg)",
             )
         )
     return issues

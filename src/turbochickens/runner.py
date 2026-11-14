@@ -59,6 +59,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import shutil
 import sqlite3
 from pathlib import Path
@@ -85,8 +86,12 @@ from turbochickens.settings import Settings
 from turbochickens.spec.loader import load_spec
 from turbochickens.spec.model import JobSpec
 from turbochickens.stats import rollup_usage
-from turbochickens.util import utcnow_iso
+from turbochickens.util import display_relpath, redact_host_paths, utcnow_iso
 from turbochickens.validate import OutputValidation, validate_output
+
+#: coopd's own log (stderr of the daemon process) — the full, unredacted detail
+#: of a failure stays here; only the redacted form is ever served (spec 32, G17)
+_log = logging.getLogger("turbochickens.coopd")
 
 #: terminal states — every one requires a teardown attestation (baseline §5).
 #: spec 22 adds `cancelled` (queued egg pulled from the pecking order) and
@@ -160,6 +165,12 @@ class RunPipeline:
         that were signalled."""
         return [run_id for run_id in sorted(self._active_free_range) if self.request_stop(run_id)]
 
+    def _path_roots(self, ctx: RunContext) -> tuple[Path, ...]:
+        """Spec 32 (G17): the roots redacted from served text — the data dir
+        (workspaces, uploads, results all live under it) and the egg's own
+        directory (a CLI-run egg may live anywhere on the host)."""
+        return (Path(self.settings.data_dir), Path(ctx.spec_path).parent)
+
     # --- db helpers -------------------------------------------------------
 
     async def _event(self, run_id: str, source: str, level: str, line: str) -> None:
@@ -212,7 +223,9 @@ class RunPipeline:
                         {
                             "attachment": att,
                             "run_id": clutch.run_id,
-                            "artifact_path": clutch.artifact_path,
+                            # spec 32 (G17): the manifest/Headcount carry the
+                            # data-dir-relative artifact path, never the host path
+                            "artifact_path": display_relpath(clutch.artifact_path, self.settings.data_dir),
                             "size_bytes": len(clutch.data),
                         }
                     )
@@ -246,7 +259,12 @@ class RunPipeline:
             )
             self.db.commit()
         self.audit.append(
-            {"event": "clutch.stored", "run_id": run_id, "artifacts_dir": str(artifacts_dir)}
+            {
+                "event": "clutch.stored",
+                "run_id": run_id,
+                # spec 32 (G17): no `artifacts_dir` in Headcount rows — the
+                # on-disk location is daemon-internal state (DB column stays)
+            }
         )
 
     async def _quarantine(self, run_id: str, raw_output: str, schema_errors: list[str]) -> None:
@@ -270,7 +288,7 @@ class RunPipeline:
             {
                 "event": "clutch.quarantined",
                 "run_id": run_id,
-                "artifacts_dir": str(qdir),
+                # spec 32 (G17): no `artifacts_dir` in Headcount rows
                 "schema_errors": schema_errors,
             }
         )
@@ -367,7 +385,9 @@ class RunPipeline:
             "started_at": item.get("started_at"),
             "finished_at": utcnow_iso(),
             "usage": result.usage if result else {"tokens_in": 0, "tokens_out": 0},
-            "workspace": str(ctx.workspace),
+            # spec 32 (G17): the manifest never embeds the host workspace
+            # path — a data-dir-relative identifier only
+            "workspace": display_relpath(ctx.workspace, self.settings.data_dir),
             "env_keys": sorted(ctx.env.keys()),
             "status": status,
             "status_reason": reason,
@@ -496,7 +516,13 @@ class RunPipeline:
                 provision_error = str(e)
                 budget["injected_context_bytes"] = e.injected_bytes
                 status, reason = "failed", f"provisioning failed: {e}"
-                await self._event(run_id, "supervisor", "error", sanitize_log_line(reason))
+                # spec 32 (G17): the served event line is redacted of host paths
+                await self._event(
+                    run_id,
+                    "supervisor",
+                    "error",
+                    sanitize_log_line(redact_host_paths(reason, *self._path_roots(ctx))),
+                )
             cap_bytes = spec.resources.max_context_mb * 1024 * 1024
             if provision_error is not None:
                 pass  # chaining resolution failed — status/reason set above
@@ -589,7 +615,9 @@ class RunPipeline:
                 else:
                     # spec 04: raw output is untrusted until it passes the job schema
                     schema_path = ctx.spec_path.parent / ctx.spec.output.schema_file
-                    outcome = validate_output(result.raw_output, schema_path)
+                    # spec 32 (G17): schema errors report the spec-relative
+                    # schema name, never the host path
+                    outcome = validate_output(result.raw_output, schema_path, schema_name=ctx.spec.output.schema_file)
                     if outcome.valid:
                         await self._store_result(run_id, outcome)
                         await self._event(
@@ -607,9 +635,18 @@ class RunPipeline:
                         )
                         status, reason = "failed", f"clutch failed candling (schema validation): {outcome.schema_errors[0]}"
         except Exception as e:
-            status, reason = "failed", f"{type(e).__name__}: {e}"
+            # spec 32 (G17): an OSError here can carry host paths (workspace,
+            # egg dir) — the full detail goes to coopd's own log (stderr), the
+            # served reason/event get the redacted form
+            _log.error("chicken %s failed: %s: %s", run_id, type(e).__name__, e)
+            status, reason = "failed", redact_host_paths(f"{type(e).__name__}: {e}", *self._path_roots(ctx))
             with contextlib.suppress(Exception):
-                await self._event(run_id, "supervisor", "error", sanitize_log_line(str(e)))
+                await self._event(
+                    run_id,
+                    "supervisor",
+                    "error",
+                    sanitize_log_line(redact_host_paths(str(e), *self._path_roots(ctx))),
+                )
         finally:
             self._active.pop(run_id, None)
             self._active_free_range.discard(run_id)
@@ -777,6 +814,10 @@ class RunPipeline:
         """Manifest + terminal status + teardown attestation + audit rows.
         Runs for every path out of `execute`, including exceptions."""
         run_id = ctx.run_id
+        # spec 32 (G17): one choke point — the terminal reason is redacted of
+        # host paths before it lands in the manifest, the runs row (surfaced
+        # by runs_list), or any Headcount row; full detail is in coopd's log
+        reason = redact_host_paths(reason, *self._path_roots(ctx))
         manifest = self._manifest(item, ctx, harness, result, status, reason, budget, auth, chaining)
         # teardown first: destruction is verified, not assumed
         try:
@@ -784,7 +825,12 @@ class RunPipeline:
         except Exception as e:
             report = TeardownReport(process_reaped=False, workspace_removed=False, env_cleared=False)
             with contextlib.suppress(Exception):
-                await self._event(run_id, "supervisor", "error", f"teardown error: {e}")
+                await self._event(
+                    run_id,
+                    "supervisor",
+                    "error",
+                    f"teardown error: {redact_host_paths(str(e), *self._path_roots(ctx))}",
+                )
         async with self._db_lock:
             self.db.execute(
                 "UPDATE runs SET status = ?, finished_at = ?, manifest_json = ?, usage_json = ? WHERE id = ?",

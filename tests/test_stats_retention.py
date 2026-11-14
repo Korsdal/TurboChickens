@@ -255,7 +255,7 @@ def test_retention_sweep_expires_old_results_and_audit_logs_each_deletion(daemon
     settings = daemon.settings
     run = wait_terminal(settings.socket_path, run_id)
     assert run["status"] == "succeeded"
-    artifacts = Path(run["result"]["artifacts_dir"])
+    artifacts = settings.results_dir / run_id  # served payload drops artifacts_dir (spec 32 G17)
     assert artifacts.exists() and (artifacts / "output.json").exists()
     audit_before = AuditLog(settings.audit_log_path).read_all()
 
@@ -331,7 +331,7 @@ schema_file = "schemas/out.schema.json"
     settings = daemon.settings
     run = wait_terminal(settings.socket_path, run_id)
     assert run["status"] == "failed" and run["result"]["valid"] is False
-    qdir = Path(run["result"]["artifacts_dir"])
+    qdir = settings.quarantine_dir / run_id  # spec 32 (G17): derived locally, not served
     assert qdir.exists() and (qdir / "raw_output.txt").exists()
 
     backdate_run(settings, run_id, months_ago_iso(7))
@@ -361,7 +361,7 @@ def test_retention_respects_custom_results_retention_months(tmp_path, monkeypatc
         assert result.exit_code == 0, combined_output(result)
         run_id = run_id_of(result)
         run = wait_terminal(settings.socket_path, run_id)
-        artifacts = Path(run["result"]["artifacts_dir"])
+        artifacts = settings.results_dir / run_id  # spec 32 (G17)
         assert artifacts.exists()
         backdate_run(settings, run_id, months_ago_iso(2))
         resp = request(settings.socket_path, "retention_sweep", timeout=5.0)
@@ -372,7 +372,7 @@ def test_retention_respects_custom_results_retention_months(tmp_path, monkeypatc
         result2 = runner.invoke(app, ["run", str(spec_path2), "--wait"])
         assert result2.exit_code == 0, combined_output(result2)
         run2 = wait_terminal(settings.socket_path, run_id_of(result2))
-        assert Path(run2["result"]["artifacts_dir"]).exists()
+        assert (settings.results_dir / run_id_of(result2)).exists()  # spec 32 (G17)
         resp2 = request(settings.socket_path, "retention_sweep", timeout=5.0)
         assert resp2["deleted"] == 0
     finally:
@@ -386,7 +386,7 @@ def test_daemon_startup_sweeps_expired_results_automatically(daemon, tmp_path) -
     run_id = run_id_of(result)
     settings = daemon.settings
     run = wait_terminal(settings.socket_path, run_id)
-    artifacts = Path(run["result"]["artifacts_dir"])
+    artifacts = settings.results_dir / run_id  # spec 32 (G17)
     assert artifacts.exists()
     backdate_run(settings, run_id, months_ago_iso(8))
     daemon.stop()  # restart on the same data dir: the startup sweep must fire

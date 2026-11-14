@@ -118,7 +118,9 @@ def test_jobs_upload_socket_valid_bundle_stored_and_enqueueable(coop_daemon, fak
     events = AuditLog(coop_daemon.settings.audit_log_path).read_all()
     uploaded = [e for e in events if e["event"] == "egg.candled"]
     assert len(uploaded) == 1 and uploaded[0]["job_id"] == "upload-job"
-    assert uploaded[0]["spec_path"] == resp["spec_path"] and uploaded[0]["size_bytes"] > 0
+    # spec 32 (G17): the Headcount row carries the data-dir-relative path only
+    assert uploaded[0]["spec_path"] == (upload_dir / "job.toml").resolve().relative_to(coop_daemon.settings.data_dir.resolve()).as_posix()
+    assert uploaded[0]["size_bytes"] > 0
 
 
 # --- socket op: invalid bundle → field-named errors, nothing stored -----------

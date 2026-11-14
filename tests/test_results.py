@@ -197,7 +197,7 @@ def test_valid_output_stored_and_results_get_returns_it(daemon, tmp_path) -> Non
     resp = request(sock, "results_get", run_id=run_id, timeout=2.0)
     assert resp["ok"] is True and resp["valid"] is True
     assert resp["output"] == payload
-    assert resp["artifacts_dir"] == str(artifacts)
+    assert "artifacts_dir" not in resp  # spec 32 (G17): never served (the dir is on disk above)
 
     # CLI prints the validated result as JSON
     result = runner.invoke(app, ["results", "get", run_id])
