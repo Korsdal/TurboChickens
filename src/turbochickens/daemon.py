@@ -222,11 +222,10 @@ class Daemon:
         self.cron = CronScheduler(fire=self._cron_fire)
         self.cron.start()
         self._load_schedules()
-        self._server = await asyncio.start_unix_server(
-            self._handle_client, path=str(s.socket_path), limit=SOCKET_STREAM_LIMIT
-        )
-        os.chmod(s.socket_path, 0o600)
-        # spec 12: coop — serve the GUI over HTTP in this same event loop
+        # spec 12: coop — serve the GUI over HTTP in this same event loop.
+        # Started before the socket accepts, so a ping OK implies the whole
+        # HTTP surface (incl. the spec-26 Farmhand MCP endpoint) is up and
+        # its startup audit row is already in the Headcount.
         if s.coop_enabled:
             from turbochickens.coop import CoopServer  # lazy: coop imports client, client imports this module
 
@@ -240,6 +239,10 @@ class Daemon:
                     # the token itself is never audited — printed once to stdout only
                 }
             )
+        self._server = await asyncio.start_unix_server(
+            self._handle_client, path=str(s.socket_path), limit=SOCKET_STREAM_LIMIT
+        )
+        os.chmod(s.socket_path, 0o600)
         serve_task = asyncio.create_task(self._server.serve_forever())
         stop_task = asyncio.create_task(self._stop.wait())
         self._sched_task = asyncio.create_task(self._scheduler())

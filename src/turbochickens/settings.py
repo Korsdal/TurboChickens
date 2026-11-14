@@ -20,7 +20,7 @@ import tomllib
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 SETTINGS_ENVVAR = "TURBOCHICKENS_SETTINGS"
 DEFAULT_DATA_DIR = Path("~/.turbochickens").expanduser()
@@ -63,6 +63,21 @@ class Settings(BaseModel):
         "non-loopback; when unset there, an ephemeral token is generated at startup and "
         "printed once to stdout. Never written to the audit log.",
     )
+
+    # spec 26 (Farmhand): the MCP server over the farm's own socket ops —
+    # farmhand_transport picks the served transport(s) ("stdio" for
+    # same-machine agents gated by the 0600 socket, "https" for the
+    # streamable-HTTP endpoint on the coop listener, "both" = the two at
+    # once), and farmhand_https_path is that endpoint's path
+    farmhand_transport: Literal["stdio", "https", "both"] = "both"
+    farmhand_https_path: str = Field(default="/mcp", min_length=2)
+
+    @field_validator("farmhand_https_path")
+    @classmethod
+    def _farmhand_https_path_shape(cls, v: str) -> str:
+        if not v.startswith("/") or "//" in v or ".." in v or "\\" in v or v.endswith("/"):
+            raise ValueError("farmhand_https_path must be a single absolute path segment like /mcp")
+        return v
 
     @property
     def coop_url(self) -> str:
@@ -134,6 +149,8 @@ class Settings(BaseModel):
             "coop_host": self.coop_host,
             "coop_port": self.coop_port,
             "coop_url": self.coop_url,
+            "farmhand_transport": self.farmhand_transport,
+            "farmhand_https_path": self.farmhand_https_path,
         }
 
 

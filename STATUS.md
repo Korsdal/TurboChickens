@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-14, after spec 23 landed (Free-Range chickens — `resources.free_range = true` removes the hard wall-clock kill: `timeout_sec` becomes optional (`int | None`, `gt=0`, `validate_default=True`) with the pairing enforced at spec load (`free_range = false` — the default — requires `timeout_sec > 0`, field-named `resources.timeout_sec` error; `free_range = true` allows it absent and never hard-kills even if present; `extra="forbid"` intact; `spec_hash` drops `free_range=false` so pre-23 egg hashes are unchanged, the shipped example still `sha256:18efbd8c…80b959`); adapters take `timeout_sec: int | None` (`None` = no hard kill — `wait_for(..., None)` waits forever, the API adapter keeps only its 10s connect timeout); the Hatchery enforces `hard_timeout = None if free_range else timeout_sec` and the manifest `resources` + `budget` blocks gain `free_range`; a Free-Range chicken dies only via `run_stop` (spec 22) or daemon shutdown — on shutdown the daemon calls `pipeline.request_stop_free_range()` before the bounded drain, so an in-flight free-range chicken ends `stopped` via the SIGTERM/hard-kill path with attestation (1,1,1) + `chicken.stopped`/`abattoir.attested` audit rows before exit; decision-log amendment for baseline invariants 1/2 recorded in `specs/23-free-range-chickens.md` + §5 below; full suite green, 353 passed (340 + 13 new tests/test_free_range.py)). Same day: spec 25 landed (chaining — `attachments = ["nestbox://<run_id>/output.json"]` in `[input]`: URI shape validated at spec load with field-named errors (`input.attachments`), resolved at provisioning from the Nest Box via the new `chaining.py` seam — valid clutches only, quarantined/composted/missing/malformed → fail-closed provisioning failure before `running` with attested teardown (1,1,1) and no results row; resolved clutch bytes count toward `max_context_mb` (over-cap chain → `budget.outcome = "context_cap"` exactly like spec 07); lineage in the manifest `chaining` block (run id + artifact path + bytes) + `clutch.consumed` Headcount rows + a run-log line; `jobs_upload` bundles no longer need nestbox attachments shipped in them; lexicon gained Chaining; full suite green, 340 passed). Same day earlier: spec 24 landed (Feed Budget cost cap — optional per-egg `resources.max_cost_usd` in USD, off by default, enforced finalize-only: over cap → run failed with `budget.outcome = "cost_cap"` in the existing manifest budget block, cost/token telemetry still recorded, teardown attested as usual; pure seam `cost_cap_exceeded`; full suite green, 307 passed). Same day earlier: spec 22 landed (lifecycle ops — socket ops `run_stop`/`run_rerun`, CLI `tc runs stop`/`tc runs rerun`, terminal states `cancelled`/`stopped` with attested teardown on every stop path, `egg.cancelled`/`chicken.stopped` Headcount rows, `rerun_of` lineage, lexicon terms added first; full suite green, 298 passed). Same day earlier: spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier then: 22, 24, 25); still no code changed.
+**Last updated:** 2026-11-14, after spec 26 landed (the Farmhand — new module `farmhand.py`: an MCP server on the official `mcp` Python SDK (new dependency, version bumped 0.0.17 → 0.0.18) whose 17 tools are thin wrappers over the daemon's existing socket ops via `client.request_async` — `status`, `jobs_list`, `jobs_validate` (wraps `jobs_upload`: candle a files bundle or a local `spec_path`), `enqueue`, `runs_list`, `runs_show`, `runs_logs`, `results_get`, `run_stop`, `run_rerun`, `schedule_add`/`schedule_list`/`schedule_rm`, `stats_list`/`stats_show`, `audit_tail`, `settings_get` — served over stdio (`tc farmhand serve --transport stdio|https|both`, informational output on stderr only so the protocol channel stays clean) and/or HTTPS (streamable-HTTP at `farmhand_https_path`, default `/mcp`, mounted into the coop's aiohttp listener via a small ASGI bridge `asgi_request` + the SDK's Starlette app with its lifespan run — no second port — behind the same bearer middleware as `/api/*`, loopback-open rule included, ephemeral token printed once like coop); settings gained `farmhand_transport` (`"stdio"|"https"|"both"`, default `"both"`) and `farmhand_https_path` (single absolute path segment, default `/mcp`) with `extra="forbid"` intact and both exposed in `public_dict()`; MCP scope is narrower than the GUI bearer — no `auth_*` ops, no `retention_sweep`, no `shutdown`/`ping`/raw `jobs_upload`, settings read-only; no tool payload ever contains token material (asserted with a configured token over both transports, and against the audit log); `"both"` serves stdio and HTTPS simultaneously in one `tc farmhand serve` process (when the stdio client hangs up the process exits); coopd binds its unix socket only after the coop (and the Farmhand endpoint) is up, so a ping OK implies the HTTP surface is up and its `coop.started` row is already audited; the coop/standalone aiohttp runners got `shutdown_timeout=15` so a hung MCP SSE stream can never wedge shutdown; full suite green, 362 passed (353 + 9 new tests/test_farmhand.py)). Same day earlier: spec 23 landed (Free-Range chickens — `resources.free_range = true` removes the hard wall-clock kill: `timeout_sec` becomes optional (`int | None`, `gt=0`, `validate_default=True`) with the pairing enforced at spec load (`free_range = false` — the default — requires `timeout_sec > 0`, field-named `resources.timeout_sec` error; `free_range = true` allows it absent and never hard-kills even if present; `extra="forbid"` intact; `spec_hash` drops `free_range=false` so pre-23 egg hashes are unchanged, the shipped example still `sha256:18efbd8c…80b959`); adapters take `timeout_sec: int | None` (`None` = no hard kill — `wait_for(..., None)` waits forever, the API adapter keeps only its 10s connect timeout); the Hatchery enforces `hard_timeout = None if free_range else timeout_sec` and the manifest `resources` + `budget` blocks gain `free_range`; a Free-Range chicken dies only via `run_stop` (spec 22) or daemon shutdown — on shutdown the daemon calls `pipeline.request_stop_free_range()` before the bounded drain, so an in-flight free-range chicken ends `stopped` via the SIGTERM/hard-kill path with attestation (1,1,1) + `chicken.stopped`/`abattoir.attested` audit rows before exit; decision-log amendment for baseline invariants 1/2 recorded in `specs/23-free-range-chickens.md` + §5 below; full suite green, 353 passed (340 + 13 new tests/test_free_range.py)). Same day: spec 25 landed (chaining — `attachments = ["nestbox://<run_id>/output.json"]` in `[input]`: URI shape validated at spec load with field-named errors (`input.attachments`), resolved at provisioning from the Nest Box via the new `chaining.py` seam — valid clutches only, quarantined/composted/missing/malformed → fail-closed provisioning failure before `running` with attested teardown (1,1,1) and no results row; resolved clutch bytes count toward `max_context_mb` (over-cap chain → `budget.outcome = "context_cap"` exactly like spec 07); lineage in the manifest `chaining` block (run id + artifact path + bytes) + `clutch.consumed` Headcount rows + a run-log line; `jobs_upload` bundles no longer need nestbox attachments shipped in them; lexicon gained Chaining; full suite green, 340 passed). Same day earlier: spec 24 landed (Feed Budget cost cap — optional per-egg `resources.max_cost_usd` in USD, off by default, enforced finalize-only: over cap → run failed with `budget.outcome = "cost_cap"` in the existing manifest budget block, cost/token telemetry still recorded, teardown attested as usual; pure seam `cost_cap_exceeded`; full suite green, 307 passed). Same day earlier: spec 22 landed (lifecycle ops — socket ops `run_stop`/`run_rerun`, CLI `tc runs stop`/`tc runs rerun`, terminal states `cancelled`/`stopped` with attested teardown on every stop path, `egg.cancelled`/`chicken.stopped` Headcount rows, `rerun_of` lineage, lexicon terms added first; full suite green, 298 passed). Same day earlier: spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier then: 22, 24, 25); still no code changed.
 
 ---
 
@@ -27,7 +27,7 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10, specs 12–20, and specs 22–25 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, the spec-20 commit, the spec-22 commit, the spec-23 commit, the spec-24 commit, and the spec-25 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
+**Spec 01 through spec 10, specs 12–20, and specs 22–26 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, the spec-20 commit, the spec-22 commit, the spec-23 commit, the spec-24 commit, the spec-25 commit, and the spec-26 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
 
 Spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality. Spec 19 gave seat auth a GUI surface (see below).
 Verified this session:
@@ -289,6 +289,27 @@ Verified this session:
 #     attestation (1,1,1); audit chicken.stopped + abattoir.attested + coopd.stopped; no results rows
 #   → fenced control (timeout_sec=1, SLEEP 30) → failed budget.outcome=timeout as today
 #   → full suite: 353 passed (340 + 13 new tests/test_free_range.py)
+# spec-26 smoke (subprocess daemon on a temp socket + fake vibe binary; MCP driven by the SDK's own client):
+#   → `tc farmhand serve --transport stdio` subprocess + mcp stdio_client: list_tools = the exact 17-tool
+#     surface (no auth_*/retention_sweep/shutdown/ping/jobs_upload); status == socket status (uptime aside);
+#     jobs_list/runs_list/runs_show/runs_logs/results_get/settings_get/audit_tail/schedule_list/stats_list
+#     MCP payloads == socket payloads; enqueue <job> → succeeded; results_get → validated JSON
+#     ("hello from fake vibe"); jobs_validate by files bundle and by spec_path → valid + stored under
+#     uploads/, enqueueable by the returned spec_path; schedule_add/list/rm round-trip; run_stop on a
+#     queued egg (budget 1) → cancelled "never hatched"; run_rerun → fresh succeeded run with rerun_of;
+#     settings_get shows farmhand_transport=both farmhand_https_path=/mcp and never the coop token;
+#     with coop_auth_token configured, no tool payload (nor the audit log) contains it
+#   → `tc coop start` subprocess with coop_auth_token: POST /mcp initialize → 401 without bearer, 200 with;
+#     SDK streamable-HTTP client with the bearer: 17 tools, enqueue → succeeded → results_get over HTTPS
+#     == socket results_get; token absent from all sampled tool payloads
+#   → loopback + no token: POST /mcp initialize → 200 (open, like /api/*); farmhand_transport="stdio" →
+#     /mcp not mounted (404/405) while the GUI still serves
+#   → 0.0.0.0 + no token: ephemeral "coop auth token:" line printed exactly once; /mcp → 401 without the
+#     bearer, 200 + MCP tools with it; /api/ping stays open; token never in payloads/audit
+#   → `tc farmhand serve --transport both`: stdio session (tools + enqueue → results_get) and the HTTPS
+#     endpoint answer simultaneously; when the stdio client hangs up the process exits (port refuses)
+#   → tc --help shows farmhand; tc jobs validate examples/weekly-incidents-digest/job.toml →
+#     sha256:18efbd8c…80b959 (unchanged); full suite: 362 passed (353 + 9 new tests/test_farmhand.py)
 ```
 
 What exists:
@@ -302,7 +323,10 @@ src/turbochickens/
 │                          # spec 13: public_dict() — effective settings for the GUI, coop_auth_token omitted;
 │                          # spec 15: uploads_dir + UPLOAD_MAX_BYTES (10 MiB bundle cap),
 │                          # UPLOAD_MAX_HTTP_BODY (aiohttp client_max_size backstop),
-│                          # SOCKET_STREAM_LIMIT (one JSON-lines request may carry a whole bundle)
+│                          # SOCKET_STREAM_LIMIT (one JSON-lines request may carry a whole bundle);
+│                          # spec 26: farmhand_transport ("stdio"|"https"|"both", default "both") +
+│                          # farmhand_https_path (single absolute path segment, default "/mcp"),
+│                          # both exposed in public_dict()
 ├── coop.py                # spec 12: CoopServer — aiohttp HTTP server inside the daemon's event loop;
 │                          # /api/ping (unauthenticated healthcheck) + /api/status (bearer unless loopback+
 │                          # no token; ephemeral token minted+printed once when non-loopback and none
@@ -333,7 +357,13 @@ src/turbochickens/
 │                          # /api/auth/login/status (auth_login_poll — pending/authorized/expired),
 │                          # POST /api/auth/logout (auth_logout) — 200 ok / 422 refused / 400
 │                          # malformed / 200 {daemon.up=false} when the socket is dead; all behind
-│                          # the bearer middleware like every /api/* op
+│                          # the bearer middleware like every /api/* op;
+│                          # spec 26: when farmhand_transport includes "https", the Farmhand MCP
+│                          # endpoint (streamable-HTTP at farmhand_https_path) is mounted on this
+│                          # same listener via farmhand.FarmhandHTTP + the asgi_request bridge,
+│                          # behind the same bearer middleware (loopback-open rule included);
+│                          # AppRunner runs with shutdown_timeout=15 so a hung MCP SSE stream
+│                          # cannot wedge daemon shutdown
 │   └── coop_static/       # the dependency-free SPA (index.html + app.js + styles.css + lucide icons as
 │                          # local SVGs, no build step, no runtime CDN): 240px sidebar shell, wordmark +
 │                          # egg dot, nav, login card (sessionStorage bearer, no cookies), Dashboard with
@@ -372,6 +402,20 @@ src/turbochickens/
 │                          # spec 20: LEGACY_EVENT_ALIASES maps pre-20 event names to lexicon names on
 │                          # read/display only (tail() normalizes + matches old and new names; read_all()
 │                          # and the raw file stay untouched)
+├── farmhand.py            # spec 26: the Farmhand — MCP server (official `mcp` SDK, MCPServer) whose
+│                          # 17 tools are thin wrappers over the daemon's socket ops via
+│                          # client.request_async (status, jobs_list, jobs_validate→jobs_upload,
+│                          # enqueue, runs_list, runs_show, runs_logs, results_get, run_stop,
+│                          # run_rerun, schedule_add/list/rm, stats_list/show, audit_tail,
+│                          # settings_get — no auth_*, no retention_sweep, no shutdown; settings
+│                          # read-only); tool results are the socket responses verbatim, daemon-down
+│                          # → {ok:false, daemon.up:false}; spec_bundle_b64 reads a local spec_path
+│                          # into a jobs_upload bundle; asgi_request bridges aiohttp→ASGI so the
+│                          # SDK's streamable-HTTP Starlette app mounts into the coop listener;
+│                          # FarmhandHTTP owns that endpoint (path, coop bearer rule, ASGI lifespan);
+│                          # serve_stdio / serve_https / serve_transport power
+│                          # `tc farmhand serve --transport stdio|https|both` ("both" = the two at
+│                          # once in one process; when the stdio client hangs up, it exits)
 ├── chaining.py            # spec 25: chaining — `nestbox://<run_id>/output.json` attachments: the URI-shape
 │                          # seams (parse_nestbox_uri / is_nestbox_uri / looks_like_uri — exactly
 │                          # nestbox://<run_id>/output.json, anything else URI-shaped is a spec-load error),
@@ -490,7 +534,10 @@ src/turbochickens/
 │                          # spec 23 (Free-Range): on shutdown, serve() calls
 │                          # pipeline.request_stop_free_range() before the bounded drain, so an
 │                          # in-flight free-range chicken is stopped via the spec-22 path (SIGTERM →
-│                          # hard kill → terminal `stopped`, attested (1,1,1)) before exit
+│                          # hard kill → terminal `stopped`, attested (1,1,1)) before exit;
+│                          # spec 26: with coop_enabled, the coop (incl. the Farmhand MCP endpoint)
+│                          # is started BEFORE the unix socket accepts, so a ping OK implies the
+│                          # HTTP surface is up and its coop.started row is already audited
 ├── client.py              # request(socket, op, **payload) → parsed response; DaemonUnreachable;
 │                          # spec 12: request_async(...) — the same exchange awaitable inside a running
 │                          # loop (used by the coop web layer's SocketTransport); spec 15: the stream
@@ -523,7 +570,10 @@ src/turbochickens/
                            # jobs validate (spec 10: model checks) | daemon start/stop | status |
                            # schedule add/list/rm | stats list/show (spec 08) |
                            # auth login/status/logout (spec 09, local) | models list (spec 10, local) |
-                           # coop start (spec 12: daemon with the GUI forced on; status prints coop:)
+                           # coop start (spec 12: daemon with the GUI forced on; status prints coop:) |
+                           # farmhand serve --transport stdio|https|both (spec 26: the Farmhand MCP
+                           # server; --transport defaults to the farmhand_transport setting; stdio is a
+                           # protocol channel so informational output goes to stderr only)
 tests/
 ├── test_spec_model.py     # pure-function seam: parser/model/hash
 ├── test_cli_validate.py   # CLI seam: tc jobs validate behavior
@@ -656,13 +706,27 @@ tests/
                            # running, attested (1,1,1), no results row, workspace gone); over-cap chain →
                            # budget.outcome=context_cap; jobs_upload accepts a nestbox:// attachment
                            # without shipping it in the bundle and the uploaded job runs chained
+└── test_farmhand.py        # spec 26: the Farmhand MCP server — the farmhand settings block pure seam
+                           # (defaults both//mcp, enum + extra=forbid + path shape, public_dict), the
+                           # CLI --transport validation, and e2e with a real MCP client (the SDK's
+                           # stdio_client / streamable_http_client): stdio against `tc farmhand serve`
+                           # (exact 17-tool surface — no auth_*/retention_sweep/shutdown/jobs_upload —
+                           # with MCP payloads == socket payloads for every op, enqueue→succeeded→
+                           # results_get, jobs_validate by files and by spec_path, schedules, run_stop
+                           # on a queued egg → cancelled + run_rerun → succeeded, secrecy with a
+                           # configured coop token), HTTPS on a `tc coop start` subprocess (401 without
+                           # the bearer / 200 + MCP with it, loopback-open without a token, /mcp not
+                           # mounted when farmhand_transport="stdio", non-loopback ephemeral token
+                           # gating /mcp and never appearing in any tool payload or the audit log), and
+                           # `--transport both` serving stdio and HTTPS simultaneously in one process
 examples/weekly-incidents-digest/   # baseline-format example job (job.toml, prompt, schema, csv; mistral-api)
 examples/hello-vibe-cli/            # manual vibe-cli example job (job.toml, prompt, schema)
 examples/providers.toml             # spec 05 reference provider registry (mistral presets + pricing,
                            # commented other-provider example) — copy to ~/.turbochickens/providers.toml
-pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.17, deps: pydantic, typer, rich, croniter,
+pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.18, deps: pydantic, typer, rich, croniter,
                            # jsonschema (+ rfc3339-validator for format checks), httpx, apscheduler (spec 06),
-                           # aiohttp (spec 12, coop web server); dev: pytest
+                           # aiohttp (spec 12, coop web server), mcp (spec 26, the Farmhand MCP server);
+                           # dev: pytest
 Dockerfile                 # spec 18: the coop image — python:3.12-slim, pip install . (the wheel ships
                            # the SPA), ships docker/settings.toml → /etc/turbochickens/settings.toml via
                            # $TURBOCHICKENS_SETTINGS, PYTHONUNBUFFERED=1, VOLUME ["/data"], EXPOSE 8737,
@@ -1165,6 +1229,7 @@ Spec-18 deliverables, concretely:
 | 23 | Free-Range chickens — `resources.free_range = true` removes the hard TTL (`timeout_sec` optional, pairing validated); death only by `run_stop` or daemon shutdown, both attested | **done** (2026-11-14) | 22 |
 | 24 | Feed Budget cost cap — `resources.max_cost_usd` (USD, off by default, finalize-only `budget.outcome = "cost_cap"`, telemetry always recorded) | **done** (2026-11-14) | 05, 08 |
 | 25 | Chaining — `nestbox://<run_id>/output.json` attachments resolved from the Nest Box at provisioning (valid clutches only), counted toward the context cap, lineage in manifest/audit | **done** (2026-11-14) | 04, 07 |
+| 26 | The Farmhand — MCP server over the farm's own socket ops (stdio + HTTPS on the coop listener, bearer-gated; `tc farmhand serve --transport stdio|https|both`; `farmhand_transport`/`farmhand_https_path` settings) | **done** (2026-11-14) | 22, 12–19 |
 
 ## 5. Non-negotiable invariants (baseline v0.2 — do not regress these)
 
@@ -1243,7 +1308,7 @@ terminal state still requires the teardown attestation. Full text:
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 - **Version management is a human responsibility.** Coding agents can bump the
   last part of a version number (`0.0.X`) — every other bump (minor, major) is
-  human initiated. Current version: `0.0.17`.
+  human initiated. Current version: `0.0.18`.
 - **No agent as a contributor on GitHub.** See the commits bullet above: the
   `Co-Authored-By` agent trailer is what made GitHub list `mistral-vibe` as a
   contributor — it is banned from commits; humans only in the contributor
@@ -1427,6 +1492,33 @@ invariants-1/2 decision-log amendment is recorded in
 binary (no-kill past any TTL while a fenced control times out, attested
 `run_stop`, attested shutdown teardown in a subprocess daemon), full suite
 353 passed.
+
+Spec 26 (the Farmhand) landed: `farmhand.py` serves an MCP server (official
+`mcp` SDK, new dependency; version 0.0.18) whose 17 tools are thin wrappers
+over the daemon's existing socket ops via `client.request_async` — tool
+results are the socket responses verbatim, and a dead daemon answers
+`{ok:false, daemon.up:false}`. Transports: stdio via
+`tc farmhand serve --transport stdio|https|both` (same-machine agents, gated by
+the 0600 daemon socket; informational output on stderr only), and HTTPS as
+streamable-HTTP at `farmhand_https_path` (default `/mcp`) mounted into the
+coop's existing aiohttp listener through a small ASGI bridge (the SDK's
+Starlette app with its lifespan run) behind the same bearer middleware as
+`/api/*` — 401 without the bearer when non-loopback or a token is configured,
+loopback-open otherwise, ephemeral token printed exactly once. `"both"` serves
+stdio and HTTPS simultaneously in one process. Settings gained
+`farmhand_transport` (`stdio|https|both`, default `both`) and
+`farmhand_https_path`, `extra="forbid"` intact, both in `public_dict()`. The
+MCP scope is narrower than the GUI bearer: no `auth_*` mutations, no
+`retention_sweep`, no `shutdown`, settings read-only — and no tool payload
+ever contains token material (asserted over both transports and against the
+audit log). Also hardened: coopd now binds its unix socket only after the coop
+(and the Farmhand endpoint) is up, and the aiohttp runners run with
+`shutdown_timeout=15` so a hung MCP SSE stream can never wedge shutdown.
+Verified e2e with the SDK's own MCP client over stdio against
+`tc farmhand serve` and over HTTPS against a `tc coop start` subprocess
+(bearer 401/200, loopback-open, ephemeral-token mode, MCP==socket payload
+parity for every tool, enqueue→succeeded→results_get, run_stop/run_rerun,
+jobs_validate, schedules), full suite 362 passed.
 
 The MVP spec pipeline (01–10) and the GUI spec 11 slices (12–20) are
 complete; what remains is the post-MVP roadmap in baseline §13.

@@ -48,10 +48,17 @@ to stdout. 401 without ``Authorization: Bearer …``; the SPA shows a login card
 ``/api/ping`` stays unauthenticated for the container healthcheck. No cookies;
 the browser keeps the token in sessionStorage only. The token is never written
 to the audit log.
+
+Spec 26 (the Farmhand): when ``farmhand_transport`` includes ``"https"``, this
+same listener also serves the Farmhand MCP endpoint — streamable-HTTP at
+``farmhand_https_path`` (default ``/mcp``), mounted via a small ASGI bridge
+into this aiohttp app and behind the same bearer middleware as ``/api/*``
+(loopback-open rule included).
 """
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import json
 import secrets
@@ -155,13 +162,27 @@ class CoopServer:
         self.url = settings.coop_url
         self._static = _load_static()
         self._runner: web.AppRunner | None = None
+        # spec 26: the Farmhand MCP endpoint mounted on this same listener at
+        # farmhand_https_path when the farmhand transport includes "https"
+        self.farmhand: Any | None = None
 
     def status_block(self) -> dict[str, Any]:
         """The `coop` block of the status op — never contains the token."""
         return {"enabled": True, "url": self.url, "auth_required": self.auth.required}
 
     async def start(self) -> None:
+        # spec 26: the Farmhand's streamable-HTTP MCP endpoint on this listener
+        # (behind the same bearer middleware as /api/* — see _auth_middleware)
+        if self.settings.farmhand_transport in ("https", "both"):
+            from turbochickens.farmhand import FarmhandHTTP  # lazy: farmhand imports coop
+
+            self.farmhand = FarmhandHTTP(self.settings)
+            await self.farmhand.start()
+        # shutdown_timeout bounds the handler drain at cleanup, so a hung
+        # client connection (e.g. an open MCP SSE stream, spec 26) can never
+        # wedge daemon shutdown beyond it
         app = web.Application(middlewares=[self._auth_middleware], client_max_size=CLIENT_MAX_BODY)
+        self._runner = web.AppRunner(app, shutdown_timeout=15.0)
         app.router.add_get("/api/ping", self._api_ping)
         app.router.add_get("/api/status", self._api_status)
         # spec 13: read-only mirrors of the GUI socket ops
@@ -190,9 +211,12 @@ class CoopServer:
         app.router.add_post("/api/auth/login", self._api_auth_login)
         app.router.add_post("/api/auth/login/status", self._api_auth_login_status)
         app.router.add_post("/api/auth/logout", self._api_auth_logout)
+        # spec 26: the Farmhand MCP endpoint (streamable-HTTP) at farmhand_https_path
+        if self.farmhand is not None:
+            app.router.add_route("*", self.farmhand.path, self.farmhand.handler)
+            app.router.add_route("*", self.farmhand.path + "/", self.farmhand.handler)
         app.router.add_get("/", self._index)
         app.router.add_get("/{tail:.*}", self._static_file)
-        self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.settings.coop_host, self.settings.coop_port)
         await site.start()
@@ -201,6 +225,10 @@ class CoopServer:
             print(f"coop auth token: {self.auth.token}", flush=True)
 
     async def stop(self) -> None:
+        if self.farmhand is not None:
+            with contextlib.suppress(Exception):
+                await self.farmhand.stop()
+            self.farmhand = None
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
@@ -210,8 +238,12 @@ class CoopServer:
     @web.middleware
     async def _auth_middleware(self, request: web.Request, handler):
         # static assets stay open so the SPA can load and show its login card
-        # on a 401 from /api/*; /api/ping is the unauthenticated healthcheck
-        if self.auth.required and request.path.startswith("/api/") and request.path != "/api/ping":
+        # on a 401 from /api/*; /api/ping is the unauthenticated healthcheck.
+        # spec 26: the Farmhand MCP endpoint sits behind the same rule
+        protected = request.path.startswith("/api/") and request.path != "/api/ping"
+        if self.farmhand is not None and self.farmhand.wants(request.path):
+            protected = True
+        if self.auth.required and protected:
             if request.headers.get("Authorization", "") != f"Bearer {self.auth.token}":
                 return web.json_response(
                     {"ok": False, "error": "unauthorized: send Authorization: Bearer <token>"}, status=401

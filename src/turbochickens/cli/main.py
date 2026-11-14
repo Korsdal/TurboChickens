@@ -36,6 +36,10 @@ stats_app = typer.Typer(help="Feed ledger — per-egg usage rollups (spec 08).",
 auth_app = typer.Typer(help="Perch — seat auth (spec 09); local, no coopd needed.", no_args_is_help=True)
 models_app = typer.Typer(help="Feeders — model discovery (spec 10); local, no coopd needed.", no_args_is_help=True)
 coop_app = typer.Typer(help="Coop — the TurboChickens GUI served by coopd over HTTP (spec 12).", no_args_is_help=True)
+farmhand_app = typer.Typer(
+    help="Farmhand — the MCP server over the farm's own socket ops (spec 26): stdio and/or HTTPS.",
+    no_args_is_help=True,
+)
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(runs_app, name="runs")
@@ -45,6 +49,7 @@ app.add_typer(stats_app, name="stats")
 app.add_typer(auth_app, name="auth")
 app.add_typer(models_app, name="models")
 app.add_typer(coop_app, name="coop")
+app.add_typer(farmhand_app, name="farmhand")
 
 err_console = Console(stderr=True)
 console = Console()
@@ -654,6 +659,52 @@ def auth_logout(
         err_console.print(f"[bold red]error[/bold red] {e}")
         raise typer.Exit(code=1) from None
     typer.echo(f"released perch seat for provider '{provider}'")
+
+
+@farmhand_app.command("serve")
+def farmhand_serve(
+    transport: str | None = typer.Option(
+        None,
+        "--transport",
+        help="Which transport(s) to serve: stdio, https, or both (default: the farmhand_transport setting, itself default 'both').",
+    ),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Serve the Farmhand (spec 26): an MCP server whose tools are thin wrappers over coopd's socket ops.
+
+    stdio speaks MCP on stdin/stdout for same-machine agents (the 0600 daemon socket gates access).
+    https serves streamable-HTTP at farmhand_https_path on the coop listener (coop_host:coop_port),
+    behind the same bearer rule as /api/* — loopback with no token configured is open, otherwise a
+    bearer token is required (an ephemeral one is printed once when non-loopback and none configured).
+    both runs the two simultaneously. A coopd started with coop_enabled serves the https side itself
+    on its existing listener when farmhand_transport includes 'https'."""
+    from turbochickens.farmhand import TRANSPORTS, serve_transport
+
+    try:
+        settings = load_settings(settings_path)
+    except SettingsError as e:
+        err_console.print(f"[bold red]error[/bold red] {e}")
+        raise typer.Exit(code=1) from None
+    chosen = transport or settings.farmhand_transport
+    if chosen not in TRANSPORTS:
+        err_console.print(
+            f"[bold red]error[/bold red] --transport must be one of {', '.join(TRANSPORTS)}, got {chosen!r}"
+        )
+        raise typer.Exit(code=1) from None
+    # stdio is a protocol channel: anything informational goes to stderr only
+    https_line = (
+        f"https={settings.coop_url.rstrip('/')}{settings.farmhand_https_path}"
+        if chosen in ("https", "both")
+        else "https=-"
+    )
+    err_console.print(f"farmhand serving transport={chosen} socket={settings.socket_path} {https_line}")
+    try:
+        asyncio.run(serve_transport(settings, chosen))
+    except KeyboardInterrupt:
+        pass
+    except OSError as e:
+        err_console.print(f"[bold red]error[/bold red] cannot serve the farmhand https listener: {e}")
+        raise typer.Exit(code=1) from None
 
 
 @app.callback()
