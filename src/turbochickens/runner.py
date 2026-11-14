@@ -31,6 +31,14 @@ egg, and never enforced as a kill for a free-range chicken) — so it dies only
 via `run_stop` (spec 22) or daemon shutdown, both ending in the same attested
 `stopped` teardown as any terminal state.
 
+Spec 27 (ChickenSubs) adds `harness.spawn_subs`: such a chicken gets the
+Farmhand attached to its vibe-cli runtime over stdio (the adapter writes the
+MCP server entry into the run's vibe config and points the per-run env at a
+token-free settings file), so it can enqueue sub-eggs. Sub-chickens are
+ordinary queue items: the daemon records `parent_run_id` on the run (schema
+v5), in the manifest, and in the `egg.queued` Headcount row; depth is capped
+at 1 at enqueue.
+
 The pipeline owns all SQLite writes for a chicken: status transitions on
 `runs`, streamed `run_events`, the manifest, the `results` row (spec 04: a
 valid clutch is stored in the nest box, an invalid one quarantined), and the
@@ -369,6 +377,10 @@ class RunPipeline:
         # from another run of the same egg
         if item.get("rerun_of"):
             manifest["rerun_of"] = item["rerun_of"]
+        # spec 27: sub-chicken lineage — this chicken was enqueued through a
+        # spawn_subs chicken's Farmhand
+        if item.get("parent_run_id"):
+            manifest["parent_run_id"] = item["parent_run_id"]
         return manifest
 
     # --- the lifecycle ----------------------------------------------------
@@ -378,7 +390,9 @@ class RunPipeline:
         attestation and audit rows."""
         run_id = item["run_id"]
         spec = load_spec(item["spec_path"])
-        adapter = make_adapter(spec, credential_provider=self.credential_provider, providers=self.providers)
+        adapter = make_adapter(
+            spec, credential_provider=self.credential_provider, providers=self.providers, settings=self.settings
+        )
         ctx = RunContext(
             run_id=run_id,
             job_id=item["job_id"],
@@ -387,6 +401,8 @@ class RunPipeline:
             spec_hash=item["spec_hash"],
             trigger=item["trigger"],
             workspace=self.settings.data_dir / "workspaces" / run_id,
+            # spec 27 (ChickenSubs): sub-chicken lineage
+            parent_run_id=item.get("parent_run_id"),
         )
         status = "failed"
         reason = "internal error"
@@ -395,6 +411,8 @@ class RunPipeline:
             "adapter": spec.harness.adapter,
             "model": spec.harness.model,
             "temperature": spec.harness.temperature,
+            # spec 27: mirrored in the manifest
+            "spawn_subs": spec.harness.spawn_subs,
         }
         budget: dict[str, Any] = {
             # spec 23: a Free-Range chicken has no fence — timeout_sec is the
@@ -487,6 +505,16 @@ class RunPipeline:
                 prepared = adapter.prepare(ctx)
                 harness = prepared.harness
                 auth = prepared.auth or auth
+                if isinstance(harness.get("farmhand"), dict):
+                    # spec 27 (ChickenSubs): the Farmhand is attached to this
+                    # chicken's harness runtime over stdio
+                    await self._event(
+                        run_id,
+                        "supervisor",
+                        "info",
+                        f"farmhand attached to the harness runtime over stdio"
+                        f" (spawn_subs=true, config={harness['farmhand'].get('config')})",
+                    )
                 # audit the mode per chicken (non-secret: mode + expiry only)
                 self.audit.append(
                     {
@@ -644,6 +672,8 @@ class RunPipeline:
                 "adapter": spec.harness.adapter,
                 "model": spec.harness.model,
                 "temperature": spec.harness.temperature,
+                # spec 27: mirrored in the manifest
+                "spawn_subs": spec.harness.spawn_subs,
             },
             "started_at": item.get("started_at"),
             "finished_at": now,
@@ -654,6 +684,9 @@ class RunPipeline:
         }
         if item.get("rerun_of"):
             manifest["rerun_of"] = item["rerun_of"]
+        # spec 27: sub-chicken lineage
+        if item.get("parent_run_id"):
+            manifest["parent_run_id"] = item["parent_run_id"]
         # nothing was provisioned for a queued egg — verify anyway and attest
         ws = self.settings.data_dir / "workspaces" / run_id
         workspace_removed = True

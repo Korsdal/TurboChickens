@@ -34,14 +34,30 @@ Secrecy: no tool result ever contains token/seat/device-code material — the
 socket ops already guarantee that (``settings_get`` omits ``coop_auth_token``,
 the ``auth_*`` ops are not exposed), and the coop bearer itself never appears
 in any tool payload.
+
+Spec 27 (ChickenSubs): a chicken whose egg has ``harness.spawn_subs = true``
+gets this server attached to its harness runtime over stdio —
+``attach_farmhand_to_run`` writes an MCP server entry into the run's vibe
+config (project-local ``.vibe/config.toml`` in the workspace) spawning the
+farmhand serve command, and points the per-run env at a generated settings
+file so the spawned process finds this daemon's socket. When the Farmhand
+runs inside a chicken's harness, the per-run env carries
+``TURBOCHICKENS_RUN_ID`` (and ``TURBOCHICKENS_PARENT_RUN_ID`` when the chicken
+is itself a sub-chicken): ``enqueue`` then passes ``parent_run_id`` so the
+sub-egg gets lineage, ``run_stop`` passes ``caller_run_id`` so the daemon can
+refuse ancestor targets, and a sub-chicken's server serves the narrowed sub
+tool set (enqueue + read tools + the guarded ``run_stop`` — no
+schedule/auth/settings/jobs_validate/run_rerun tools).
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import os
+import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 from mcp.server.mcpserver import MCPServer
@@ -49,6 +65,9 @@ from mcp.server.mcpserver import MCPServer
 from turbochickens import client
 from turbochickens.client import DaemonUnreachable
 from turbochickens.settings import SOCKET_STREAM_LIMIT, UPLOAD_MAX_HTTP_BODY, Settings
+
+if TYPE_CHECKING:  # pragma: no cover
+    from turbochickens.adapter import RunContext
 
 #: the MCP server name advertised to clients
 FARMHAND_NAME = "farmhand"
@@ -91,11 +110,102 @@ def spec_bundle_b64(spec_path: Path) -> dict[str, str]:
     return {key: base64.b64encode(blob).decode("ascii") for key, blob in blobs.items()}
 
 
-def build_server(settings: Settings) -> MCPServer:
+#: spec 27: tools a sub-chicken's Farmhand does NOT expose — schedule/auth/
+#: settings changes, bundle candling, and re-run are operator-side chores; a
+#: sub gets enqueue + read tools (plus the guarded run_stop)
+SUB_SCOPE_EXCLUDED = ("jobs_validate", "run_rerun", "schedule_add", "schedule_list", "schedule_rm", "settings_get")
+
+
+def farmhand_serve_command() -> tuple[str, list[str]]:
+    """The command spawning the Farmhand over stdio: ``tc farmhand serve
+    --transport stdio`` via the ``tc`` entry point sitting next to the
+    current interpreter (the venv's bin dir — a bare PATH lookup could pick
+    up an unrelated ``tc`` binary), else the same package invocation through
+    the current interpreter."""
+    sibling = Path(sys.executable).parent / "tc"
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling), ["farmhand", "serve", "--transport", "stdio"]
+    return sys.executable, ["-m", "turbochickens", "farmhand", "serve", "--transport", "stdio"]
+
+
+def _toml_value(v: Any) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    s = str(v).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{s}"'
+
+
+def settings_toml_for_farmhand(settings: Settings) -> str:
+    """TOML text of the daemon's effective settings for a Farmhand process
+    spawned inside a chicken's harness — every field except the coop bearer
+    token, which is never written anywhere (the Farmhand reaches coopd over
+    the 0600 socket and needs no token)."""
+    data = settings.model_dump(mode="json", exclude_none=True, exclude={"coop_auth_token"})
+    lines = [
+        "# spec 27: effective settings for the Farmhand process spawned inside a",
+        "# spawn_subs chicken's harness — the coop bearer token is excluded.",
+    ]
+    for key in sorted(data):
+        lines.append(f"{key} = {_toml_value(data[key])}")
+    return "\n".join(lines) + "\n"
+
+
+def attach_farmhand_to_run(run: "RunContext", settings: Settings) -> dict[str, Any]:
+    """Spec 27 (ChickenSubs): attach the Farmhand to a ``spawn_subs = true``
+    chicken's vibe-cli runtime over stdio — an MCP server entry in the run's
+    vibe config (the project-local ``.vibe/config.toml`` in the workspace,
+    which is the harness cwd) spawning the farmhand serve command. Also writes
+    a token-free settings file into the workspace and points the per-run env
+    at it (``TURBOCHICKENS_SETTINGS``), so the spawned Farmhand process finds
+    this daemon's socket; a sub-chicken's env additionally carries
+    ``TURBOCHICKENS_PARENT_RUN_ID``, which narrows its Farmhand's tool set.
+    Returns the manifest block describing the attachment."""
+    command, args = farmhand_serve_command()
+    vibe_dir = run.workspace / ".vibe"
+    vibe_dir.mkdir(parents=True, exist_ok=True)
+    config_path = vibe_dir / "config.toml"
+    config_path.write_text(
+        "# spec 27 (ChickenSubs): the Farmhand attached to this chicken's harness\n"
+        "# runtime over stdio — enqueue sub-eggs and read the flock through the\n"
+        "# farm's own contract. Spawned by the harness with the run's env.\n"
+        "[mcp_servers.farmhand]\n"
+        f"command = {_toml_value(command)}\n"
+        f"args = [{', '.join(_toml_value(a) for a in args)}]\n",
+        encoding="utf-8",
+    )
+    settings_path = run.workspace / ".tc-farmhand-settings.toml"
+    settings_path.write_text(settings_toml_for_farmhand(settings), encoding="utf-8")
+    run.env["TURBOCHICKENS_SETTINGS"] = str(settings_path)
+    if run.parent_run_id:
+        run.env["TURBOCHICKENS_PARENT_RUN_ID"] = run.parent_run_id
+    return {
+        "attached": True,
+        "server": FARMHAND_NAME,
+        "transport": "stdio",
+        "config": ".vibe/config.toml",
+    }
+
+
+def build_server(
+    settings: Settings,
+    caller_run_id: str | None = None,
+    caller_parent_run_id: str | None = None,
+) -> MCPServer:
     """Build the Farmhand MCP server: one tool per socket op, each a thin
     wrapper that round-trips ``client.request_async`` over the daemon's 0600
-    socket and returns the socket response verbatim as the tool result."""
+    socket and returns the socket response verbatim as the tool result.
+
+    Spec 27 (ChickenSubs): when the Farmhand process runs inside a chicken's
+    harness, ``caller_run_id`` is that chicken's run id — ``enqueue`` then
+    passes ``parent_run_id`` (sub-egg lineage) and ``run_stop`` passes
+    ``caller_run_id`` (the daemon refuses ancestor targets). When the caller
+    is itself a sub-chicken (``caller_parent_run_id`` set), the server serves
+    the narrowed sub tool set: enqueue + read tools + the guarded run_stop,
+    without the schedule/auth/settings/jobs_validate/run_rerun tools."""
     socket_path = settings.socket_path
+    sub_scope = caller_parent_run_id is not None
 
     async def call(op: str, timeout: float = 10.0, **payload: Any) -> dict[str, Any]:
         try:
@@ -113,6 +223,12 @@ def build_server(settings: Settings) -> MCPServer:
             "(runs); chickens lay clutches (validated results) in the nest box; the rooster keeps "
             "cron crows (schedules); the headcount (audit log) records everything. Every tool "
             "returns the daemon's socket response verbatim."
+            + (
+                " You are attached to a sub-chicken: your scope is enqueue + read tools only "
+                "(plus stopping non-ancestor chickens) — no schedule, auth, settings, or re-run chores."
+                if sub_scope
+                else ""
+            )
         ),
     )
 
@@ -124,62 +240,18 @@ def build_server(settings: Settings) -> MCPServer:
     async def jobs_list() -> dict[str, Any]:
         return await call("jobs_list")
 
-    @server.tool(
-        name="jobs_validate",
-        description=(
-            "Candle an egg: validate a job-spec bundle and, when valid, store it under uploads/ so it is "
-            "enqueueable by the returned spec_path (socket op `jobs_upload`). Pass either `files` "
-            "({bundle path: text content}, e.g. job.toml + prompts/… + schemas/…) or `spec_path` to an "
-            "egg on this machine, which is read into a bundle locally."
-        ),
-    )
-    async def jobs_validate(
-        files: dict[str, str] | None = None, spec_path: str | None = None
-    ) -> dict[str, Any]:
-        if files is not None:
-            if not files:
-                return {
-                    "ok": False,
-                    "op": "jobs_upload",
-                    "error": "jobs_validate needs a non-empty 'files' object (bundle path -> content) or a 'spec_path'",
-                }
-            payload = {
-                str(key): base64.b64encode(str(value).encode("utf-8")).decode("ascii")
-                for key, value in files.items()
-            }
-        elif spec_path:
-            from turbochickens.spec.loader import SpecValidationError
-
-            try:
-                payload = spec_bundle_b64(Path(spec_path))
-            except SpecValidationError as e:
-                return {
-                    "ok": False,
-                    "op": "jobs_upload",
-                    "valid": False,
-                    "errors": [
-                        {"field": ".".join(i.loc) if i.loc else "<spec>", "message": str(i)}
-                        for i in e.issues
-                    ],
-                }
-            except OSError as e:
-                return {"ok": False, "op": "jobs_upload", "error": f"cannot read the egg at {spec_path!r}: {e}"}
-        else:
-            return {
-                "ok": False,
-                "op": "jobs_upload",
-                "error": "jobs_validate needs a 'files' object (bundle path -> content) or a 'spec_path'",
-            }
-        return await call("jobs_upload", timeout=60.0, files=payload)
-
-    @server.tool(name="enqueue", description="Queue an egg for hatching: enqueue a run by spec path (socket op `enqueue`, trigger defaults to manual). Returns run_id, status=queued, weight, pecking-order depth.")
+    @server.tool(name="enqueue", description="Queue an egg for hatching: enqueue a run by spec path (socket op `enqueue`, trigger defaults to manual). Returns run_id, status=queued, weight, pecking-order depth. When attached to a chicken, the new egg is queued as its sub-chicken (`parent_run_id` lineage).")
     async def enqueue(spec_path: str, spec_hash: str | None = None, trigger: str = "manual") -> dict[str, Any]:
         payload: dict[str, Any] = {"spec_path": spec_path, "trigger": trigger}
         if spec_hash:
             payload["spec_hash"] = spec_hash
+        if caller_run_id:
+            # spec 27: this Farmhand runs inside a chicken — the egg becomes
+            # its sub-chicken (ordinary egg through the same queue/admission)
+            payload["parent_run_id"] = caller_run_id
         return await call("enqueue", timeout=10.0, **payload)
 
-    @server.tool(name="runs_list", description="List chickens (runs), most recent first; optional job and status filters (socket op `runs_list`).")
+    @server.tool(name="runs_list", description="List chickens (runs), most recent first; optional job and status filters; rows carry parent_run_id lineage (socket op `runs_list`).")
     async def runs_list(job: str | None = None, status: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         if job:
@@ -188,7 +260,7 @@ def build_server(settings: Settings) -> MCPServer:
             payload["status"] = status
         return await call("runs_list", **payload)
 
-    @server.tool(name="runs_show", description="Show one chicken: lifecycle fields, manifest, abattoir attestation, result row (socket op `runs_show`).")
+    @server.tool(name="runs_show", description="Show one chicken: lifecycle fields, manifest (incl. parent_run_id lineage), abattoir attestation, result row (socket op `runs_show`).")
     async def runs_show(run_id: str) -> dict[str, Any]:
         return await call("runs_show", run_id=run_id)
 
@@ -200,28 +272,13 @@ def build_server(settings: Settings) -> MCPServer:
     async def results_get(run_id: str) -> dict[str, Any]:
         return await call("results_get", run_id=run_id)
 
-    @server.tool(name="run_stop", description="Stop a chicken deliberately (socket op `run_stop`): a queued egg is cancelled (never hatches), a running chicken gets SIGTERM then a hard kill — both attested. Waits for the terminal state.")
+    @server.tool(name="run_stop", description="Stop a chicken deliberately (socket op `run_stop`): a queued egg is cancelled (never hatches), a running chicken gets SIGTERM then a hard kill — both attested. Waits for the terminal state. A sub-chicken cannot stop its ancestors (refused).")
     async def run_stop(run_id: str) -> dict[str, Any]:
-        return await call("run_stop", timeout=60.0, run_id=run_id)
-
-    @server.tool(name="run_rerun", description="Re-queue the same egg as a fresh chicken with lineage recorded (socket op `run_rerun`).")
-    async def run_rerun(run_id: str) -> dict[str, Any]:
-        return await call("run_rerun", timeout=10.0, run_id=run_id)
-
-    @server.tool(name="schedule_add", description="Register an egg's cron trigger as a crow with the rooster (socket op `schedule_add`; the egg must be cron-triggered).")
-    async def schedule_add(spec_path: str, spec_hash: str | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {"spec_path": spec_path}
-        if spec_hash:
-            payload["spec_hash"] = spec_hash
-        return await call("schedule_add", timeout=10.0, **payload)
-
-    @server.tool(name="schedule_list", description="The rooster's registered crows with live next crow times (socket op `schedule_list`).")
-    async def schedule_list() -> dict[str, Any]:
-        return await call("schedule_list")
-
-    @server.tool(name="schedule_rm", description="Remove an egg's crow from the rooster (socket op `schedule_rm`).")
-    async def schedule_rm(job_id: str) -> dict[str, Any]:
-        return await call("schedule_rm", job_id=job_id)
+        payload: dict[str, Any] = {"run_id": run_id}
+        if caller_run_id:
+            # spec 27: the daemon refuses targets that are the caller's ancestors
+            payload["caller_run_id"] = caller_run_id
+        return await call("run_stop", timeout=60.0, **payload)
 
     @server.tool(name="stats_list", description="The feed ledger: per-egg usage rollups (n, mean/p50/p95 tokens in+out, total p95, expected feed per chicken) (socket op `stats_list`).")
     async def stats_list() -> dict[str, Any]:
@@ -238,9 +295,80 @@ def build_server(settings: Settings) -> MCPServer:
             payload["event"] = event
         return await call("audit_tail", **payload)
 
-    @server.tool(name="settings_get", description="Effective settings, read-only (socket op `settings_get`) — the coop auth token is never included.")
-    async def settings_get() -> dict[str, Any]:
-        return await call("settings_get")
+    if not sub_scope:
+        # spec 27: operator-side chores are NOT exposed to a sub-chicken's
+        # Farmhand — no schedule/auth/settings changes, no bundle candling,
+        # no re-run
+        @server.tool(
+            name="jobs_validate",
+            description=(
+                "Candle an egg: validate a job-spec bundle and, when valid, store it under uploads/ so it is "
+                "enqueueable by the returned spec_path (socket op `jobs_upload`). Pass either `files` "
+                "({bundle path: text content}, e.g. job.toml + prompts/… + schemas/…) or `spec_path` to an "
+                "egg on this machine, which is read into a bundle locally."
+            ),
+        )
+        async def jobs_validate(
+            files: dict[str, str] | None = None, spec_path: str | None = None
+        ) -> dict[str, Any]:
+            if files is not None:
+                if not files:
+                    return {
+                        "ok": False,
+                        "op": "jobs_upload",
+                        "error": "jobs_validate needs a non-empty 'files' object (bundle path -> content) or a 'spec_path'",
+                    }
+                payload = {
+                    str(key): base64.b64encode(str(value).encode("utf-8")).decode("ascii")
+                    for key, value in files.items()
+                }
+            elif spec_path:
+                from turbochickens.spec.loader import SpecValidationError
+
+                try:
+                    payload = spec_bundle_b64(Path(spec_path))
+                except SpecValidationError as e:
+                    return {
+                        "ok": False,
+                        "op": "jobs_upload",
+                        "valid": False,
+                        "errors": [
+                            {"field": ".".join(i.loc) if i.loc else "<spec>", "message": str(i)}
+                            for i in e.issues
+                        ],
+                    }
+                except OSError as e:
+                    return {"ok": False, "op": "jobs_upload", "error": f"cannot read the egg at {spec_path!r}: {e}"}
+            else:
+                return {
+                    "ok": False,
+                    "op": "jobs_upload",
+                    "error": "jobs_validate needs a 'files' object (bundle path -> content) or a 'spec_path'",
+                }
+            return await call("jobs_upload", timeout=60.0, files=payload)
+
+        @server.tool(name="run_rerun", description="Re-queue the same egg as a fresh chicken with lineage recorded (socket op `run_rerun`).")
+        async def run_rerun(run_id: str) -> dict[str, Any]:
+            return await call("run_rerun", timeout=10.0, run_id=run_id)
+
+        @server.tool(name="schedule_add", description="Register an egg's cron trigger as a crow with the rooster (socket op `schedule_add`; the egg must be cron-triggered).")
+        async def schedule_add(spec_path: str, spec_hash: str | None = None) -> dict[str, Any]:
+            payload: dict[str, Any] = {"spec_path": spec_path}
+            if spec_hash:
+                payload["spec_hash"] = spec_hash
+            return await call("schedule_add", timeout=10.0, **payload)
+
+        @server.tool(name="schedule_list", description="The rooster's registered crows with live next crow times (socket op `schedule_list`).")
+        async def schedule_list() -> dict[str, Any]:
+            return await call("schedule_list")
+
+        @server.tool(name="schedule_rm", description="Remove an egg's crow from the rooster (socket op `schedule_rm`).")
+        async def schedule_rm(job_id: str) -> dict[str, Any]:
+            return await call("schedule_rm", job_id=job_id)
+
+        @server.tool(name="settings_get", description="Effective settings, read-only (socket op `settings_get`) — the coop auth token is never included.")
+        async def settings_get() -> dict[str, Any]:
+            return await call("settings_get")
 
     return server
 
@@ -394,8 +522,18 @@ class FarmhandHTTP:
 
 async def serve_stdio(settings: Settings) -> None:
     """Serve the Farmhand over stdio (same-machine agents; the 0600 daemon
-    socket gates who can reach coopd)."""
-    await build_server(settings).run_stdio_async()
+    socket gates who can reach coopd).
+
+    Spec 27 (ChickenSubs): when spawned inside a chicken's harness, the
+    per-run env carries ``TURBOCHICKENS_RUN_ID`` (and
+    ``TURBOCHICKENS_PARENT_RUN_ID`` when the chicken is itself a sub-chicken)
+    — the server then tags its enqueue/run_stop calls with that caller, and a
+    sub-chicken's server serves the narrowed sub tool set."""
+    caller_run_id = os.environ.get("TURBOCHICKENS_RUN_ID") or None
+    caller_parent_run_id = os.environ.get("TURBOCHICKENS_PARENT_RUN_ID") or None
+    await build_server(
+        settings, caller_run_id=caller_run_id, caller_parent_run_id=caller_parent_run_id
+    ).run_stdio_async()
 
 
 async def serve_https(settings: Settings) -> None:

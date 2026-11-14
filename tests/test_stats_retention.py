@@ -104,12 +104,15 @@ def test_months_before_calendar_arithmetic() -> None:
 
 
 def test_schema_v3_adds_percentile_columns_and_migrates_v2_dbs(tmp_path) -> None:
-    # fresh DB: schema_version 4 with all percentile columns + job_specs.spec_path (spec 16)
+    # fresh DB: schema_version 5 with all percentile columns + job_specs.spec_path (spec 16)
+    # + runs.parent_run_id (spec 27)
     conn = init_db(tmp_path / "fresh.db")
     try:
-        assert SCHEMA_VERSION == 4
+        assert SCHEMA_VERSION == 5
         ver = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()[0]
-        assert ver == "4"
+        assert ver == "5"
+        runs_cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+        assert "parent_run_id" in runs_cols
         cols = {r[1] for r in conn.execute("PRAGMA table_info(job_usage_stats)")}
         assert {"tokens_in_p50", "tokens_in_p95", "tokens_out_p50", "tokens_out_p95"} <= cols
         job_cols = {r[1] for r in conn.execute("PRAGMA table_info(job_specs)")}
@@ -133,7 +136,7 @@ def test_schema_v3_adds_percentile_columns_and_migrates_v2_dbs(tmp_path) -> None
         cols = {r[1] for r in conn.execute("PRAGMA table_info(job_usage_stats)")}
         assert {"tokens_in_p50", "tokens_in_p95", "tokens_out_p50", "tokens_out_p95"} <= cols
         ver = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()[0]
-        assert ver == "4"
+        assert ver == "5"
     finally:
         conn.close()
     # a v3-era DB (job_specs without spec_path) is migrated in place by init_db
@@ -152,7 +155,7 @@ def test_schema_v3_adds_percentile_columns_and_migrates_v2_dbs(tmp_path) -> None
         job_cols = {r[1] for r in conn.execute("PRAGMA table_info(job_specs)")}
         assert "spec_path" in job_cols
         ver = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()[0]
-        assert ver == "4"
+        assert ver == "5"
         # the append-only guard still holds after the in-place migration
         conn.execute(
             "INSERT INTO job_specs (id, name, spec_hash, spec_toml, created_at, spec_path)"

@@ -4,13 +4,13 @@
 
 **Blocked by:** 22 (stop op + lineage groundwork), 26 (the Farmhand server and its stdio transport)
 
-**Status:** ready-for-agent (split from spec 21 via to-tickets, 2026-11-14)
+**Status:** done (2026-11-14)
 
-- [ ] Spec model: `HarnessSection` gains `spawn_subs: bool = False` (`extra = "forbid"` intact)
-- [ ] E2E (fake vibe binary that itself calls the attached Farmhand over stdio): a `spawn_subs = true` chicken enqueues a sub-egg; the sub runs as an ordinary egg through the same queue/admission (same weights), with `parent_run_id` set in the runs store, manifest, and audit
-- [ ] Depth cap 1: a sub-chicken enqueueing a spec with `spawn_subs = true` is refused with a field-named error; no sub-sub-chickens exist
-- [ ] Sub scope: from a sub-chicken's Farmhand, only enqueue + read tools are exposed; `run_stop` against an ancestor run is refused; schedule/auth/settings tools are not available
-- [ ] Schema: `runs.parent_run_id` column added with a schema bump; existing rows read as NULL; migrations keep the suite green on old data dirs
-- [ ] Secrecy: manifest/audit/MCP results for subs carry no token/seat material
-- [ ] Tests: e2e for lineage recorded, depth-1 refusal, sub-scope refusal of ancestor-stop; pure seam for the spec field; full suite green
-- [ ] Lexicon: ChickenSub term confirmed/added in `docs/lexicon.md`; `STATUS.md` updated at the slice boundary
+- [x] Spec model: `HarnessSection` gains `spawn_subs: bool = False` (`extra = "forbid"` intact)
+- [x] E2E (fake vibe binary that itself calls the attached Farmhand over stdio): a `spawn_subs = true` chicken enqueues a sub-egg; the sub runs as an ordinary egg through the same queue/admission (same weights), with `parent_run_id` set in the runs store, manifest, and audit
+- [x] Depth cap 1: a sub-chicken enqueueing a spec with `spawn_subs = true` is refused with a field-named error; no sub-sub-chickens exist
+- [x] Sub scope: from a sub-chicken's Farmhand, only enqueue + read tools are exposed; `run_stop` against an ancestor run is refused; schedule/auth/settings tools are not available
+- [x] Schema: `runs.parent_run_id` column added with a schema bump; existing rows read as NULL; migrations keep the suite green on old data dirs
+- [x] Secrecy: manifest/audit/MCP results for subs carry no token/seat material
+- [x] Tests: e2e for lineage recorded, depth-1 refusal, sub-scope refusal of ancestor-stop; pure seam for the spec field; full suite green
+- [x] Lexicon: ChickenSub term confirmed/added in `docs/lexicon.md`; `STATUS.md` updated at the slice boundary

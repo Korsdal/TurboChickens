@@ -29,6 +29,7 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 | **Stopped** | A Chicken ended deliberately by the operator — SIGTERM, then hard kill, with the Abattoir's attested teardown | `stopped` run state / `run_stop` on a running chicken / `chicken.stopped` |
 | **Re-run** | Hatching the same Egg again as a fresh Chicken, new run ID, lineage recorded | `run_rerun` / manifest `rerun_of` |
 | **Chaining** | An Egg consuming an earlier Chicken's Clutch via a `nestbox://<run_id>/output.json` attachment — resolved from the Nest Box at provisioning, valid clutches only | `chaining.py`, manifest `chaining`, Headcount `clutch.consumed` |
+| **ChickenSub** | A sub-chicken — a Chicken spawned by another Chicken through its attached Farmhand (stdio), enqueued as an ordinary Egg in the same Pecking Order with lineage `parent_run_id`, depth capped at 1, and a narrower Farmhand tool set (enqueue + read only; it cannot stop its ancestors) | `harness.spawn_subs`, `runs.parent_run_id`, `farmhand.py` |
 
 ## Support Cast
 

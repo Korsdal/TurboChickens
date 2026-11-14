@@ -13,7 +13,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _TABLES = [
     """
@@ -37,7 +37,10 @@ _TABLES = [
         started_at TEXT,
         finished_at TEXT,
         manifest_json TEXT,
-        usage_json TEXT
+        usage_json TEXT,
+        -- spec 27 (ChickenSubs): the parent chicken when this run is a
+        -- sub-chicken enqueued through a spawn_subs chicken's Farmhand
+        parent_run_id TEXT
     )
     """,
     """
@@ -133,6 +136,12 @@ def init_db(path: str | Path) -> sqlite3.Connection:
     job_specs_cols = {row[1] for row in conn.execute("PRAGMA table_info(job_specs)")}
     if "spec_path" not in job_specs_cols:
         conn.execute("ALTER TABLE job_specs ADD COLUMN spec_path TEXT")
+    # spec 27 migration: DBs created before schema_version 5 lack
+    # parent_run_id on runs; add it in place (runs stays mutable; existing
+    # rows read as NULL — they are not sub-chickens)
+    runs_cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+    if "parent_run_id" not in runs_cols:
+        conn.execute("ALTER TABLE runs ADD COLUMN parent_run_id TEXT")
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),

@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-14, after spec 26 landed (the Farmhand — new module `farmhand.py`: an MCP server on the official `mcp` Python SDK (new dependency, version bumped 0.0.17 → 0.0.18) whose 17 tools are thin wrappers over the daemon's existing socket ops via `client.request_async` — `status`, `jobs_list`, `jobs_validate` (wraps `jobs_upload`: candle a files bundle or a local `spec_path`), `enqueue`, `runs_list`, `runs_show`, `runs_logs`, `results_get`, `run_stop`, `run_rerun`, `schedule_add`/`schedule_list`/`schedule_rm`, `stats_list`/`stats_show`, `audit_tail`, `settings_get` — served over stdio (`tc farmhand serve --transport stdio|https|both`, informational output on stderr only so the protocol channel stays clean) and/or HTTPS (streamable-HTTP at `farmhand_https_path`, default `/mcp`, mounted into the coop's aiohttp listener via a small ASGI bridge `asgi_request` + the SDK's Starlette app with its lifespan run — no second port — behind the same bearer middleware as `/api/*`, loopback-open rule included, ephemeral token printed once like coop); settings gained `farmhand_transport` (`"stdio"|"https"|"both"`, default `"both"`) and `farmhand_https_path` (single absolute path segment, default `/mcp`) with `extra="forbid"` intact and both exposed in `public_dict()`; MCP scope is narrower than the GUI bearer — no `auth_*` ops, no `retention_sweep`, no `shutdown`/`ping`/raw `jobs_upload`, settings read-only; no tool payload ever contains token material (asserted with a configured token over both transports, and against the audit log); `"both"` serves stdio and HTTPS simultaneously in one `tc farmhand serve` process (when the stdio client hangs up the process exits); coopd binds its unix socket only after the coop (and the Farmhand endpoint) is up, so a ping OK implies the HTTP surface is up and its `coop.started` row is already audited; the coop/standalone aiohttp runners got `shutdown_timeout=15` so a hung MCP SSE stream can never wedge shutdown; full suite green, 362 passed (353 + 9 new tests/test_farmhand.py)). Same day earlier: spec 23 landed (Free-Range chickens — `resources.free_range = true` removes the hard wall-clock kill: `timeout_sec` becomes optional (`int | None`, `gt=0`, `validate_default=True`) with the pairing enforced at spec load (`free_range = false` — the default — requires `timeout_sec > 0`, field-named `resources.timeout_sec` error; `free_range = true` allows it absent and never hard-kills even if present; `extra="forbid"` intact; `spec_hash` drops `free_range=false` so pre-23 egg hashes are unchanged, the shipped example still `sha256:18efbd8c…80b959`); adapters take `timeout_sec: int | None` (`None` = no hard kill — `wait_for(..., None)` waits forever, the API adapter keeps only its 10s connect timeout); the Hatchery enforces `hard_timeout = None if free_range else timeout_sec` and the manifest `resources` + `budget` blocks gain `free_range`; a Free-Range chicken dies only via `run_stop` (spec 22) or daemon shutdown — on shutdown the daemon calls `pipeline.request_stop_free_range()` before the bounded drain, so an in-flight free-range chicken ends `stopped` via the SIGTERM/hard-kill path with attestation (1,1,1) + `chicken.stopped`/`abattoir.attested` audit rows before exit; decision-log amendment for baseline invariants 1/2 recorded in `specs/23-free-range-chickens.md` + §5 below; full suite green, 353 passed (340 + 13 new tests/test_free_range.py)). Same day: spec 25 landed (chaining — `attachments = ["nestbox://<run_id>/output.json"]` in `[input]`: URI shape validated at spec load with field-named errors (`input.attachments`), resolved at provisioning from the Nest Box via the new `chaining.py` seam — valid clutches only, quarantined/composted/missing/malformed → fail-closed provisioning failure before `running` with attested teardown (1,1,1) and no results row; resolved clutch bytes count toward `max_context_mb` (over-cap chain → `budget.outcome = "context_cap"` exactly like spec 07); lineage in the manifest `chaining` block (run id + artifact path + bytes) + `clutch.consumed` Headcount rows + a run-log line; `jobs_upload` bundles no longer need nestbox attachments shipped in them; lexicon gained Chaining; full suite green, 340 passed). Same day earlier: spec 24 landed (Feed Budget cost cap — optional per-egg `resources.max_cost_usd` in USD, off by default, enforced finalize-only: over cap → run failed with `budget.outcome = "cost_cap"` in the existing manifest budget block, cost/token telemetry still recorded, teardown attested as usual; pure seam `cost_cap_exceeded`; full suite green, 307 passed). Same day earlier: spec 22 landed (lifecycle ops — socket ops `run_stop`/`run_rerun`, CLI `tc runs stop`/`tc runs rerun`, terminal states `cancelled`/`stopped` with attested teardown on every stop path, `egg.cancelled`/`chicken.stopped` Headcount rows, `rerun_of` lineage, lexicon terms added first; full suite green, 298 passed). Same day earlier: spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier then: 22, 24, 25); still no code changed.
+**Last updated:** 2026-11-14, after spec 27 landed (ChickenSubs — `harness.spawn_subs = true` attaches the Farmhand to the chicken's vibe-cli runtime over stdio: `attach_farmhand_to_run` writes an MCP server entry into the run's vibe config (project-local `.vibe/config.toml` in the workspace) spawning the farmhand serve command (the venv-sibling `tc`, else `python -m turbochickens`) plus a token-free settings file the per-run env points at via `TURBOCHICKENS_SETTINGS`, so the spawned Farmhand finds this daemon's socket; `RunContext`/`make_adapter` carry `parent_run_id` + settings, and the manifest harness block gains `spawn_subs` + `farmhand`); subs are ordinary eggs through the same socket/queue/admission (weight unchanged) with lineage `parent_run_id` recorded on the new `runs.parent_run_id` column (schema v5, in-place ALTER migration, old rows NULL), in the manifest, in the `egg.queued` Headcount row, and in `runs_show`/`runs_list` rows; `enqueue` accepts `parent_run_id` (unknown parent refused; depth capped at 1 — a sub enqueueing a `spawn_subs = true` egg is refused with a field-named `harness.spawn_subs` error; `spawn_subs` refused for non-vibe-cli adapters at enqueue); `run_stop` with `caller_run_id` refuses targets that are the caller's ancestors; `build_server` reads `TURBOCHICKENS_RUN_ID`/`TURBOCHICKENS_PARENT_RUN_ID` from the per-run env so a Farmhand inside a chicken tags `enqueue` with `parent_run_id` and `run_stop` with `caller_run_id`, and a sub-chicken's Farmhand serves the narrowed tool set (enqueue + read tools + the guarded `run_stop` — no jobs_validate/run_rerun/schedule_*/settings_get); `spec_hash` drops `spawn_subs=false` so the shipped example stays `sha256:18efbd8c…80b959`; version bumped 0.0.18 → 0.0.19; lexicon gained ChickenSub; full suite green, 374 passed (362 + 12 new tests/test_chickensubs.py)). Earlier same day: spec 26 landed (the Farmhand — new module `farmhand.py`: an MCP server on the official `mcp` Python SDK (new dependency, version bumped 0.0.17 → 0.0.18) whose 17 tools are thin wrappers over the daemon's existing socket ops via `client.request_async` — `status`, `jobs_list`, `jobs_validate` (wraps `jobs_upload`: candle a files bundle or a local `spec_path`), `enqueue`, `runs_list`, `runs_show`, `runs_logs`, `results_get`, `run_stop`, `run_rerun`, `schedule_add`/`schedule_list`/`schedule_rm`, `stats_list`/`stats_show`, `audit_tail`, `settings_get` — served over stdio (`tc farmhand serve --transport stdio|https|both`, informational output on stderr only so the protocol channel stays clean) and/or HTTPS (streamable-HTTP at `farmhand_https_path`, default `/mcp`, mounted into the coop's aiohttp listener via a small ASGI bridge `asgi_request` + the SDK's Starlette app with its lifespan run — no second port — behind the same bearer middleware as `/api/*`, loopback-open rule included, ephemeral token printed once like coop); settings gained `farmhand_transport` (`"stdio"|"https"|"both"`, default `"both"`) and `farmhand_https_path` (single absolute path segment, default `/mcp`) with `extra="forbid"` intact and both exposed in `public_dict()`; MCP scope is narrower than the GUI bearer — no `auth_*` ops, no `retention_sweep`, no `shutdown`/`ping`/raw `jobs_upload`, settings read-only; no tool payload ever contains token material (asserted with a configured token over both transports, and against the audit log); `"both"` serves stdio and HTTPS simultaneously in one `tc farmhand serve` process (when the stdio client hangs up the process exits); coopd binds its unix socket only after the coop (and the Farmhand endpoint) is up, so a ping OK implies the HTTP surface is up and its `coop.started` row is already audited; the coop/standalone aiohttp runners got `shutdown_timeout=15` so a hung MCP SSE stream can never wedge shutdown; full suite green, 362 passed (353 + 9 new tests/test_farmhand.py)). Same day earlier: spec 23 landed (Free-Range chickens — `resources.free_range = true` removes the hard wall-clock kill: `timeout_sec` becomes optional (`int | None`, `gt=0`, `validate_default=True`) with the pairing enforced at spec load (`free_range = false` — the default — requires `timeout_sec > 0`, field-named `resources.timeout_sec` error; `free_range = true` allows it absent and never hard-kills even if present; `extra="forbid"` intact; `spec_hash` drops `free_range=false` so pre-23 egg hashes are unchanged, the shipped example still `sha256:18efbd8c…80b959`); adapters take `timeout_sec: int | None` (`None` = no hard kill — `wait_for(..., None)` waits forever, the API adapter keeps only its 10s connect timeout); the Hatchery enforces `hard_timeout = None if free_range else timeout_sec` and the manifest `resources` + `budget` blocks gain `free_range`; a Free-Range chicken dies only via `run_stop` (spec 22) or daemon shutdown — on shutdown the daemon calls `pipeline.request_stop_free_range()` before the bounded drain, so an in-flight free-range chicken ends `stopped` via the SIGTERM/hard-kill path with attestation (1,1,1) + `chicken.stopped`/`abattoir.attested` audit rows before exit; decision-log amendment for baseline invariants 1/2 recorded in `specs/23-free-range-chickens.md` + §5 below; full suite green, 353 passed (340 + 13 new tests/test_free_range.py)). Same day: spec 25 landed (chaining — `attachments = ["nestbox://<run_id>/output.json"]` in `[input]`: URI shape validated at spec load with field-named errors (`input.attachments`), resolved at provisioning from the Nest Box via the new `chaining.py` seam — valid clutches only, quarantined/composted/missing/malformed → fail-closed provisioning failure before `running` with attested teardown (1,1,1) and no results row; resolved clutch bytes count toward `max_context_mb` (over-cap chain → `budget.outcome = "context_cap"` exactly like spec 07); lineage in the manifest `chaining` block (run id + artifact path + bytes) + `clutch.consumed` Headcount rows + a run-log line; `jobs_upload` bundles no longer need nestbox attachments shipped in them; lexicon gained Chaining; full suite green, 340 passed). Same day earlier: spec 24 landed (Feed Budget cost cap — optional per-egg `resources.max_cost_usd` in USD, off by default, enforced finalize-only: over cap → run failed with `budget.outcome = "cost_cap"` in the existing manifest budget block, cost/token telemetry still recorded, teardown attested as usual; pure seam `cost_cap_exceeded`; full suite green, 307 passed). Same day earlier: spec 22 landed (lifecycle ops — socket ops `run_stop`/`run_rerun`, CLI `tc runs stop`/`tc runs rerun`, terminal states `cancelled`/`stopped` with attested teardown on every stop path, `egg.cancelled`/`chicken.stopped` Headcount rows, `rerun_of` lineage, lexicon terms added first; full suite green, 298 passed). Same day earlier: spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier then: 22, 24, 25); still no code changed.
 
 ---
 
@@ -27,7 +27,7 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10, specs 12–20, and specs 22–26 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, the spec-20 commit, the spec-22 commit, the spec-23 commit, the spec-24 commit, the spec-25 commit, and the spec-26 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
+**Spec 01 through spec 10, specs 12–20, and specs 22–27 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, the spec-20 commit, the spec-22 commit, the spec-23 commit, the spec-24 commit, the spec-25 commit, and the spec-26 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
 
 Spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality. Spec 19 gave seat auth a GUI surface (see below).
 Verified this session:
@@ -310,6 +310,26 @@ Verified this session:
 #     endpoint answer simultaneously; when the stdio client hangs up the process exits (port refuses)
 #   → tc --help shows farmhand; tc jobs validate examples/weekly-incidents-digest/job.toml →
 #     sha256:18efbd8c…80b959 (unchanged); full suite: 362 passed (353 + 9 new tests/test_farmhand.py)
+# spec-27 smoke (subprocess daemon, temp data_dir, fake vibe binary that itself drives the attached
+#   Farmhand over stdio via the SDK's MCP client, driven through the real `tc` CLI):
+#   → tc run <spawn_subs parent whose prompt says SUBSPAWN <sub-egg path>> --wait → rc 0 succeeded;
+#     parent manifest harness={spawn_subs=true, farmhand={attached=true, transport=stdio,
+#     config=.vibe/config.toml}}; parent clutch reports sub_run_id + sub_status=succeeded + weight=1.0 +
+#     sub_parent_run_id=<parent> and the full 17-tool list (parent is not a sub)
+#   → sub (spawn_subs=true, prompt SUBSCOPE <grand-egg path>) → succeeded; runs.parent_run_id=<parent>,
+#     sub manifest parent_run_id=<parent>, egg.queued audit row parent_run_id=<parent>, runs_list rows
+#     carry parent_run_id; sub clutch shows the 11-tool sub scope (no schedule_*/settings_get/jobs_validate/
+#     run_rerun), depth_refusal='harness.spawn_subs: sub-chicken … cannot queue an egg with spawn_subs =
+#     true — ChickenSub depth is capped at 1' and stop_refusal='refused: chicken <parent> is an ancestor of
+#     the calling sub-chicken …'; exactly two runs exist (no sub-sub); both attested (1,1,1), valid clutches
+#   → socket: enqueue <spawn_subs egg> parent_run_id=<sub> → ok:false, errors[0].field=harness.spawn_subs,
+#     nothing queued; enqueue parent_run_id=run-nope → 'unknown chicken'; run_stop run_id=<running parent>
+#     caller_run_id=<sub> → refused '… is an ancestor …' while the operator stop (no caller) still works
+#   → secrecy with coop_auth_token configured: token absent from manifests, results (incl. the settings_get
+#     payload the parent's farmhand read), run logs, runs_list/status, and audit.jsonl
+#   → tc jobs validate examples/weekly-incidents-digest/job.toml → sha256:18efbd8c…80b959 (unchanged);
+#     tc status → alerts: 0; tc daemon stop → rc 0
+#   → full suite: 374 passed (362 + 12 new tests/test_chickensubs.py)
 ```
 
 What exists:
@@ -396,7 +416,8 @@ src/turbochickens/
 ├── storage.py             # init_db(): full MVP SQLite schema + `schedules` table (spec 06) +
 │                          # `job_usage_stats` percentile columns (spec 08, schema_version=3→4 migration)
 │                          # + `job_specs.spec_path` (spec 16, schema_version=4, in-place ALTER migration
-│                          # of v3 DBs) + append-only triggers + schema_meta
+│                          # of v3 DBs) + append-only triggers + schema_meta; spec 27: `runs.parent_run_id`
+│                          # (schema_version 5, in-place ALTER migration of v4 DBs; old rows NULL)
 ├── audit.py               # AuditLog: append-only JSONL, the Headcount (open "a" only, fsync per row) — never TTL-deleted;
 │                          # spec 13: tail(limit, event) — last N rows newest first, defensive read;
 │                          # spec 20: LEGACY_EVENT_ALIASES maps pre-20 event names to lexicon names on
@@ -415,7 +436,17 @@ src/turbochickens/
 │                          # FarmhandHTTP owns that endpoint (path, coop bearer rule, ASGI lifespan);
 │                          # serve_stdio / serve_https / serve_transport power
 │                          # `tc farmhand serve --transport stdio|https|both` ("both" = the two at
-│                          # once in one process; when the stdio client hangs up, it exits)
+│                          # once in one process; when the stdio client hangs up, it exits); spec 27
+│                          # (ChickenSubs): `attach_farmhand_to_run` writes the `[mcp_servers.farmhand]`
+│                          # entry into the run's vibe config (`<workspace>/.vibe/config.toml`) spawning
+│                          # the farmhand serve command (venv-sibling `tc` else `python -m turbochickens`)
+│                          # + a token-free settings file (`settings_toml_for_farmhand`) the per-run env
+│                          # points at via TURBOCHICKENS_SETTINGS; `build_server` reads
+│                          # TURBOCHICKENS_RUN_ID / TURBOCHICKENS_PARENT_RUN_ID from the env so a Farmhand
+│                          # inside a chicken tags enqueue with parent_run_id and run_stop with
+│                          # caller_run_id, and a sub-chicken's server serves the narrowed tool set
+│                          # (enqueue + reads + guarded run_stop; no jobs_validate/run_rerun/schedule_*/
+│                          # settings_get)
 ├── chaining.py            # spec 25: chaining — `nestbox://<run_id>/output.json` attachments: the URI-shape
 │                          # seams (parse_nestbox_uri / is_nestbox_uri / looks_like_uri — exactly
 │                          # nestbox://<run_id>/output.json, anything else URI-shaped is a spec-load error),
@@ -449,7 +480,10 @@ src/turbochickens/
 │                          # attachment_workspace_name (chained clutches land there at provisioning);
 │                          # spec 23: execute(..., timeout_sec: int | None) — None = no hard kill
 │                          # (Free-Range), wait_for(..., None) waits forever; the API adapter keeps
-│                          # only its 10s connect timeout
+│                          # only its 10s connect timeout; spec 27: RunContext.parent_run_id;
+│                          # VibeCLIAdapter takes `settings` and, when harness.spawn_subs, attaches the
+│                          # Farmhand to the run's vibe-cli runtime over stdio (see farmhand.py) — the
+│                          # manifest harness block gains spawn_subs + farmhand; make_adapter passes settings
 ├── providers.py           # spec 05: providers.toml registry — provider/model presets, base_url,
 │                          # credential env var, context_window, per-token pricing; resolution:
 │                          # settings.providers_path > $TURBOCHICKENS_PROVIDERS > <data_dir>/providers.toml
@@ -484,7 +518,10 @@ src/turbochickens/
 │                          # else timeout_sec` — no wall-clock kill for free-range chickens; the
 │                          # manifest `resources` + `budget` blocks gain `free_range`; active
 │                          # free-range chickens are tracked (`_active_free_range`) and
-│                          # `request_stop_free_range()` stops them via the spec-22 stop path
+│                          # `request_stop_free_range()` stops them via the spec-22 stop path; spec 27:
+│                          # the queue item's parent_run_id lands on RunContext → the manifest
+│                          # (also on cancelled queued eggs) + a run-log line when the Farmhand is
+│                          # attached to the harness runtime
 ├── scheduler.py           # spec 06: CronScheduler over APScheduler AsyncIOScheduler; standard
 │                          # POSIX cron semantics (aps_trigger resolves the day-of-week field via
 │                          # croniter because APScheduler numbers 0=Monday); schedules re-registered
@@ -537,7 +574,13 @@ src/turbochickens/
 │                          # hard kill → terminal `stopped`, attested (1,1,1)) before exit;
 │                          # spec 26: with coop_enabled, the coop (incl. the Farmhand MCP endpoint)
 │                          # is started BEFORE the unix socket accepts, so a ping OK implies the
-│                          # HTTP surface is up and its coop.started row is already audited
+│                          # HTTP surface is up and its coop.started row is already audited;
+│                          # spec 27 (ChickenSubs): enqueue accepts parent_run_id (unknown parent refused;
+│                          # depth cap 1 — a sub enqueueing a spawn_subs=true egg → field-named
+│                          # harness.spawn_subs error; spawn_subs refused for non-vibe-cli adapters) and
+│                          # records lineage on the runs row + queue item + egg.queued row + response;
+│                          # run_stop with caller_run_id refuses ancestor targets (_ancestor_run_ids);
+│                          # runs_show/runs_list rows carry parent_run_id
 ├── client.py              # request(socket, op, **payload) → parsed response; DaemonUnreachable;
 │                          # spec 12: request_async(...) — the same exchange awaitable inside a running
 │                          # loop (used by the coop web layer's SocketTransport); spec 15: the stream
@@ -559,7 +602,9 @@ src/turbochickens/
 │   │                      # (spec 24: resources.max_cost_usd — optional USD cost cap,
 │   │                      #  positive-only, default None = off; still no max_tokens)
 │   │                      # (spec 25: [input].attachments entries that are URI-shaped must be
-│   │                      #  exactly nestbox://<run_id>/output.json — field-named error otherwise)
+│   │                      #  exactly nestbox://<run_id>/output.json — field-named error otherwise);
+│   │                      # (spec 27: harness.spawn_subs — bool, default false; spec_hash drops
+│   │                      #  spawn_subs=false so pre-27 egg hashes are unchanged)
 │   └── loader.py          # load_spec(), SpecValidationError (field-named issues), spec_hash()
 │                          # (spec_hash excludes None optionals and free_range=false, so pre-23
 │                          #  spec hashes are unchanged)
@@ -719,11 +764,20 @@ tests/
                            # mounted when farmhand_transport="stdio", non-loopback ephemeral token
                            # gating /mcp and never appearing in any tool payload or the audit log), and
                            # `--transport both` serving stdio and HTTPS simultaneously in one process
+└── test_chickensubs.py     # spec 27: ChickenSubs — spawn_subs field/hash pure seams, schema v5 migration
+                           # (v4 DB gains runs.parent_run_id, old rows NULL), the attach seam (vibe config
+                           # entry + token-free settings file + per-run env), socket-level lineage/depth-cap/
+                           # ancestor-refusal tests, and the e2e: a fake vibe binary that itself drives the
+                           # attached Farmhand over stdio (SDK MCP client) — parent enqueues a sub (weight 1.0,
+                           # parent_run_id in runs/manifest/runs_list/egg.queued), sub gets the 11-tool sub
+                           # scope, its spawn_subs enqueue refused (harness.spawn_subs) and its run_stop on
+                           # the parent refused (ancestor); stdio-level sub/full scope tests with the run env;
+                           # secrecy with a configured coop token over manifests/results/logs/audit
 examples/weekly-incidents-digest/   # baseline-format example job (job.toml, prompt, schema, csv; mistral-api)
 examples/hello-vibe-cli/            # manual vibe-cli example job (job.toml, prompt, schema)
 examples/providers.toml             # spec 05 reference provider registry (mistral presets + pricing,
                            # commented other-provider example) — copy to ~/.turbochickens/providers.toml
-pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.18, deps: pydantic, typer, rich, croniter,
+pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.19, deps: pydantic, typer, rich, croniter,
                            # jsonschema (+ rfc3339-validator for format checks), httpx, apscheduler (spec 06),
                            # aiohttp (spec 12, coop web server), mcp (spec 26, the Farmhand MCP server);
                            # dev: pytest
@@ -1230,6 +1284,7 @@ Spec-18 deliverables, concretely:
 | 24 | Feed Budget cost cap — `resources.max_cost_usd` (USD, off by default, finalize-only `budget.outcome = "cost_cap"`, telemetry always recorded) | **done** (2026-11-14) | 05, 08 |
 | 25 | Chaining — `nestbox://<run_id>/output.json` attachments resolved from the Nest Box at provisioning (valid clutches only), counted toward the context cap, lineage in manifest/audit | **done** (2026-11-14) | 04, 07 |
 | 26 | The Farmhand — MCP server over the farm's own socket ops (stdio + HTTPS on the coop listener, bearer-gated; `tc farmhand serve --transport stdio|https|both`; `farmhand_transport`/`farmhand_https_path` settings) | **done** (2026-11-14) | 22, 12–19 |
+| 27 | ChickenSubs — `harness.spawn_subs = true` attaches the Farmhand to the chicken's vibe-cli runtime over stdio (MCP entry in the run's vibe config); subs are ordinary eggs in the same queue/admission with `parent_run_id` lineage (schema v5) in store/manifest/audit, depth capped at 1 (field-named `harness.spawn_subs` refusal), sub tool scope narrowed (enqueue + reads + guarded `run_stop`; ancestors refused; no schedule/auth/settings tools) | **done** (2026-11-14) | 22, 26 |
 
 ## 5. Non-negotiable invariants (baseline v0.2 — do not regress these)
 
@@ -1519,6 +1574,23 @@ Verified e2e with the SDK's own MCP client over stdio against
 (bearer 401/200, loopback-open, ephemeral-token mode, MCP==socket payload
 parity for every tool, enqueue→succeeded→results_get, run_stop/run_rerun,
 jobs_validate, schedules), full suite 362 passed.
+
+Spec 27 (ChickenSubs) landed: a chicken whose egg sets `harness.spawn_subs = true` gets the Farmhand
+attached to its vibe-cli runtime over stdio — an `[mcp_servers.farmhand]` entry in the run's vibe config
+(project-local `.vibe/config.toml` in the workspace) spawning the farmhand serve command, with a
+token-free generated settings file wired through `TURBOCHICKENS_SETTINGS` so the spawned process finds
+the daemon's socket. Sub-chickens are ordinary eggs through the same socket/queue/admission (weight
+unchanged), with `parent_run_id` lineage on the new `runs.parent_run_id` column (schema v5, in-place
+migration), in the manifest, in the `egg.queued` Headcount row, and in `runs_show`/`runs_list` rows.
+Depth is capped at 1: enqueue refuses a `spawn_subs = true` egg when the enqueuing run is itself a sub
+(field-named `harness.spawn_subs` error), and `spawn_subs` is refused for non-vibe-cli adapters.
+A Farmhand running inside a chicken reads `TURBOCHICKENS_RUN_ID`/`TURBOCHICKENS_PARENT_RUN_ID` from the
+per-run env: `enqueue` passes `parent_run_id`, `run_stop` passes `caller_run_id` (ancestor targets
+refused), and a sub-chicken's Farmhand serves only enqueue + read tools + the guarded `run_stop`. Lexicon
+gained **ChickenSub**; version 0.0.19. Verified e2e with a fake vibe binary that itself drives the
+attached Farmhand over stdio (SDK MCP client) through the `tc` CLI against a subprocess daemon
+(lineage recorded everywhere, depth-1 and ancestor refusals, 11-tool sub scope, secrecy with a
+configured token), full suite 374 passed.
 
 The MVP spec pipeline (01–10) and the GUI spec 11 slices (12–20) are
 complete; what remains is the post-MVP roadmap in baseline §13.

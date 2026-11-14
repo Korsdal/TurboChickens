@@ -93,6 +93,9 @@ class RunContext:
     workspace: Path
     env: dict[str, str] = field(default_factory=dict)
     proc: asyncio.subprocess.Process | None = None
+    # spec 27 (ChickenSubs): the parent chicken when this run is a sub-chicken
+    # enqueued through a spawn_subs chicken's Farmhand (lineage parent_run_id)
+    parent_run_id: str | None = None
 
 
 @dataclass
@@ -228,11 +231,16 @@ class VibeCLIAdapter:
         self,
         bin_path: str | None = None,
         credential_provider: CredentialProvider | None = None,
+        settings: Any = None,
     ) -> None:
         self.bin = bin_path or resolve_vibe_bin()
         self.credential_provider: CredentialProvider = (
             credential_provider or EnvAllowlistCredentialProvider()
         )
+        # spec 27 (ChickenSubs): needed to attach the Farmhand to a
+        # spawn_subs chicken's runtime (the generated settings file for the
+        # spawned farmhand process points back at this daemon's data_dir)
+        self.settings = settings
         self._version: str | None = None
 
     def _vibe_version(self) -> str:
@@ -242,15 +250,26 @@ class VibeCLIAdapter:
 
     def prepare(self, run: RunContext) -> PreparedRun:
         run.env = build_per_run_env(run, self.credential_provider.credentials(run))
+        harness: dict[str, Any] = {
+            "adapter": self.name,
+            "version": self._vibe_version(),
+            "provider": "mistral",
+            "model": run.spec.harness.model,
+            "temperature": run.spec.harness.temperature,
+            # spec 27 (ChickenSubs): mirrored in the manifest
+            "spawn_subs": run.spec.harness.spawn_subs,
+        }
+        if run.spec.harness.spawn_subs and self.settings is not None:
+            # spec 27: attach the Farmhand to this chicken's harness runtime
+            # over stdio — an MCP server entry in the run's vibe config
+            # spawning `tc farmhand serve --transport stdio` (lazy import:
+            # farmhand → client → daemon → adapter would be a cycle)
+            from turbochickens.farmhand import attach_farmhand_to_run
+
+            harness["farmhand"] = attach_farmhand_to_run(run, self.settings)
         return PreparedRun(
             context=run,
-            harness={
-                "adapter": self.name,
-                "version": self._vibe_version(),
-                "provider": "mistral",
-                "model": run.spec.harness.model,
-                "temperature": run.spec.harness.temperature,
-            },
+            harness=harness,
             # spec 09: non-secret auth telemetry (mode + token expiry, never a
             # token). A seat-configured vibe profile is handled by the vibe
             # binary itself via HOME passthrough, hence "none" when no env key.
@@ -417,6 +436,10 @@ class MistralAPIAdapter:
                 "provider": self.provider_name,
                 "model": self.model,
                 "temperature": run.spec.harness.temperature,
+                # spec 27: mirrored in the manifest (no Farmhand attach — an
+                # HTTP adapter has no harness runtime to attach to; enqueue
+                # refuses spawn_subs = true for this adapter)
+                "spawn_subs": run.spec.harness.spawn_subs,
             },
             # spec 09: "seat" providers inject the broker's access token under
             # api_key_env (same var), so the bearer header below is unchanged
@@ -606,11 +629,14 @@ def make_adapter(
     spec: JobSpec,
     credential_provider: CredentialProvider | None = None,
     providers: ProvidersConfig | None = None,
+    settings: Any = None,
 ) -> HarnessAdapter:
     """Instantiate the adapter named by the spec. The model/provider must
-    resolve from providers.toml — unknown ones fail here, at enqueue time."""
+    resolve from providers.toml — unknown ones fail here, at enqueue time.
+    `settings` is handed to the vibe-cli adapter so a spawn_subs chicken can
+    attach the Farmhand (spec 27)."""
     if spec.harness.adapter == "vibe-cli":
-        return VibeCLIAdapter(credential_provider=credential_provider)
+        return VibeCLIAdapter(credential_provider=credential_provider, settings=settings)
     if spec.harness.adapter == "mistral-api":
         try:
             return MistralAPIAdapter(spec, providers=providers, credential_provider=credential_provider)

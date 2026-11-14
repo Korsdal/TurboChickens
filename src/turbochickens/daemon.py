@@ -66,6 +66,18 @@ chicken dies only via ``run_stop`` or daemon shutdown — on shutdown the
 daemon asks every active Free-Range chicken to stop through the same
 spec-22 stop path (SIGTERM → hard kill → terminal ``stopped`` with the
 abattoir's attested teardown) before exiting.
+
+Spec 27 (ChickenSubs) adds ``harness.spawn_subs``: a chicken with
+``spawn_subs = true`` gets the Farmhand attached to its vibe-cli runtime over
+stdio (the adapter writes the MCP server entry into the run's vibe config), so
+it can enqueue sub-eggs through the farm's own contract. ``enqueue`` accepts
+``parent_run_id``: the sub is an ordinary egg through the same queue/admission
+(weight unchanged), with lineage recorded on the `runs.parent_run_id` column
+(schema v5), in the manifest, and in the ``egg.queued`` Headcount row. Depth
+is capped at 1 — enqueue refuses a ``spawn_subs = true`` egg when the
+enqueuing run is itself a sub (field-named ``harness.spawn_subs`` error) —
+and ``run_stop`` with a ``caller_run_id`` refuses targets that are the caller's
+ancestors. ``runs_show``/``runs_list`` rows carry ``parent_run_id``.
 """
 
 from __future__ import annotations
@@ -468,6 +480,7 @@ class Daemon:
         spec_path = Path(str(spec_path_raw))
         trigger = str(req.get("trigger", "manual"))
         rerun_of = req.get("rerun_of")  # spec 22: `run_rerun` lineage
+        parent_run_id = req.get("parent_run_id")  # spec 27: ChickenSub lineage
         try:
             spec = load_spec(spec_path)
         except SpecValidationError as e:
@@ -488,6 +501,19 @@ class Daemon:
             weight = run_weight(spec.harness.adapter)
         except KeyError:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"unknown adapter: {spec.harness.adapter!r}"}
+        if spec.harness.spawn_subs and spec.harness.adapter != "vibe-cli":
+            # spec 27: only the vibe-cli harness has a runtime to attach the
+            # Farmhand to — fail closed instead of a silent no-op
+            msg = (
+                f"harness.spawn_subs: adapter {spec.harness.adapter!r} has no harness runtime to attach"
+                " the Farmhand to — spawn_subs = true is only supported with adapter 'vibe-cli'"
+            )
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": msg,
+                "errors": [{"field": "harness.spawn_subs", "message": msg}],
+            }
         from turbochickens.adapter import make_adapter
 
         try:
@@ -495,6 +521,34 @@ class Daemon:
             make_adapter(spec, providers=self.providers)
         except (AdapterNotImplemented, ProviderConfigError) as e:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": str(e)}
+        if parent_run_id is not None:
+            parent_run_id = str(parent_run_id)
+            if not parent_run_id:
+                return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "enqueue parent_run_id must be a non-empty run id"}
+            assert self.db is not None
+            prow = self.db.execute("SELECT parent_run_id FROM runs WHERE id = ?", (parent_run_id,)).fetchone()
+            if prow is None:
+                return {
+                    "ok": False,
+                    "protocol": PROTOCOL_VERSION,
+                    "error": (
+                        f"unknown chicken: parent_run_id {parent_run_id!r} — a sub-egg must be enqueued"
+                        " by an existing chicken (through its Farmhand)"
+                    ),
+                }
+            if prow[0] is not None and spec.harness.spawn_subs:
+                # spec 27: depth cap 1 — the enqueuing run is itself a sub, so
+                # it cannot queue an egg that would itself spawn subs
+                msg = (
+                    f"harness.spawn_subs: sub-chicken {parent_run_id!r} (itself a sub of {prow[0]!r})"
+                    " cannot queue an egg with spawn_subs = true — ChickenSub depth is capped at 1"
+                )
+                return {
+                    "ok": False,
+                    "protocol": PROTOCOL_VERSION,
+                    "error": msg,
+                    "errors": [{"field": "harness.spawn_subs", "message": msg}],
+                }
         job_id = spec.job.name
         run_id = "run-" + uuid.uuid4().hex[:12]
         started_at = utcnow_iso()
@@ -506,8 +560,8 @@ class Daemon:
                 (job_id, spec.job.name, digest, spec_path.read_text(encoding="utf-8"), started_at, str(spec_path.resolve())),
             )
             self.db.execute(
-                "INSERT INTO runs (id, job_id, status, trigger, started_at) VALUES (?, ?, ?, ?, ?)",
-                (run_id, job_id, "queued", trigger, started_at),
+                "INSERT INTO runs (id, job_id, status, trigger, started_at, parent_run_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, job_id, "queued", trigger, started_at, parent_run_id),
             )
             self.db.commit()
         item = {
@@ -521,6 +575,8 @@ class Daemon:
         }
         if rerun_of:
             item["rerun_of"] = str(rerun_of)
+        if parent_run_id:
+            item["parent_run_id"] = parent_run_id
         await self.queue.put(item)
         assert self.audit is not None
         queued_row: dict[str, Any] = {
@@ -533,6 +589,9 @@ class Daemon:
         }
         if rerun_of:
             queued_row["rerun_of"] = str(rerun_of)
+        if parent_run_id:
+            # spec 27: sub-chicken lineage in the Headcount
+            queued_row["parent_run_id"] = parent_run_id
         self.audit.append(queued_row)
         resp: dict[str, Any] = {
             "ok": True,
@@ -546,6 +605,8 @@ class Daemon:
         }
         if rerun_of:
             resp["rerun_of"] = str(rerun_of)
+        if parent_run_id:
+            resp["parent_run_id"] = parent_run_id
         return resp
 
     # --- admission control + scheduler -------------------------------------
@@ -607,7 +668,7 @@ class Daemon:
             return None
         row = self.db.execute(
             "SELECT r.id, r.job_id, j.name, r.status, r.trigger, r.started_at, r.finished_at,"
-            " r.manifest_json, r.usage_json FROM runs r JOIN job_specs j ON j.id = r.job_id WHERE r.id = ?",
+            " r.manifest_json, r.usage_json, r.parent_run_id FROM runs r JOIN job_specs j ON j.id = r.job_id WHERE r.id = ?",
             (run_id,),
         ).fetchone()
         if row is None:
@@ -629,6 +690,8 @@ class Daemon:
             "trigger": row[4],
             "started_at": row[5],
             "finished_at": row[6],
+            # spec 27: sub-chicken lineage (None for ordinary chickens)
+            "parent_run_id": row[9],
             "manifest": json.loads(row[7]) if row[7] else None,
             "usage": json.loads(row[8]) if row[8] else None,
             "attestation": (
@@ -676,7 +739,7 @@ class Daemon:
             "SELECT r.id, r.job_id, j.name, r.status, r.trigger, r.started_at, r.finished_at,"
             " (SELECT COUNT(*) FROM teardown_attestations t WHERE t.run_id = r.id),"
             " (SELECT valid FROM results WHERE run_id = r.id),"
-            " r.manifest_json"
+            " r.manifest_json, r.parent_run_id"
             f" FROM runs r JOIN job_specs j ON j.id = r.job_id{where} ORDER BY r.rowid DESC",
             params,
         ).fetchall()
@@ -710,6 +773,8 @@ class Daemon:
                     "result_valid": None if r[8] is None else bool(r[8]),
                     "auth_mode": auth_mode,
                     "status_reason": status_reason,
+                    # spec 27: sub-chicken lineage (None for ordinary chickens)
+                    "parent_run_id": r[10],
                 }
             )
         return {"ok": True, "op": "runs_list", "protocol": PROTOCOL_VERSION, "runs": runs}
@@ -741,12 +806,34 @@ class Daemon:
 
     # --- spec 22: lifecycle ops — stop & re-run a chicken --------------------
 
+    def _ancestor_run_ids(self, run_id: str) -> set[str]:
+        """Spec 27: the ancestor chain of a chicken via `parent_run_id`
+        (a sub-chicken's parent, its parent's parent, …). Depth is capped at
+        1 by enqueue, so this is short; the loop guards against cycles anyway."""
+        if self.db is None:
+            return set()
+        ancestors: set[str] = set()
+        seen = {run_id}
+        cur = run_id
+        while True:
+            row = self.db.execute("SELECT parent_run_id FROM runs WHERE id = ?", (cur,)).fetchone()
+            if row is None or row[0] is None or row[0] in seen:
+                break
+            ancestors.add(row[0])
+            seen.add(row[0])
+            cur = row[0]
+        return ancestors
+
     async def _run_stop(self, req: dict[str, Any]) -> dict[str, Any]:
         """End a chicken deliberately. A queued egg is pulled from the pecking
         order → terminal `cancelled` (it never hatches); a chicken already in
         the Hatchery gets SIGTERM, then a hard kill → terminal `stopped`. Both
         paths get the abattoir's attested teardown and Headcount rows. Waits
-        for the terminal state and returns it with its reason."""
+        for the terminal state and returns it with its reason.
+
+        Spec 27: when the request carries `caller_run_id` (a Farmhand running
+        inside a sub-chicken), a target that is one of the caller's ancestors
+        is refused — a sub-chicken cannot stop its ancestors."""
         run_id = str(req.get("run_id", ""))
         if not run_id:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "run_stop requires run_id"}
@@ -762,6 +849,18 @@ class Daemon:
                 "protocol": PROTOCOL_VERSION,
                 "error": f"chicken {run_id!r} is already terminal ({status}) — nothing to stop",
             }
+        caller_run_id = req.get("caller_run_id")
+        if caller_run_id:
+            caller_run_id = str(caller_run_id)
+            if run_id in self._ancestor_run_ids(caller_run_id):
+                return {
+                    "ok": False,
+                    "protocol": PROTOCOL_VERSION,
+                    "error": (
+                        f"refused: chicken {run_id!r} is an ancestor of the calling sub-chicken"
+                        f" {caller_run_id!r} — a sub-chicken cannot stop its ancestors"
+                    ),
+                }
         # mark for cancellation in case the scheduler has not popped/admitted
         # the egg yet, and cancel it right away when it is sitting in the backlog
         self._cancel_requested.add(run_id)

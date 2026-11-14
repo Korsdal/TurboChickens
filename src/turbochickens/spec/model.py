@@ -11,6 +11,9 @@ Spec 23 (Free-Range) adds ``resources.free_range``: a Free-Range chicken has
 no fence — no hard wall-clock kill — so ``timeout_sec`` becomes optional and
 the pairing is validated here (``free_range = false`` requires
 ``timeout_sec > 0``; ``free_range = true`` allows it absent).
+Spec 27 (ChickenSubs) adds ``harness.spawn_subs``: a chicken with
+``spawn_subs = true`` gets the Farmhand attached to its harness runtime over
+stdio, so it can enqueue sub-eggs (lineage ``parent_run_id``, depth cap 1).
 """
 
 from __future__ import annotations
@@ -72,6 +75,13 @@ class HarnessSection(_StrictModel):
     adapter: Literal["mistral-api", "vibe-cli"]
     model: str = Field(min_length=1)
     temperature: float = Field(ge=0.0, le=2.0)
+    # spec 27 (ChickenSubs): a chicken with spawn_subs = true gets the
+    # Farmhand attached to its harness runtime over stdio, so it can enqueue
+    # sub-eggs (ordinary eggs through the same queue/admission, lineage
+    # `parent_run_id`, depth capped at 1) and read the flock through the
+    # farm's own contract. Only the vibe-cli harness has a runtime to attach
+    # to; the daemon refuses spawn_subs = true for other adapters at enqueue.
+    spawn_subs: bool = False
 
 
 class ResourcesSection(_StrictModel):

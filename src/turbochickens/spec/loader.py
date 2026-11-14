@@ -87,6 +87,11 @@ def spec_hash(spec: JobSpec) -> str:
     resources = data.get("resources")
     if isinstance(resources, dict) and resources.get("free_range") is False:
         del resources["free_range"]
+    # spec 27: `spawn_subs = false` is the pre-27 default — same treatment, so
+    # existing egg hashes are unchanged
+    harness = data.get("harness")
+    if isinstance(harness, dict) and harness.get("spawn_subs") is False:
+        del harness["spawn_subs"]
     canonical = json.dumps(
         data,
         sort_keys=True,
