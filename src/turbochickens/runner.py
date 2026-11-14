@@ -60,6 +60,7 @@ import asyncio
 import contextlib
 import json
 import shutil
+import signal
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -70,7 +71,9 @@ from turbochickens.adapter import (
     TeardownReport,
     auth_telemetry_of,
     make_adapter,
+    reap_process_group,
     sanitize_log_line,
+    signal_process_group,
 )
 from turbochickens.audit import AuditLog
 from turbochickens.chaining import (
@@ -95,6 +98,14 @@ TERMINAL_STATES = ("succeeded", "failed", "cancelled", "stopped")
 
 #: spec 22: grace between SIGTERM and the hard kill when stopping a chicken
 STOP_TERM_GRACE_SEC = 5.0
+
+#: spec 32 (review finding G15): cap on the post-kill `await` of the harness
+#: task. The chicken runs in its own session and is killed as a whole process
+#: group, so the task normally completes right away; if a pipe-holding
+#: escapee keeps the pipes open past the kill, the bounded await times out and
+#: a synthetic harness result is produced so teardown always completes and
+#: the run always reaches a terminal state with its attestation.
+POST_KILL_AWAIT_SEC = 5.0
 
 OUTPUT_EVENT_MAX_LEN = 20_000
 
@@ -624,9 +635,13 @@ class RunPipeline:
         timeout_sec: int | None,
     ) -> tuple[HarnessResult, str | None]:
         """Spec 22: run the harness to completion, racing an operator stop.
-        When `run_stop` fires mid-run, the harness process gets SIGTERM first
-        and a hard kill after `STOP_TERM_GRACE_SEC`; the run then ends
-        `stopped` and its output is never collected or candled. Returns
+        When `run_stop` fires mid-run, the harness process group gets SIGTERM
+        first and a hard kill after `STOP_TERM_GRACE_SEC` (spec 32 / G15: the
+        chicken is spawned in its own session, so the signals reach the whole
+        group, and the post-kill await of the harness task is bounded — on
+        timeout a synthetic result is produced so the run always reaches a
+        terminal state with its attestation). The run then ends `stopped`
+        and its output is never collected or candled. Returns
         (harness result, stopped reason or None). `timeout_sec=None` (spec 23,
         Free-Range) means no wall-clock kill — only the stop event ends it."""
         run_id = ctx.run_id
@@ -643,28 +658,49 @@ class RunPipeline:
         if stop_event.is_set() and not exec_task.done():
             proc = ctx.proc
             if proc is not None and proc.returncode is None:
-                # SIGTERM first, then the hard kill after the grace period
-                with contextlib.suppress(ProcessLookupError):
-                    proc.terminate()
+                # spec 32 (G15): the chicken was spawned in its own session,
+                # so SIGTERM goes to the whole process group (grandchildren
+                # included), and after the grace the group gets a SIGKILL —
+                # a pipe-holding grandchild can no longer survive the stop
+                signal_process_group(proc, signal.SIGTERM)
                 hard_killed = False
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=STOP_TERM_GRACE_SEC)
                 except asyncio.TimeoutError:
-                    with contextlib.suppress(ProcessLookupError):
-                        proc.kill()
                     hard_killed = True
-                    with contextlib.suppress(Exception):
-                        await proc.wait()
+                # reap the whole group either way: SIGTERM survivors (and
+                # pipe-holders) must not outlive the stop; the reap await is
+                # bounded so it can never wedge the run
+                await reap_process_group(proc)
                 reason = (
                     f"stopped by operator: SIGTERM, then hard kill after {STOP_TERM_GRACE_SEC:g}s grace"
                     if hard_killed
                     else f"stopped by operator: SIGTERM (reaped within {STOP_TERM_GRACE_SEC:g}s grace)"
                 )
-                result = await exec_task  # completes now that the process is dead
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(exec_task), timeout=POST_KILL_AWAIT_SEC)
+                except asyncio.TimeoutError:
+                    # a pipe-holding escapee kept the harness task alive past
+                    # the group kill — synthesize the result so teardown
+                    # always completes and the run reaches terminal state
+                    exec_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await exec_task
+                    result = HarnessResult(
+                        exit_code=proc.returncode,
+                        raw_output="",
+                        usage={},
+                        error="stopped by operator (synthetic result: harness pipes still held after the process-group kill)",
+                    )
+                    reason = f"{reason}; harness output discarded (pipes still held after the group kill)"
             else:
                 # no live subprocess to signal (e.g. an HTTP adapter) — cancel
-                # the in-flight call itself
+                # the in-flight call itself, with a bounded await
                 exec_task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(exec_task), timeout=POST_KILL_AWAIT_SEC)
+                except asyncio.TimeoutError:
+                    pass
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await exec_task
                 result = HarnessResult(exit_code=None, raw_output="", usage={}, error="stopped by operator")
