@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-14, after spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only).
+**Last updated:** 2026-11-14, after spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier: 22, 24, 25 can start immediately); still no code changed.
 
 ---
 
@@ -997,6 +997,7 @@ Spec-18 deliverables, concretely:
 | 18 | coop Docker container | **done** (2026-11-12) | 12 |
 | 19 | Auth & access management UI (seat sessions, provider auth modes, access scope for tools/data/MCP/connectors) | **done** (2026-11-12) | 09, 12 |
 | 20 | Lexicon adoption — every surface speaks farm (`docs/lexicon.md` rolled out to Headcount events, GUI copy, CLI output, errors, docs; machine interfaces unchanged; legacy rows aliased on read) | **done** (2026-11-14) | 01–19 |
+| 21 | Hatchery & Farmhand overview v0.1 — lifecycle ops (stop/re-run), Free-Range, cost cap (off by default), chaining, Farmhand MCP (stdio/https/both), ChickenSubs, connectors registry, GUI for everything | overview v0.1 — **not ready-for-agent**; split into slices 22+ via to-tickets before implementation | 01–20 |
 
 ## 5. Non-negotiable invariants (baseline v0.2 — do not regress these)
 
