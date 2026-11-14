@@ -58,7 +58,7 @@ def combined_output(result) -> str:
 
 
 def run_id_of(result) -> str:
-    m = re.search(r"queued run (run-[0-9a-f]+)", result.output)
+    m = re.search(r"egg queued (run-[0-9a-f]+)", result.output)
     assert m, f"no run id in output: {result.output}"
     return m.group(1)
 
@@ -572,7 +572,7 @@ def test_api_run_over_http_lands_schema_validated_result(api_daemon, fake_api, t
     result = runner.invoke(app, ["run", str(spec_path), "--wait"])
     assert result.exit_code == 0, combined_output(result)
     assert "succeeded" in result.output
-    assert "weight=0.25" in result.output  # API runs weigh 0.25 in admission control
+    assert "weight 0.25" in result.output  # API chickens weigh 0.25 in admission control
     run_id = run_id_of(result)
     settings = api_daemon.settings
 
@@ -609,7 +609,7 @@ def test_api_run_over_http_lands_schema_validated_result(api_daemon, fake_api, t
     assert not (settings.data_dir / "workspaces" / run_id).exists()
     assert run_id not in request(settings.socket_path, "status", timeout=2.0)["alerts"]
     events = [r["event"] for r in AuditLog(settings.audit_log_path).read_all()]
-    assert "result.stored" in events and "teardown.attested" in events and "run.finished" in events
+    assert "clutch.stored" in events and "abattoir.attested" in events and "chicken.finished" in events
 
 
 def test_429_backoff_is_visible_in_run_logs(api_daemon, fake_api, tmp_path) -> None:
@@ -685,7 +685,7 @@ def test_api_runs_weigh_0_25_and_share_the_weight_budget(api_daemon, fake_api, t
     for _ in range(5):
         r = runner.invoke(app, ["run", str(spec_path)])
         assert r.exit_code == 0, combined_output(r)
-        assert "weight=0.25" in r.output
+        assert "weight 0.25" in r.output
         ids.append(run_id_of(r))
     settings = api_daemon.settings
     max_in_flight = 0
@@ -736,7 +736,7 @@ def test_e2e_subprocess_daemon_api_run(tmp_path, monkeypatch, providers_file, fa
 
         result = runner.invoke(app, ["run", str(spec_path), "--wait"])
         assert result.exit_code == 0, combined_output(result)
-        assert "weight=0.25" in result.output and "succeeded" in result.output
+        assert "weight 0.25" in result.output and "succeeded" in result.output
         run_id = run_id_of(result)
 
         res = runner.invoke(app, ["results", "get", run_id])
@@ -754,7 +754,7 @@ def test_e2e_subprocess_daemon_api_run(tmp_path, monkeypatch, providers_file, fa
         att = db_row(settings, "SELECT process_reaped, workspace_removed, env_cleared FROM teardown_attestations WHERE run_id = ?", (run_id,))
         assert att == (1, 1, 1)
         events = [r["event"] for r in AuditLog(settings.audit_log_path).read_all()]
-        for expected in ("daemon.started", "run.queued", "result.stored", "teardown.attested", "run.finished", "daemon.stopped"):
+        for expected in ("coopd.started", "egg.queued", "clutch.stored", "abattoir.attested", "chicken.finished", "coopd.stopped"):
             assert expected in events
         assert not (settings.data_dir / "workspaces" / run_id).exists()
     finally:

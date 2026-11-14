@@ -9,7 +9,7 @@ Seams (per spec 11/17 testing decisions — no browser automation):
 - runs triggered over HTTP (POST /api/runs + fake vibe binary) roll up into
   the stats the Stats view renders;
 - a sweep over HTTP with backdated runs deletes the expired artifacts
-  (result and quarantine alike), audit-logs each deletion as result.expired,
+  (result and quarantine alike), audit-logs each deletion as clutch.composted,
   and the swept run then reads back as expired over /api/results/{run_id};
 - auth-required 401s, dead-socket daemon-down payloads (never 500), served
   SPA markup, and a subprocess e2e (`tc coop start` + fake vibe).
@@ -89,7 +89,7 @@ def test_stats_endpoints_mirror_socket_and_cli_after_http_run(coop_daemon, fake_
     # unknown job → 404 (not a broken page), socket agrees it is an error
     r = c.get("/api/stats/no-such-job")
     assert r.status_code == 404
-    assert r.json()["ok"] is False and "no usage stats" in r.json()["error"]
+    assert r.json()["ok"] is False and "no feed recorded" in r.json()["error"]
     assert request(sock, "stats_show", job_id="no-such-job", timeout=2.0)["ok"] is False
 
     # CLI parity: `tc stats list` / `tc stats show` print the same numbers
@@ -163,10 +163,10 @@ def test_retention_sweep_over_http_expires_backdated_runs(coop_daemon, fake_vibe
     again = c.post("/api/retention/sweep", json={})
     assert again.status_code == 200 and again.json()["deleted"] == 0
 
-    # artifacts are gone; each deletion audit-logged as result.expired; the audit log itself is untouched
+    # artifacts are gone; each deletion audit-logged as clutch.composted; the headcount itself is untouched
     assert not ok_dir.exists() and not bad_dir.exists()
     events = AuditLog(settings.audit_log_path).read_all()
-    expired_events = [e for e in events if e["event"] == "result.expired"]
+    expired_events = [e for e in events if e["event"] == "clutch.composted"]
     assert {e["run_id"] for e in expired_events} == {run_ok, run_bad}
     assert all(e["retention_months"] == 6 for e in expired_events)
     # the append-only results index rows remain
@@ -187,7 +187,7 @@ def test_retention_sweep_over_http_expires_backdated_runs(coop_daemon, fake_vibe
         assert rb["ok"] is False and rb["expired"] is True and rb["run_id"] == run_id
         assert "output" not in rb and "raw_output" not in rb
     cli = runner.invoke(app, ["results", "get", run_ok])
-    assert cli.exit_code == 1 and "expired" in combined_output(cli)
+    assert cli.exit_code == 1 and "composted" in combined_output(cli)
 
     # stats are unaffected by expiry (the rollup lives in the DB, not the artifacts)
     stats = c.get("/api/stats").json()["stats"]
@@ -206,7 +206,7 @@ def test_stats_and_sweep_endpoints_require_bearer_when_auth_required(auth_daemon
 
     assert c.get("/api/stats", headers=AUTH_HEADERS).status_code == 200
     r = c.get("/api/stats/some-job", headers=AUTH_HEADERS)
-    assert r.status_code == 404 and "no usage stats" in r.json()["error"]
+    assert r.status_code == 404 and "no feed recorded" in r.json()["error"]
     r = c.post("/api/retention/sweep", json={}, headers=AUTH_HEADERS)
     assert r.status_code == 200 and r.json()["ok"] is True and r.json()["deleted"] == 0
 
@@ -248,8 +248,8 @@ def test_spa_serves_stats_view_and_retention_card(coop_daemon, tmp_path) -> None
     html = c.get("/").text
     for marker in (
         'id="view-stats"', 'id="stats-grid"', 'id="stats-empty"', 'id="stats-detail"',
-        'id="stats-detail-list"', 'id="stats-detail-close"', "Stats",
-        'id="retention-card"', 'id="retention-summary"', 'id="sweep-now"', ">Sweep now</button>",
+        'id="stats-detail-list"', 'id="stats-detail-close"', ">Feed</a>",
+        'id="retention-card"', 'id="retention-summary"', 'id="sweep-now"', ">Turn the compost</button>",
         'id="sweep-error"', 'id="sweep-outcome"', 'id="sweep-summary"', 'id="sweep-list"',
         'data-stat="retention"',
     ):
@@ -304,7 +304,7 @@ def test_e2e_stats_and_retention_sweep_over_http_subprocess(tmp_path, monkeypatc
         cli = runner.invoke(app, ["stats", "list"])
         assert cli.exit_code == 0 and "e2e-stats" in cli.output and "n=1" in cli.output
 
-        # 2. backdate the run, sweep over HTTP → result.expired, artifacts gone, expired over HTTP
+        # 2. backdate the run, sweep over HTTP → clutch.composted, artifacts gone, composted over HTTP
         backdate_run(settings, run_id, months_ago_iso(8))
         r = c.post("/api/retention/sweep", json={})
         assert r.status_code == 200, r.text
@@ -313,7 +313,7 @@ def test_e2e_stats_and_retention_sweep_over_http_subprocess(tmp_path, monkeypatc
         assert body["expired"][0]["run_id"] == run_id and body["expired"][0]["kind"] == "result"
         assert not (settings.results_dir / run_id).exists()
         events = [e["event"] for e in AuditLog(settings.audit_log_path).read_all()]
-        assert "result.expired" in events
+        assert "clutch.composted" in events
         res = c.get(f"/api/results/{run_id}")
         assert res.status_code == 200 and res.json()["expired"] is True and res.json()["ok"] is False
 

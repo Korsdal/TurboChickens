@@ -92,10 +92,10 @@ def test_runs_and_stats_tables_stay_mutable(tmp_path) -> None:
 
 def test_audit_log_appends_rows_in_order(tmp_path) -> None:
     log = AuditLog(tmp_path / "audit.jsonl")
-    log.append({"event": "daemon.started", "pid": 1})
-    log.append({"event": "daemon.stopped", "pid": 1})
+    log.append({"event": "coopd.started", "pid": 1})
+    log.append({"event": "coopd.stopped", "pid": 1})
     rows = log.read_all()
-    assert [r["event"] for r in rows] == ["daemon.started", "daemon.stopped"]
+    assert [r["event"] for r in rows] == ["coopd.started", "coopd.stopped"]
     assert all(r["ts"].endswith("Z") for r in rows)
     assert rows[0]["ts"] <= rows[1]["ts"]
 

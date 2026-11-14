@@ -23,19 +23,19 @@ from turbochickens.spec.loader import SpecValidationError, load_spec, spec_hash
 
 app = typer.Typer(
     name="tc",
-    help="TurboChickens — local-first platform for ephemeral, just-in-time AI agent jobs.",
+    help="TurboChickens — local-first platform for ephemeral, just-in-time AI agent jobs (eggs hatched into chickens).",
     no_args_is_help=True,
     add_completion=False,
 )
-jobs_app = typer.Typer(help="Job spec commands.", no_args_is_help=True)
-daemon_app = typer.Typer(help="Daemon lifecycle commands.", no_args_is_help=True)
-runs_app = typer.Typer(help="Inspect runs.", no_args_is_help=True)
-results_app = typer.Typer(help="Fetch validated results.", no_args_is_help=True)
-schedule_app = typer.Typer(help="Manage cron schedules.", no_args_is_help=True)
-stats_app = typer.Typer(help="Per-job usage statistics (spec 08).", no_args_is_help=True)
-auth_app = typer.Typer(help="Seat/subscription auth (spec 09) — local, no daemon needed.", no_args_is_help=True)
-models_app = typer.Typer(help="Model discovery (spec 10) — local, no daemon needed.", no_args_is_help=True)
-coop_app = typer.Typer(help="Coop — the TurboChickens GUI served by the daemon over HTTP (spec 12).", no_args_is_help=True)
+jobs_app = typer.Typer(help="Egg (job spec) commands — candling.", no_args_is_help=True)
+daemon_app = typer.Typer(help="Coopd lifecycle commands (the supervisor daemon).", no_args_is_help=True)
+runs_app = typer.Typer(help="Inspect chickens (runs).", no_args_is_help=True)
+results_app = typer.Typer(help="Fetch clutches (validated results) from the nest box.", no_args_is_help=True)
+schedule_app = typer.Typer(help="Manage the rooster's crows (cron schedules).", no_args_is_help=True)
+stats_app = typer.Typer(help="Feed ledger — per-egg usage rollups (spec 08).", no_args_is_help=True)
+auth_app = typer.Typer(help="Perch — seat auth (spec 09); local, no coopd needed.", no_args_is_help=True)
+models_app = typer.Typer(help="Feeders — model discovery (spec 10); local, no coopd needed.", no_args_is_help=True)
+coop_app = typer.Typer(help="Coop — the TurboChickens GUI served by coopd over HTTP (spec 12).", no_args_is_help=True)
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(runs_app, name="runs")
@@ -71,7 +71,7 @@ def jobs_validate(
     ),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Validate a job spec. Prints OK plus the stable spec hash, or field-named errors.
+    """Candle an egg (validate a job spec). Prints OK plus the stable spec hash, or field-named errors.
 
     Spec 10: also checks harness.model against the chosen harness — an unknown
     provider/model errors (exit 1), a mistral-api model without a pricing
@@ -102,7 +102,7 @@ def jobs_validate(
             err_console.print(f"[bold red]error[/bold red] {e}")
         raise typer.Exit(code=1) from None
     digest = spec_hash(spec)
-    typer.echo(f"OK: job '{spec.job.name}' — spec hash sha256:{digest}")
+    typer.echo(f"OK: egg '{spec.job.name}' candled — spec hash sha256:{digest}")
 
 
 @models_app.command("list")
@@ -114,7 +114,7 @@ def models_list(
     ),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """List usable models, on demand (local, no daemon state).
+    """List usable models from the feeders, on demand (local, no coopd state).
 
     Per provider: reachable or not, the live model ids from GET /models, and
     which of them have a pricing preset in providers.toml. Credentials match
@@ -168,14 +168,14 @@ def models_list(
 def daemon_start(
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Start the supervisor daemon in the foreground, binding the Unix socket."""
+    """Start coopd in the foreground, binding the Unix socket."""
     try:
         settings = load_settings(settings_path)
     except SettingsError as e:
         err_console.print(f"[bold red]error[/bold red] {e}")
         raise typer.Exit(code=1) from None
     typer.echo(
-        f"daemon starting: socket={settings.socket_path} "
+        f"coopd starting: socket={settings.socket_path} "
         f"db={settings.db_path} audit_log={settings.audit_log_path} "
         f"weight_budget={settings.weight_budget}"
     )
@@ -184,14 +184,14 @@ def daemon_start(
     except DaemonAlreadyRunning as e:
         err_console.print(f"[bold red]error[/bold red] {e}")
         raise typer.Exit(code=1) from None
-    typer.echo("daemon stopped")
+    typer.echo("coopd stopped")
 
 
 @coop_app.command("start")
 def coop_start(
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Start the daemon with the coop GUI enabled — HTTP at coop_host:coop_port serving / and /api/*.
+    """Start coopd with the coop GUI enabled — HTTP at coop_host:coop_port serving / and /api/*.
 
     Identical to `tc daemon start` with coop_enabled = true in settings (the coop
     container's CMD). Loopback with no coop_auth_token → open; otherwise a bearer
@@ -206,7 +206,7 @@ def coop_start(
     settings = settings.model_copy(update={"coop_enabled": True})
     auth = coop_auth(settings)
     typer.echo(
-        f"daemon starting: socket={settings.socket_path} "
+        f"coopd starting: socket={settings.socket_path} "
         f"db={settings.db_path} audit_log={settings.audit_log_path} "
         f"weight_budget={settings.weight_budget}"
     )
@@ -218,14 +218,14 @@ def coop_start(
     except DaemonAlreadyRunning as e:
         err_console.print(f"[bold red]error[/bold red] {e}")
         raise typer.Exit(code=1) from None
-    typer.echo("daemon stopped")
+    typer.echo("coopd stopped")
 
 
 @daemon_app.command("stop")
 def daemon_stop(
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Ask a running daemon to shut down gracefully over the socket."""
+    """Ask a running coopd to shut down gracefully over the socket."""
     try:
         settings = load_settings(settings_path)
         resp = request(settings.socket_path, "shutdown", timeout=5.0)
@@ -235,14 +235,14 @@ def daemon_stop(
     if not resp.get("ok"):
         err_console.print(f"[bold red]error[/bold red] {resp.get('error', 'unknown error')}")
         raise typer.Exit(code=1)
-    typer.echo("daemon stopped")
+    typer.echo("coopd stopped")
 
 
 @app.command("status")
 def status(
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Show daemon health, queue depth, and in-flight runs (round-trip over the socket)."""
+    """Show coopd health, pecking-order depth, and in-flight chickens (round-trip over the socket)."""
     try:
         settings = load_settings(settings_path)
         resp = request(settings.socket_path, "status", timeout=5.0)
@@ -254,26 +254,26 @@ def status(
         raise typer.Exit(code=1)
     d = resp["daemon"]
     typer.echo(
-        f"daemon: up (pid={d['pid']}, version={d['version']}, "
+        f"coopd: up (pid={d['pid']}, version={d['version']}, "
         f"uptime={d['uptime_sec']}s, started_at={d['started_at']})"
     )
     typer.echo(f"socket: {resp['socket']}")
     typer.echo(f"db: {resp['db_path']}")
     typer.echo(f"audit_log: {resp['audit_log']}")
     typer.echo(f"weight_budget: {resp['weight_budget']}")
-    typer.echo(f"queue_depth: {resp['queue_depth']}")
+    typer.echo(f"pecking order: {resp['queue_depth']}")
     in_flight = resp["in_flight"]
     typer.echo(f"in_flight: {len(in_flight)}")
     alerts = resp.get("alerts", [])
     if alerts:
-        err_console.print(f"[bold red]alerts[/bold red]: {len(alerts)} terminal run(s) without a valid teardown attestation: {', '.join(alerts)}")
+        err_console.print(f"[bold red]alerts[/bold red]: {len(alerts)} terminal chicken(s) without an abattoir attestation: {', '.join(alerts)}")
     else:
         typer.echo("alerts: 0")
     retention = resp.get("retention") or {}
     if retention:
         typer.echo(
-            f"retention: audit_log={retention.get('audit_retention')} "
-            f"results_retention_months={retention.get('results_retention_months')}"
+            f"retention: audit_log={retention.get('audit_retention')} (the headcount, forever) "
+            f"results_retention_months={retention.get('results_retention_months')} (clutches rot after that many months)"
         )
     coop = resp.get("coop") or {}
     if coop.get("enabled"):
@@ -281,7 +281,7 @@ def status(
             f"coop: {coop.get('url')} auth={'required' if coop.get('auth_required') else 'open'}"
         )
     if in_flight:
-        table = Table(title="In-flight runs")
+        table = Table(title="In-flight chickens")
         table.add_column("run_id")
         table.add_column("weight", justify="right")
         for r in in_flight:
@@ -319,7 +319,7 @@ def run_cmd(
     wait: bool = typer.Option(False, "--wait", help="Wait until the run reaches a terminal state."),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Submit a manual run of a job to the daemon queue (over the socket)."""
+    """Queue an egg (a job spec) — the Hatchery hatches it into a chicken — over the socket."""
     try:
         spec = load_spec(spec_path)
     except SpecValidationError as e:
@@ -332,8 +332,7 @@ def run_cmd(
     )
     run_id = resp["run_id"]
     typer.echo(
-        f"queued run {run_id} job '{resp['job_id']}' status=queued "
-        f"weight={resp['weight']} queue_depth={resp['queue_depth']}"
+        f"egg queued {run_id} (job '{resp['job_id']}') — pecking order depth {resp['queue_depth']}, weight {resp['weight']}"
     )
     if not wait:
         return
@@ -343,10 +342,10 @@ def run_cmd(
         status = show["run"]["status"]
         if status in TERMINAL_STATES:
             reason = (show["run"].get("manifest") or {}).get("status_reason", "")
-            typer.echo(f"run {run_id} → {status}" + (f" ({reason})" if reason else ""))
+            typer.echo(f"chicken {run_id} → {status}" + (f" ({reason})" if reason else ""))
             raise typer.Exit(code=0 if status == "succeeded" else 1)
         time.sleep(0.2)
-    err_console.print(f"[bold red]error[/bold red] run {run_id} did not finish in time")
+    err_console.print(f"[bold red]error[/bold red] chicken {run_id} did not finish in time")
     raise typer.Exit(code=1)
 
 
@@ -354,10 +353,10 @@ def run_cmd(
 def runs_list(
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """List runs, most recent first, one line per run (round-trip over the socket)."""
+    """List chickens, most recent first, one line per chicken (round-trip over the socket)."""
     resp = _request_or_exit(settings_path, "runs_list")
     if not resp["runs"]:
-        typer.echo("no runs")
+        typer.echo("no chickens yet")
         return
     for r in resp["runs"]:
         status = r["status"]
@@ -365,21 +364,21 @@ def runs_list(
         if r["status"] in TERMINAL_STATES and not r["attested"]:
             status += " ALERT:no-attestation"
         typer.echo(
-            f"{r['id']}  job={r['job_name']}  status={status}  trigger={r['trigger']}  "
+            f"chicken={r['id']}  egg={r['job_name']}  status={status}  trigger={r['trigger']}  "
             f"started={r['started_at'] or '-'}  finished={r['finished_at'] or '-'}  attested={attested}"
         )
 
 
 @runs_app.command("show")
 def runs_show(
-    run_id: str = typer.Argument(..., help="Run ID, e.g. run-0123abcd4567."),
+    run_id: str = typer.Argument(..., help="Chicken ID, e.g. run-0123abcd4567."),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Show one run: lifecycle fields, manifest, attestation."""
+    """Show one chicken: lifecycle fields, manifest, abattoir attestation."""
     resp = _request_or_exit(settings_path, "runs_show", run_id=run_id)
     r = resp["run"]
-    typer.echo(f"run: {r['id']}")
-    typer.echo(f"job: {r['job_name']} ({r['job_id']})")
+    typer.echo(f"chicken: {r['id']}")
+    typer.echo(f"egg: {r['job_name']} ({r['job_id']})")
     typer.echo(f"status: {r['status']}")
     typer.echo(f"trigger: {r['trigger']}")
     typer.echo(f"started_at: {r['started_at']}")
@@ -389,27 +388,27 @@ def runs_show(
         typer.echo(json.dumps(r["manifest"], indent=2, sort_keys=True))
     if r["attestation"]:
         typer.echo(
-            "attestation: process_reaped={process_reaped} workspace_removed={workspace_removed} "
+            "abattoir attestation: process_reaped={process_reaped} workspace_removed={workspace_removed} "
             "env_cleared={env_cleared} verified_at={verified_at}".format(**r["attestation"])
         )
     elif r["status"] in TERMINAL_STATES:
-        err_console.print("[bold red]ALERT: terminal run without a teardown attestation[/bold red]")
+        err_console.print("[bold red]ALERT: terminal chicken without an abattoir attestation[/bold red]")
     if r.get("result"):
         res = r["result"]
         if res["valid"]:
-            typer.echo(f"result: valid (artifacts: {res['artifacts_dir']})")
+            typer.echo(f"clutch: valid (nest box: {res['artifacts_dir']})")
         else:
-            typer.echo(f"result: QUARANTINED — output failed schema validation (artifacts: {res['artifacts_dir']})")
+            typer.echo(f"clutch: QUARANTINED — failed candling, schema errors below (quarantine: {res['artifacts_dir']})")
             for e in res["schema_errors"] or []:
                 typer.echo(f"  schema error: {e}")
 
 
 @runs_app.command("logs")
 def runs_logs(
-    run_id: str = typer.Argument(..., help="Run ID, e.g. run-0123abcd4567."),
+    run_id: str = typer.Argument(..., help="Chicken ID, e.g. run-0123abcd4567."),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Print the run's streamed events (sanitized log lines + state transitions)."""
+    """Print the chicken's streamed events (sanitized log lines + state transitions)."""
     resp = _request_or_exit(settings_path, "runs_logs", run_id=run_id)
     for e in resp["events"]:
         typer.echo(f"{e['seq']:>4} {e['ts']} [{e['level']}] {e['source']}: {e['line']}")
@@ -417,13 +416,13 @@ def runs_logs(
 
 @results_app.command("get")
 def results_get(
-    run_id: str = typer.Argument(..., help="Run ID whose validated result to fetch."),
+    run_id: str = typer.Argument(..., help="Chicken ID whose clutch to fetch from the nest box."),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Print the schema-validated result of a run as JSON.
+    """Print the chicken's candled clutch (schema-validated result) as JSON.
 
-    Only valid results are ever returned. A quarantined run (output failed
-    schema validation) exits 1 with the recorded schema errors — its output is
+    Only valid clutches are ever returned. A quarantined chicken (its clutch
+    failed candling) exits 1 with the recorded schema errors — the clutch is
     kept in quarantine for inspection, never served as a result.
     """
     resp = _daemon_request(settings_path, "results_get", run_id=run_id)
@@ -433,9 +432,9 @@ def results_get(
             for e in resp.get("schema_errors", []):
                 err_console.print(f"  schema error: {e}")
             if resp.get("artifacts_dir"):
-                err_console.print(f"  quarantined artifacts: {resp['artifacts_dir']}")
+                err_console.print(f"  quarantined clutch kept at: {resp['artifacts_dir']}")
         if resp.get("expired"):
-            err_console.print("  the on-disk result artifacts expired under the retention TTL; the append-only index row remains")
+            err_console.print("  the clutch was composted under the retention TTL; the append-only index row remains")
         raise typer.Exit(code=1) from None
     typer.echo(json.dumps(resp["output"], indent=2, sort_keys=True, ensure_ascii=False))
 
@@ -451,7 +450,7 @@ def schedule_add(
     ),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Register a job's cron trigger with the daemon's internal scheduler."""
+    """Register an egg's cron trigger as a crow with the rooster (coopd's scheduler)."""
     try:
         spec = load_spec(spec_path)
     except SpecValidationError as e:
@@ -460,8 +459,8 @@ def schedule_add(
         raise typer.Exit(code=1) from None
     if spec.trigger.type != "cron" or not spec.trigger.schedule:
         err_console.print(
-            f"[bold red]error[/bold red] job '{spec.job.name}' has trigger.type="
-            f"'{spec.trigger.type}'; only cron-triggered jobs carry a schedule"
+            f"[bold red]error[/bold red] egg '{spec.job.name}' has trigger.type="
+            f"'{spec.trigger.type}'; only cron-triggered eggs carry a crow"
         )
         raise typer.Exit(code=1)
     digest = spec_hash(spec)
@@ -473,7 +472,7 @@ def schedule_add(
         spec_hash=digest,
     )
     typer.echo(
-        f"scheduled job '{resp['job_id']}' cron='{resp['schedule']}' "
+        f"crow scheduled for egg '{resp['job_id']}' cron='{resp['schedule']}' "
         f"spec=sha256:{resp['spec_hash']} next_run={resp.get('next_run') or '-'}"
     )
 
@@ -482,26 +481,26 @@ def schedule_add(
 def schedule_list(
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """List registered cron schedules with their next run time."""
+    """List the rooster's registered crows with their next crow time."""
     resp = _request_or_exit(settings_path, "schedule_list")
     if not resp["schedules"]:
-        typer.echo("no schedules")
+        typer.echo("no crows yet")
         return
     for s in resp["schedules"]:
         typer.echo(
-            f"{s['job_id']}  cron='{s['schedule']}'  next_run={s.get('next_run') or '-'}  "
+            f"egg={s['job_id']}  cron='{s['schedule']}'  next_run={s.get('next_run') or '-'}  "
             f"added_at={s['added_at']}  spec=sha256:{s['spec_hash'][:12]}…"
         )
 
 
 @schedule_app.command("rm")
 def schedule_rm(
-    job_id: str = typer.Argument(..., help="Job name (id) whose cron schedule to remove."),
+    job_id: str = typer.Argument(..., help="Egg name (id) whose crow to remove."),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Remove a job's cron schedule from the daemon's scheduler."""
+    """Remove an egg's crow from the rooster."""
     resp = _request_or_exit(settings_path, "schedule_rm", job_id=job_id)
-    typer.echo(f"removed schedule for job '{resp['job_id']}'")
+    typer.echo(f"removed crow for egg '{resp['job_id']}'")
 
 
 def _fmt_stat(v) -> str:
@@ -510,7 +509,7 @@ def _fmt_stat(v) -> str:
 
 def _stats_line(s: dict) -> str:
     return (
-        f"job={s['job_name']}  n={s['n_runs']}  "
+        f"egg={s['job_name']}  n={s['n_runs']}  "
         f"tokens_in mean={_fmt_stat(s['tokens_in_mean'])} p50={_fmt_stat(s['tokens_in_p50'])}"
         f" p95={_fmt_stat(s['tokens_in_p95'])}  "
         f"tokens_out mean={_fmt_stat(s['tokens_out_mean'])} p50={_fmt_stat(s['tokens_out_p50'])}"
@@ -523,10 +522,10 @@ def _stats_line(s: dict) -> str:
 def stats_list(
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """List per-job usage stats (n, mean/p50/p95 tokens in+out, expected cost per run)."""
+    """List the feed ledger: per-egg rollups (n, mean/p50/p95 tokens in+out, expected feed per chicken)."""
     resp = _request_or_exit(settings_path, "stats_list")
     if not resp["stats"]:
-        typer.echo("no usage stats yet")
+        typer.echo("no feed recorded yet")
         return
     for s in resp["stats"]:
         typer.echo(_stats_line(s))
@@ -534,13 +533,13 @@ def stats_list(
 
 @stats_app.command("show")
 def stats_show(
-    job_id: str = typer.Argument(..., help="Job name (id) whose usage stats to show."),
+    job_id: str = typer.Argument(..., help="Egg name (id) whose feed ledger to show."),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Show one job's usage stats in detail: n, mean/p50/p95 tokens in+out, expected cost."""
+    """Show one egg's feed ledger in detail: n, mean/p50/p95 tokens in+out, expected feed."""
     resp = _request_or_exit(settings_path, "stats_show", job_id=job_id)
     s = resp["stats"]
-    typer.echo(f"job: {s['job_name']} ({s['job_id']})")
+    typer.echo(f"egg: {s['job_name']} ({s['job_id']})")
     typer.echo(f"n_runs: {s['n_runs']}")
     typer.echo(
         f"tokens_in:  mean={_fmt_stat(s['tokens_in_mean'])} p50={_fmt_stat(s['tokens_in_p50'])}"
@@ -567,7 +566,7 @@ def auth_login(
     provider: str = typer.Argument(..., help="Provider name from providers.toml with auth = \"seat\"."),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Run the OAuth device flow for a seat provider and store the session under the data dir."""
+    """Claim a perch seat: run the OAuth device flow for a seat provider and store the session under the data dir."""
     try:
         broker, _ = _seat_broker(settings_path)
         session = broker.login(provider, notify=typer.echo)
@@ -577,7 +576,7 @@ def auth_login(
     from turbochickens.seat import _iso
 
     typer.echo(
-        f"seat session stored for provider '{provider}' "
+        f"perch seat claimed for provider '{provider}' "
         f"(token expires { _iso(session.expires_at) }) — tokens are never printed or logged"
     )
 
@@ -586,7 +585,7 @@ def auth_login(
 def auth_status(
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Show each provider's auth mode and stored seat session expiry (no tokens)."""
+    """Show each feeder's auth mode and stored perch seat expiry (no tokens)."""
     try:
         broker, _ = _seat_broker(settings_path)
         rows = broker.status()
@@ -600,11 +599,11 @@ def auth_status(
         line = f"provider={r['provider']}  auth={r['mode']}"
         if r.get("session"):
             s = r["session"]
-            line += f"  seat session: expires_at={s['expires_at']} expired={s['expired']}"
+            line += f"  perch seat: expires_at={s['expires_at']} expired={s['expired']}"
         elif r.get("session_error"):
-            line += f"  seat session: UNREADABLE ({r['session_error']})"
+            line += f"  perch seat: UNREADABLE ({r['session_error']})"
         elif r["mode"] == "seat":
-            line += "  seat session: none (run `tc auth login " + r["provider"] + "`)"
+            line += "  perch seat: none (run `tc auth login " + r["provider"] + "`)"
         typer.echo(line)
 
 
@@ -613,14 +612,14 @@ def auth_logout(
     provider: str = typer.Argument(..., help="Provider whose stored seat session to delete."),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Delete a provider's stored seat session (tokens are removed, not revoked)."""
+    """Release a provider's perch seat (tokens are removed, not revoked)."""
     try:
         broker, _ = _seat_broker(settings_path)
         broker.logout(provider)
     except (SettingsError, ProvidersError, SeatError) as e:
         err_console.print(f"[bold red]error[/bold red] {e}")
         raise typer.Exit(code=1) from None
-    typer.echo(f"removed seat session for provider '{provider}'")
+    typer.echo(f"released perch seat for provider '{provider}'")
 
 
 @app.callback()

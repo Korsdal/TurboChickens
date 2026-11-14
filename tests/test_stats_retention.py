@@ -199,7 +199,7 @@ def test_api_runs_roll_up_per_job_stats_with_expected_cost(api_daemon, fake_api,
     assert lst["ok"] is True and [x["job_id"] for x in lst["stats"]] == ["stats-api-job"]
     out = runner.invoke(app, ["stats", "list"])
     assert out.exit_code == 0, combined_output(out)
-    assert "job=stats-api-job" in out.output and "n=3" in out.output and "expected_cost_usd=0.00018" in out.output
+    assert "egg=stats-api-job" in out.output and "n=3" in out.output and "expected_cost_usd=0.00018" in out.output
     show = runner.invoke(app, ["stats", "show", "stats-api-job"])
     assert show.exit_code == 0, combined_output(show)
     assert "n_runs: 3" in show.output and "tokens_in" in show.output and "expected_cost_usd_per_run" in show.output
@@ -234,11 +234,11 @@ def test_cli_runs_roll_up_stats_with_harness_cost_fallback(daemon, tmp_path) -> 
 
 def test_stats_show_unknown_job_is_an_error(daemon) -> None:
     resp = request(daemon.settings.socket_path, "stats_show", job_id="nope", timeout=2.0)
-    assert resp["ok"] is False and "no usage stats" in resp["error"]
+    assert resp["ok"] is False and "no feed recorded" in resp["error"]
     out = runner.invoke(app, ["stats", "show", "nope"])
     assert out.exit_code == 1
     lst = runner.invoke(app, ["stats", "list"])
-    assert lst.exit_code == 0 and "no usage stats yet" in lst.output
+    assert lst.exit_code == 0 and "no feed recorded yet" in lst.output
 
 
 # --- retention e2e (spec 08 checkbox 3) ----------------------------------------
@@ -275,7 +275,7 @@ def test_retention_sweep_expires_old_results_and_audit_logs_each_deletion(daemon
     # the append-only results row is NOT deleted; the deletion is audit-logged
     assert db_row(settings, "SELECT valid FROM results WHERE run_id = ?", (run_id,)) == (1,)
     rows = AuditLog(settings.audit_log_path).read_all()
-    expired_events = [r for r in rows if r["event"] == "result.expired" and r.get("run_id") == run_id]
+    expired_events = [r for r in rows if r["event"] == "clutch.composted" and r.get("run_id") == run_id]
     assert len(expired_events) == 1
     assert expired_events[0]["kind"] == "result" and expired_events[0]["retention_months"] == 6
     # the audit log itself is never TTL-deleted: all earlier rows are intact
@@ -283,14 +283,14 @@ def test_retention_sweep_expires_old_results_and_audit_logs_each_deletion(daemon
 
     # results_get now reports the result as expired (artifacts gone); CLI exits 1
     got = request(settings.socket_path, "results_get", run_id=run_id, timeout=2.0)
-    assert got["ok"] is False and got.get("expired") is True and "expired" in got["error"]
+    assert got["ok"] is False and got.get("expired") is True and "composted" in got["error"]
     cli = runner.invoke(app, ["results", "get", run_id])
-    assert cli.exit_code == 1 and "expired" in combined_output(cli)
+    assert cli.exit_code == 1 and "composted" in combined_output(cli)
 
     # a second sweep is idempotent: nothing left to delete, no duplicate audit rows
     resp2 = request(settings.socket_path, "retention_sweep", timeout=5.0)
     assert resp2["deleted"] == 0 and resp2["expired"] == []
-    assert len([r for r in AuditLog(settings.audit_log_path).read_all() if r["event"] == "result.expired"]) == 1
+    assert len([r for r in AuditLog(settings.audit_log_path).read_all() if r["event"] == "clutch.composted"]) == 1
 
 
 def test_retention_sweep_expires_quarantined_output_too(daemon, tmp_path) -> None:
@@ -338,7 +338,7 @@ schema_file = "schemas/out.schema.json"
     assert not qdir.exists()
     # the quarantined results row (valid=0) is append-only and stays
     assert db_row(settings, "SELECT valid FROM results WHERE run_id = ?", (run_id,)) == (0,)
-    ev = [r for r in AuditLog(settings.audit_log_path).read_all() if r["event"] == "result.expired"]
+    ev = [r for r in AuditLog(settings.audit_log_path).read_all() if r["event"] == "clutch.composted"]
     assert len(ev) == 1 and ev[0]["run_id"] == run_id and ev[0]["kind"] == "quarantine"
 
 
@@ -394,7 +394,7 @@ def test_daemon_startup_sweeps_expired_results_automatically(daemon, tmp_path) -
         ev = [
             r
             for r in AuditLog(settings.audit_log_path).read_all()
-            if r["event"] == "result.expired" and r.get("run_id") == run_id
+            if r["event"] == "clutch.composted" and r.get("run_id") == run_id
         ]
         assert len(ev) == 1
         # status reports the retention settings and the last sweep
@@ -403,7 +403,7 @@ def test_daemon_startup_sweeps_expired_results_automatically(daemon, tmp_path) -
         assert st["retention"]["results_retention_months"] == 6
         assert st["retention"]["last_sweep"]["deleted"] == 1
         cli = runner.invoke(app, ["status"])
-        assert cli.exit_code == 0 and "retention: audit_log=forever results_retention_months=6" in cli.output
+        assert cli.exit_code == 0 and "retention: audit_log=forever (the headcount, forever) results_retention_months=6 (clutches rot after that many months)" in cli.output
     finally:
         dt.stop()
 
@@ -417,7 +417,7 @@ def test_sweep_pure_seam_never_touches_audit_log(tmp_path) -> None:
     settings = load_settings(settings_file)
     db = init_db(settings.db_path)
     audit = AuditLog(settings.audit_log_path)
-    audit.append({"event": "daemon.started", "pid": 1})
+    audit.append({"event": "coopd.started", "pid": 1})
     db.execute(
         "INSERT INTO job_specs (id, name, spec_hash, spec_toml, created_at) VALUES ('j', 'j', 'h', 'x', ?)",
         (utcnow_iso(),),
@@ -438,7 +438,7 @@ def test_sweep_pure_seam_never_touches_audit_log(tmp_path) -> None:
     summary = sweep_expired_results(settings, db, audit)
     assert summary["deleted"] == 1 and not adir.exists()
     rows = audit.read_all()
-    assert len(rows) == n_audit_before + 1  # only the result.expired row was appended
-    assert rows[0]["event"] == "daemon.started"  # audit log untouched, kept forever
-    assert rows[1]["event"] == "result.expired"
+    assert len(rows) == n_audit_before + 1  # only the clutch.composted row was appended
+    assert rows[0]["event"] == "coopd.started"  # audit log untouched, kept forever
+    assert rows[1]["event"] == "clutch.composted"
     db.close()

@@ -1,0 +1,70 @@
+# Lexicon — TurboChickens Naming Convention
+
+> One source of truth for what things on this farm are called. Future agents: match this vocabulary in code, specs, docs, audit events, and UI copy. If a term is missing, add it here first, then use it.
+
+## The Story
+
+A **Egg** (job spec) is **Candled** (validated) and waits in the **Pecking Order** (queue). The **Hatchery** hatches it into a **Chicken** (a running agent) — optionally **Free-Range** (no max TTL) — fed by the **Feeders** (model providers) within its **Feed Budget**. When the Chicken finishes, it lays a **Clutch** (its output artifacts) in the **Nest Box** (results store). Then the **Abattoir** performs the attested teardown of the Chicken, and old Clutches eventually rot away in the **Compost** (retention). The **Rooster** keeps time (schedules), the **Fox** watches the fence (security), the **Perch** is where seats are claimed (auth), and the **Headcount** (audit log) records everything. The **Coop** is the management interface, run by **Coopd**; outsiders ask the **Farmhand** (MCP) for chores.
+
+The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget results, results feed future jobs.
+
+## Core Lifecycle
+
+| Term | Meaning | Maps to |
+|---|---|---|
+| **Egg** | A job spec — dormant, awaiting hatch | job spec / `job.toml` |
+| **Candling** | Validation (and quarantine) of an Egg before incubation | `validate.py` |
+| **Pecking Order** | The queue of Eggs waiting to hatch | queue |
+| **Hatchery** | Agent provisioning — hatches an Egg into a Chicken | provisioning / `runner.py` |
+| **Chicken** | A running agent instance | run / agent process |
+| **Free-Range** | "No max TTL" mode in the Hatchery — a Chicken with no fence | max-TTL toggle |
+| **Feeders** | Model providers — who feeds the Chickens | `providers.py` |
+| **Feed Budget** | Per-run budgets: timeout, context cap, cost | run budgets / `budget.outcome` |
+| **Feed Ledger** | The per-egg rollup of what the flock was actually fed — tokens in/out, expected feed per Chicken | `stats.py`, the Feed view |
+| **Clutch** | A run's output artifacts — the eggs a Chicken lays | run results / artifacts |
+| **Nest Box** | Results store — where Clutches are found | `storage.py` (results) |
+| **Abattoir** | De-provisioning with attested, verifiable teardown | teardown / destruction |
+| **Compost** | Retention — old Clutches rot away; audit records stay forever | `retention.py` |
+
+## Support Cast
+
+| Term | Meaning | Maps to |
+|---|---|---|
+| **Rooster** | Cron-style scheduler — it wakes the jobs up | `scheduler.py` |
+| **Fox** | Security module — foxes eat Eggs *and* Chickens | security (future) |
+| **Perch** | Seat-based auth — a seat is a perch | `seat.py` |
+| **Headcount** | Audit log — a farmer's headcount | `audit.py` |
+
+## The Interface Layer
+
+| Term | Meaning | Maps to |
+|---|---|---|
+| **Coop** | The management GUI / container | `coop.py`, `coop_static/` |
+| **Coopd** | The always-on supervisor daemon | `daemon.py` |
+| **Farmhand** | The MCP — a hired helper who does chores through the farm's tools | MCP (future) |
+| **Beak** | *Reserved*: an in-GUI terminal view | — |
+
+## Reserved
+
+| Term | Intended for |
+|---|---|
+| **Silo** | If `storage.py` ever splits: Silo = the append-only permanent record; Nest Box = live, fetchable Clutches |
+| **Clutch** (secondary sense) | A batch of jobs submitted together ("a clutch of runs") |
+
+## Retired / Rejected
+
+| Term | Was / would be | Why retired |
+|---|---|---|
+| **Poultryman** | The MCP's original name | Person-title that doesn't say what the MCP does; superseded by Farmhand |
+| **Egg Basket** | The results store | Collides with Egg in UI/UX contexts; superseded by Nest Box |
+| **Chick** | Candidate for job spec | A chick is by definition already hatched — biologically wrong for a dormant spec; Egg won |
+| **Setting** | Candidate for job spec | Collides with `settings.py` |
+| **Larder** | Candidate for results store | Flavor-overlap with the Abattoir (a larder is where meat goes) |
+
+## Convention Rules
+
+1. **Concrete nouns, no prefixes/suffixes.** Coop, not CoopService; Rooster, not RoosterModule.
+2. **The metaphor must be functional, not decorative.** A name earns its place by mapping to what the thing does (Run = execution, Pecking Order = priority queue, Candling = inspecting before you incubate).
+3. **No repeated nouns across lifecycle stages.** Egg (spec) and Clutch (results) are deliberately distinct.
+4. **Death is unapologetic.** The Abattoir name is only used where teardown is guaranteed and attested; best-effort cleanup is not the Abattoir.
+5. **Match the register everywhere.** Docs, audit events, error messages, and UI copy all use lexicon terms ("this run laid 3 eggs", `egg.hatched`, `clutch.stored`, `abattoir.attested`).

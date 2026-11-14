@@ -195,7 +195,7 @@ def test_spa_shell_served_with_content_types(coop_daemon) -> None:
     html = r.text
     assert "TurboChickens" in html  # wordmark
     assert "egg" in html  # egg-dot brand mark
-    for view in ("Dashboard", "Runs", "Jobs", "Schedules", "Stats", "Audit", "Settings"):
+    for view in ("Dashboard", "Chickens", "Eggs", "Rooster", "Feed", "Headcount", "Settings"):
         assert view in html  # sidebar nav
     assert 'id="view-login"' in html  # login card for 401
     assert 'data-stat="uptime"' in html and 'data-stat="queue_depth"' in html
@@ -246,7 +246,7 @@ def test_shutdown_tears_down_http_server(coop_daemon) -> None:
         request(coop_daemon.settings.socket_path, "ping", timeout=1.0)
     events = [r["event"] for r in AuditLog(coop_daemon.settings.audit_log_path).read_all()]
     assert "coop.started" in events and "coop.stopped" in events
-    assert events[-1] == "daemon.stopped"
+    assert events[-1] == "coopd.stopped"
 
 
 def test_coop_disabled_status_block(tmp_path, monkeypatch) -> None:

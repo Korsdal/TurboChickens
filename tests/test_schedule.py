@@ -137,7 +137,7 @@ def test_schedule_add_list_rm_round_trip(daemon, tmp_path) -> None:
 
     result = runner.invoke(app, ["schedule", "add", str(spec_path)])
     assert result.exit_code == 0, combined_output(result)
-    assert "scheduled job 'cron-job'" in result.output
+    assert "crow scheduled for egg 'cron-job'" in result.output
     assert "cron='0 7 * * 1'" in result.output
     assert "next_run=" in result.output and "next_run=-" not in result.output
 
@@ -152,7 +152,7 @@ def test_schedule_add_list_rm_round_trip(daemon, tmp_path) -> None:
     row = db_row(daemon.settings, "SELECT schedule, spec_hash FROM schedules WHERE job_id = 'cron-job'")
     assert row is not None and row[0] == "0 7 * * 1"
     events = [r["event"] for r in AuditLog(daemon.settings.audit_log_path).read_all()]
-    assert "schedule.added" in events
+    assert "rooster.scheduled" in events
     st = request(sock, "status", timeout=2.0)
     assert st["schedules"] == 1
 
@@ -164,19 +164,19 @@ def test_schedule_add_list_rm_round_trip(daemon, tmp_path) -> None:
     # rm removes it everywhere
     result = runner.invoke(app, ["schedule", "rm", "cron-job"])
     assert result.exit_code == 0, combined_output(result)
-    assert "removed schedule for job 'cron-job'" in result.output
+    assert "removed crow for egg 'cron-job'" in result.output
     resp = request(sock, "schedule_list", timeout=2.0)
     assert resp["ok"] is True and resp["schedules"] == []
     assert db_row(daemon.settings, "SELECT job_id FROM schedules") is None
     events = [r["event"] for r in AuditLog(daemon.settings.audit_log_path).read_all()]
-    assert "schedule.removed" in events
+    assert "rooster.unscheduled" in events
     result = runner.invoke(app, ["schedule", "list"])
-    assert result.exit_code == 0 and "no schedules" in result.output
+    assert result.exit_code == 0 and "no crows yet" in result.output
 
     # rm again is an error, not a silent no-op
     result = runner.invoke(app, ["schedule", "rm", "cron-job"])
     assert result.exit_code == 1
-    assert "no schedule registered" in combined_output(result)
+    assert "no crow registered" in combined_output(result)
 
 
 def test_schedule_add_rejects_manual_trigger_job(daemon, tmp_path) -> None:
@@ -202,7 +202,7 @@ def test_schedule_add_over_socket_validates_spec_and_hash(daemon, tmp_path) -> N
     sock = daemon.settings.socket_path
     (spec_path.parent / "schemas" / "out.schema.json").unlink()  # broken file ref
     resp = request(sock, "schedule_add", timeout=5.0, spec_path=str(spec_path))
-    assert resp["ok"] is False and "invalid job spec" in resp["error"]
+    assert resp["ok"] is False and "egg failed candling" in resp["error"]
     (spec_path.parent / "schemas" / "out.schema.json").write_text('{"type": "object"}')
     resp = request(sock, "schedule_add", timeout=5.0, spec_path=str(spec_path), spec_hash="deadbeef")
     assert resp["ok"] is False and "hash mismatch" in resp["error"]
@@ -214,7 +214,7 @@ def test_schedule_add_over_socket_validates_spec_and_hash(daemon, tmp_path) -> N
     # manual-trigger spec over the socket is refused too
     manual = write_cron_job(tmp_path, name="manual-2", trigger_type="manual")
     resp = request(sock, "schedule_add", timeout=5.0, spec_path=str(manual))
-    assert resp["ok"] is False and "only cron-triggered jobs" in resp["error"]
+    assert resp["ok"] is False and "only cron-triggered eggs" in resp["error"]
 
 
 def test_schedule_add_replaces_existing_schedule(daemon, tmp_path) -> None:
@@ -263,7 +263,7 @@ def test_schedule_commands_when_daemon_down_exit_1(settings_file, tmp_path) -> N
     for args in (["schedule", "add", str(spec_path)], ["schedule", "list"], ["schedule", "rm", "cron-job"]):
         result = runner.invoke(app, args)
         assert result.exit_code == 1, args
-        assert "no daemon" in combined_output(result)
+        assert "no coopd" in combined_output(result)
 
 
 # --- the acceptance behavior: a firing cron enqueues a run with trigger=cron ---
@@ -308,9 +308,9 @@ def test_firing_cron_enqueues_run_through_the_same_pipeline(daemon, tmp_path) ->
 
     # audit trail: the fire and the queued run are both recorded with trigger=cron
     audit = AuditLog(settings.audit_log_path).read_all()
-    fired = [r for r in audit if r["event"] == "schedule.fired"]
+    fired = [r for r in audit if r["event"] == "rooster.crowed"]
     assert fired and fired[0]["run_id"] == run_id and fired[0]["trigger"] == "cron"
-    queued = [r for r in audit if r["event"] == "run.queued" and r.get("run_id") == run_id]
+    queued = [r for r in audit if r["event"] == "egg.queued" and r.get("run_id") == run_id]
     assert queued and queued[0]["trigger"] == "cron"
 
     # and the CLI surfaces all of it: runs list shows trigger=cron, results get works
@@ -324,7 +324,7 @@ def test_firing_cron_enqueues_run_through_the_same_pipeline(daemon, tmp_path) ->
     manual_spec = write_cron_job(tmp_path, name="manual-side", trigger_type="manual")
     r = runner.invoke(app, ["run", str(manual_spec), "--wait"])
     assert r.exit_code == 0, combined_output(r)
-    m = re.search(r"queued run (run-[0-9a-f]+)", r.output)
+    m = re.search(r"egg queued (run-[0-9a-f]+)", r.output)
     assert m
     manual_run = wait_terminal(sock, m.group(1), timeout=30)
     assert manual_run["trigger"] == "manual"

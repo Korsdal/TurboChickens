@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-12, after spec 19 landed (286/286 tests green, auth & access management GUI verified over HTTP against a hermetic fake OAuth server, incl. a subprocess `tc coop start` e2e).
+**Last updated:** 2026-11-14, after spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only).
 
 ---
 
@@ -21,12 +21,13 @@ durable thing; the agents are not.
 | Doc | Role |
 | --- | --- |
 | `specs/archive/turbochickens-baseline-spec-v0-2.md` | **Governing baseline.** Its decision log (§14) wins any conflict. |
+| `docs/lexicon.md` | **Naming register** (spec 20): every docs/audit-event/error/UI string uses these terms; machine interfaces stay byte-stable. |
 | `specs/archive/turbochickens-mvp-spec.md` | Operational MVP spec derived from the baseline (user stories, decisions, test philosophy). |
 | `specs/01-*.md` … `specs/10-*.md` | Implementation tickets. Each has `Status: ready-for-agent`, a "Blocked by" line, and a checkbox acceptance list. |
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10 and specs 12–19 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, and the spec-19 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
+**Spec 01 through spec 10 and specs 12–20 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, and the spec-20 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
 
 Spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality. Spec 19 gave seat auth a GUI surface (see below).
 Verified this session:
@@ -212,7 +213,20 @@ Verified this session:
 #     login is in flight; runs table has an Auth column; no host paths in the assets;
 #     no response body or audit row ever contains token/device-code material
 #   → subprocess e2e (`tc coop start` + fake OAuth): full login → status → providers → logout flow
-#     over HTTP, session 0600 on disk between, audit auth.login/auth.logout, SPA smoke, clean stop
+#     over HTTP, session 0600 on disk between, audit perch.claimed/perch.released, SPA smoke, clean stop
+# spec-20 smoke (temp settings, coop on 127.0.0.1:8791, fake vibe binary, subprocess `tc coop start`):
+#   → tc run <hello-vibe-cli> --wait → "egg queued run-… (job '…') — pecking order depth 1, weight 1.0"
+#     → "chicken run-… → succeeded"; raw audit.jsonl for the run reads, in order:
+#     egg.queued → egg.hatched → perch.resolved → clutch.stored → abattoir.attested → chicken.finished
+#   → tc status prints "coopd: up (pid=…)" / "pecking order: 0" /
+#     "retention: audit_log=forever (the headcount, forever) results_retention_months=6 (…)"
+#   → GET /api/audit chips show lexicon labels; a legacy "run.queued" row appended to audit.jsonl
+#     still matches ?event=egg.queued and displays as egg.queued over HTTP, raw bytes untouched
+#   → GET / serves nav Dashboard/Chickens/Eggs/Rooster/Feed/Headcount/Settings/Perch,
+#     "Pecking order", "Queue egg", "Turn the compost"; ids/data-*/api paths unchanged
+#   → full suite: 291 passed (286 + 5 new tests/test_lexicon.py: alias-on-read-only with raw-bytes
+#     assertion, quoted-string grep guard over src/, SPA lexicon markup, socket+HTTP old/new event
+#     filters, lifecycle Headcount order on a real run)
 ```
 
 What exists:
@@ -291,8 +305,11 @@ src/turbochickens/
 │                          # `job_usage_stats` percentile columns (spec 08, schema_version=3→4 migration)
 │                          # + `job_specs.spec_path` (spec 16, schema_version=4, in-place ALTER migration
 │                          # of v3 DBs) + append-only triggers + schema_meta
-├── audit.py               # AuditLog: append-only JSONL (open "a" only, fsync per row) — never TTL-deleted;
-│                          # spec 13: tail(limit, event) — last N rows newest first, defensive read
+├── audit.py               # AuditLog: append-only JSONL, the Headcount (open "a" only, fsync per row) — never TTL-deleted;
+│                          # spec 13: tail(limit, event) — last N rows newest first, defensive read;
+│                          # spec 20: LEGACY_EVENT_ALIASES maps pre-20 event names to lexicon names on
+│                          # read/display only (tail() normalizes + matches old and new names; read_all()
+│                          # and the raw file stay untouched)
 ├── stats.py               # spec 08 pure seam: percentile (linear interpolation) + rollup_usage
 │                          # (n, mean/p50/p95 tokens in/out/total over a job's finished runs)
 ├── retention.py           # spec 08: sweep_expired_results — deletes on-disk result/quarantine
@@ -320,7 +337,7 @@ src/turbochickens/
 │                          # settings.providers_path > $TURBOCHICKENS_PROVIDERS > <data_dir>/providers.toml
 │                          # > built-in mistral defaults (overlaid per provider). Spec 09: ProviderProfile
 │                          # gains auth="api-key"|"seat" + oauth_* endpoints (required for seat)
-├── runner.py              # RunPipeline: lifecycle queued→…→succeeded/failed, fresh workspace +
+├── runner.py              # RunPipeline (the Hatchery): lifecycle queued→…→succeeded/failed, fresh workspace +
 │                          # per-run env, manifest (+ spec-07 `budget` outcome block, spec-09 `auth`
 │                          # telemetry block), run_events, spec-04 result store / quarantine at
 │                          # `collecting`, spec-07 context cap at `provisioning`, teardown attestation
@@ -978,7 +995,8 @@ Spec-18 deliverables, concretely:
 | 16 | Schedules from the GUI | **done** (2026-11-12) | 12, 13 |
 | 17 | Stats + retention from the GUI | **done** (2026-11-12) | 12 |
 | 18 | coop Docker container | **done** (2026-11-12) | 12 |
-| 19 | Auth & access management UI (seat sessions, provider auth modes, access scope for tools/data/MCP/connectors) | ready-for-agent (backlog) | 09, 12 |
+| 19 | Auth & access management UI (seat sessions, provider auth modes, access scope for tools/data/MCP/connectors) | **done** (2026-11-12) | 09, 12 |
+| 20 | Lexicon adoption — every surface speaks farm (`docs/lexicon.md` rolled out to Headcount events, GUI copy, CLI output, errors, docs; machine interfaces unchanged; legacy rows aliased on read) | **done** (2026-11-14) | 01–19 |
 
 ## 5. Non-negotiable invariants (baseline v0.2 — do not regress these)
 
@@ -1045,7 +1063,7 @@ tables deliberately excluded).
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 - **Version management is a human responsibility.** Coding agents can bump the
   last part of a version number (`0.0.X`) — every other bump (minor, major) is
-  human initiated. Current version: `0.0.12`.
+  human initiated. Current version: `0.0.13`.
 - **No agent as a contributor on GitHub.** See the commits bullet above: the
   `Co-Authored-By` agent trailer is what made GitHub list `mistral-vibe` as a
   contributor — it is banned from commits; humans only in the contributor
@@ -1143,7 +1161,18 @@ HTTP with a hermetic fake OAuth server, including a seat run after a GUI
 login and a subprocess `tc coop start` flow, with an explicit assertion that
 no response body or audit row ever contains token or device-code material.
 
-The MVP spec pipeline (01–10) and the GUI spec 11 slices (12–19) are
+Spec 20 (lexicon adoption) landed: Headcount event names, Coop GUI copy, CLI
+output/help, and error copy now speak farm per `docs/lexicon.md` (`egg.queued`,
+`egg.hatched`, `clutch.stored`, `abattoir.attested`, `chicken.finished`,
+`rooster.crowed`, `perch.claimed`, `coopd.started`, …; nav Chickens/Eggs/Rooster/
+Feed/Headcount/Perch; `tc status` prints `coopd:` / `pecking order:`), while
+socket ops, HTTP paths, CLI subcommands, DB schema, settings keys, and on-disk
+file names stay byte-stable. `audit.py` carries the legacy→lexicon alias map
+applied on read/display only (`tail()` normalizes, `?event=` accepts both old and
+new names; raw rows on disk are never rewritten), and the Hatchery now emits
+`egg.hatched` at provisioning start. `docs/lexicon.md` gained the Feed Ledger.
+
+The MVP spec pipeline (01–10) and the GUI spec 11 slices (12–20) are
 complete; what remains is the post-MVP roadmap in baseline §13.
 
 **Next items (the next session starts here):**

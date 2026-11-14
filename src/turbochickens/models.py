@@ -147,7 +147,7 @@ def list_provider_catalogs(
     timeout: float = MODELS_HTTP_TIMEOUT_SEC,
 ) -> list[ProviderCatalog]:
     """One catalog row per provider in providers.toml, sorted by name. A
-    provider whose credential resolution fails (e.g. no seat session) is
+    provider whose credential resolution fails (e.g. no perch seat) is
     marked unreachable with that error — the listing never aborts, rc stays 0."""
     rows: list[ProviderCatalog] = []
     for name in sorted(providers.providers):

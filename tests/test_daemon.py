@@ -158,7 +158,7 @@ def test_audit_log_records_daemon_start_and_stop(settings_file) -> None:
     dt.start()
     dt.stop()
     events = [r["event"] for r in AuditLog(settings.audit_log_path).read_all()]
-    assert events == ["daemon.started", "daemon.stopped"]
+    assert events == ["coopd.started", "coopd.stopped"]
 
 
 # --- CLI against a live daemon ---
@@ -167,9 +167,9 @@ def test_audit_log_records_daemon_start_and_stop(settings_file) -> None:
 def test_tc_status_shows_up_empty_queue_zero_in_flight(daemon) -> None:
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 0, result.output
-    assert "daemon: up" in result.output
+    assert "coopd: up" in result.output
     assert f"version={turbochickens.__version__}" in result.output
-    assert "queue_depth: 0" in result.output
+    assert "pecking order: 0" in result.output
     assert "in_flight: 0" in result.output
     assert "weight_budget: 4" in result.output
 
@@ -177,13 +177,13 @@ def test_tc_status_shows_up_empty_queue_zero_in_flight(daemon) -> None:
 def test_tc_status_when_daemon_down_exits_1(settings_file) -> None:
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 1
-    assert "no daemon" in result.output
+    assert "no coopd" in result.output
 
 
 def test_tc_daemon_stop_round_trip(daemon) -> None:
     result = runner.invoke(app, ["daemon", "stop"])
     assert result.exit_code == 0, result.output
-    assert "daemon stopped" in result.output
+    assert "coopd stopped" in result.output
     daemon.thread.join(timeout=10)
     assert not daemon.thread.is_alive()
     result = runner.invoke(app, ["status"])
@@ -193,7 +193,7 @@ def test_tc_daemon_stop_round_trip(daemon) -> None:
 def test_tc_daemon_stop_when_down_exits_1(settings_file) -> None:
     result = runner.invoke(app, ["daemon", "stop"])
     assert result.exit_code == 1
-    assert "no daemon" in result.output
+    assert "no coopd" in result.output
 
 
 # --- end-to-end: real daemon subprocess + real CLI ---
@@ -227,12 +227,12 @@ def test_e2e_daemon_subprocess_and_tc_status(settings_file) -> None:
 
         result = runner.invoke(app, ["status"])
         assert result.exit_code == 0, result.output
-        assert "daemon: up" in result.output
-        assert "queue_depth: 0" in result.output
+        assert "coopd: up" in result.output
+        assert "pecking order: 0" in result.output
         assert "in_flight: 0" in result.output
 
         events = [r["event"] for r in AuditLog(settings.audit_log_path).read_all()]
-        assert "daemon.started" in events
+        assert "coopd.started" in events
 
         result = runner.invoke(app, ["daemon", "stop"])
         assert result.exit_code == 0, result.output
@@ -240,7 +240,7 @@ def test_e2e_daemon_subprocess_and_tc_status(settings_file) -> None:
         assert proc.returncode == 0
 
         events = [r["event"] for r in AuditLog(settings.audit_log_path).read_all()]
-        assert "daemon.stopped" in events
+        assert "coopd.stopped" in events
         with pytest.raises(DaemonUnreachable):
             request(settings.socket_path, "ping", timeout=1.0)
     finally:

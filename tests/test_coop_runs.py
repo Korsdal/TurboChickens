@@ -226,7 +226,7 @@ def test_post_api_runs_enqueues_manual_run_seen_by_cli_and_socket(coop_daemon, f
 
     # the enqueue was audited like any manual run
     events_audit = [e["event"] for e in AuditLog(coop_daemon.settings.audit_log_path).read_all()]
-    assert "run.queued" in events_audit and "result.stored" in events_audit
+    assert "egg.queued" in events_audit and "clutch.stored" in events_audit
 
 
 def test_post_api_runs_rejects_bad_requests(coop_daemon) -> None:
@@ -238,7 +238,7 @@ def test_post_api_runs_rejects_bad_requests(coop_daemon) -> None:
 
     r = c.post("/api/runs", json={"spec_path": "/no/such/job.toml"})
     assert r.status_code == 422
-    assert r.json()["ok"] is False and "invalid job spec" in r.json()["error"]
+    assert r.json()["ok"] is False and "egg failed candling" in r.json()["error"]
 
     # unknown resources are 404s, not broken pages
     assert c.get("/api/runs/run-nope").status_code == 404
@@ -253,7 +253,7 @@ def test_results_endpoint_404_while_run_has_no_result_yet(coop_daemon, fake_vibe
     # the run is queued/running (fake vibe sleeps 5 s) and never reached collecting
     res = c.get(f"/api/results/{run_id}")
     assert res.status_code == 404
-    assert res.json()["ok"] is False and "no result stored" in res.json()["error"]
+    assert res.json()["ok"] is False and "no clutch in the nest box" in res.json()["error"]
     wait_terminal_http(c, run_id, timeout=30.0)  # let it finish so the daemon stops cleanly
 
 
@@ -317,7 +317,7 @@ def test_expired_result_over_http_renders_expired_state(coop_daemon, fake_vibe, 
     assert body["ok"] is False and body["expired"] is True and body["run_id"] == run_id
     assert "output" not in body and "raw_output" not in body  # the payload is not served
     cli = runner.invoke(app, ["results", "get", run_id])
-    assert cli.exit_code == 1 and "expired" in combined_output(cli)
+    assert cli.exit_code == 1 and "composted" in combined_output(cli)
 
 
 # --- auth required --------------------------------------------------------------------
@@ -388,7 +388,7 @@ def test_spa_serves_runs_view(coop_daemon) -> None:
         'id="tab-manifest"', 'id="tab-logs"', 'id="tab-result"',
         'id="pane-manifest"', 'id="pane-logs"', 'id="pane-result"',
         'id="manifest-pre"', 'id="run-log"', 'id="result-pre"', 'id="result-state"',
-        "Run job",
+        "Queue egg",
     ):
         assert marker in html, marker
     js = c.get("/app.js").text

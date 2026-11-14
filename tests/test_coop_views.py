@@ -109,7 +109,7 @@ def test_audit_tail_newest_first_with_limit(daemon) -> None:
     assert resp["events"] == on_disk[-5:][::-1]  # newest first
     ts = [e["ts"] for e in resp["events"]]
     assert ts == sorted(ts, reverse=True)
-    assert any(e["event"] == "daemon.started" for e in resp["events"])
+    assert any(e["event"] == "coopd.started" for e in resp["events"])
 
     default = request(sock, "audit_tail", timeout=2.0)
     assert default["ok"] is True and default["limit"] == 100
@@ -118,10 +118,10 @@ def test_audit_tail_newest_first_with_limit(daemon) -> None:
 
 def test_audit_tail_event_filter(daemon) -> None:
     sock = daemon.settings.socket_path
-    resp = request(sock, "audit_tail", limit=50, event="daemon.started", timeout=2.0)
-    assert resp["ok"] is True and resp["event"] == "daemon.started"
+    resp = request(sock, "audit_tail", limit=50, event="coopd.started", timeout=2.0)
+    assert resp["ok"] is True and resp["event"] == "coopd.started"
     assert resp["count"] >= 1
-    assert all(e["event"] == "daemon.started" for e in resp["events"])
+    assert all(e["event"] == "coopd.started" for e in resp["events"])
 
     none = request(sock, "audit_tail", limit=50, event="no.such.event", timeout=2.0)
     assert none["ok"] is True and none["events"] == [] and none["count"] == 0
@@ -161,11 +161,11 @@ def test_settings_get_effective_settings_never_the_token(tmp_path, monkeypatch) 
 def test_audit_log_tail_pure_seam(tmp_path) -> None:
     log = AuditLog(tmp_path / "audit.jsonl")
     for i in range(5):
-        log.append({"event": "run.queued" if i % 2 else "daemon.started", "n": i})
+        log.append({"event": "egg.queued" if i % 2 else "coopd.started", "n": i})
     log.path.write_text(log.path.read_text() + "{torn line\n")  # crash-torn final line
     assert [r["n"] for r in log.tail(2)] == [4, 3]  # newest first
     assert [r["n"] for r in log.tail(10)] == [4, 3, 2, 1, 0]
-    assert [r["n"] for r in log.tail(10, event="daemon.started")] == [4, 2, 0]
+    assert [r["n"] for r in log.tail(10, event="coopd.started")] == [4, 2, 0]
     assert log.tail(0) == []
 
 

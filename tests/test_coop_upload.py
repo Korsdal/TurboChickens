@@ -116,7 +116,7 @@ def test_jobs_upload_socket_valid_bundle_stored_and_enqueueable(coop_daemon, fak
     assert len(jobs) == 1 and jobs[0]["job_id"] == "upload-job" and jobs[0]["spec_hash"] == resp["spec_hash"]
     # the upload was audited (no file contents)
     events = AuditLog(coop_daemon.settings.audit_log_path).read_all()
-    uploaded = [e for e in events if e["event"] == "job.uploaded"]
+    uploaded = [e for e in events if e["event"] == "egg.candled"]
     assert len(uploaded) == 1 and uploaded[0]["job_id"] == "upload-job"
     assert uploaded[0]["spec_path"] == resp["spec_path"] and uploaded[0]["size_bytes"] > 0
 
@@ -148,7 +148,7 @@ def test_jobs_upload_socket_invalid_bundle_errors_named_nothing_stored(coop_daem
     assert not coop_daemon.settings.uploads_dir.exists() or list(coop_daemon.settings.uploads_dir.iterdir()) == []
     assert request(sock, "jobs_list", timeout=2.0)["jobs"] == []
     events = [e["event"] for e in AuditLog(coop_daemon.settings.audit_log_path).read_all()]
-    assert "job.upload_rejected" in events and "job.uploaded" not in events
+    assert "egg.rejected" in events and "egg.candled" not in events
 
 
 def test_jobs_upload_socket_missing_prompt_and_attachments_named(coop_daemon, tmp_path) -> None:
@@ -363,12 +363,12 @@ def test_spa_serves_jobs_upload_form_and_no_host_paths(coop_daemon, tmp_path) ->
         'id="up-job"', 'id="up-prompt"', 'id="up-prompt-path"', 'id="up-schema"', 'id="up-schema-path"',
         'id="up-attachments"', 'id="up-job-error"', 'id="up-prompt-error"', 'id="up-schema-error"',
         'id="up-attachments-error"', 'id="upload-error"', 'id="upload-submit"', 'id="upload-result"',
-        ">Validate</button>", "Job spec (job.toml)", "Prompt file", "Schema file", "Attachments (optional)",
+        ">Validate</button>", "Egg (job.toml)", "Prompt file", "Schema file", "Attachments (optional)",
     ):
         assert marker in html, marker
     js = c.get("/app.js").text
     assert '"/api/jobs/validate"' in js and '"/api/runs"' in js and "apiPost" in js
-    assert "readFileB64" in js and "showUploadErrors" in js and "Run job" in js
+    assert "readFileB64" in js and "showUploadErrors" in js and "Queue egg" in js
     css = c.get("/styles.css").text
     for cls in (".upload-card", ".upload-form", ".upload-grid", ".upload-field", ".upload-actions", ".upload-error"):
         assert cls in css, cls
@@ -437,7 +437,7 @@ def test_e2e_create_run_and_read_job_entirely_over_http(tmp_path, monkeypatch) -
         jobs = c.get("/api/jobs").json()["jobs"]
         assert [j["job_id"] for j in jobs] == ["e2e-upload-job"]
         events = [e["event"] for e in AuditLog(settings.audit_log_path).read_all()]
-        assert "job.uploaded" in events and "run.queued" in events and "result.stored" in events
+        assert "egg.candled" in events and "egg.queued" in events and "clutch.stored" in events
 
         # 6. the SPA serves the upload form, with no host paths in the assets
         page = c.get("/")

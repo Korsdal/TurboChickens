@@ -41,14 +41,14 @@ non-loopback (or any configured token) → bearer required, with an ephemeral
 token printed once at startup when none is configured.
 
 Spec 19 (auth & access management in the GUI) adds the ops behind the Auth
-view: ``auth_providers`` (each provider's auth mode + seat session expiry via
+view: ``auth_providers`` (each provider's auth mode + perch seat expiry via
 ``SeatBroker.status()`` — never token material), ``auth_access`` (the declared
 access scope: per-run env allowlist, network policy, tools/data/MCP/connectors
 placeholders), ``auth_login_start`` / ``auth_login_poll`` (the OAuth device
 flow driven one request at a time through the same ``SeatBroker`` — the
 device_code stays in daemon memory, sessions land 0600 under
-``<data_dir>/seats/`` exactly as the CLI path, audit rows ``auth.login`` /
-``auth.logout`` carry provider + mode only), and ``auth_logout``.
+``<data_dir>/seats/`` exactly as the CLI path, Headcount rows ``perch.claimed`` /
+``perch.released`` carry provider + mode only), and ``auth_logout``.
 ``runs_list`` rows also carry ``auth_mode`` from the run manifest.
 """
 
@@ -182,7 +182,7 @@ class Daemon:
         self._stop = asyncio.Event()
         self.audit.append(
             {
-                "event": "daemon.started",
+                "event": "coopd.started",
                 "pid": os.getpid(),
                 "version": __version__,
                 "socket": str(s.socket_path),
@@ -252,7 +252,7 @@ class Daemon:
             with contextlib.suppress(Exception):
                 await self._server.wait_closed()
             if self.audit is not None:
-                self.audit.append({"event": "daemon.stopped", "pid": os.getpid()})
+                self.audit.append({"event": "coopd.stopped", "pid": os.getpid()})
             if self.db is not None:
                 self.db.close()
                 self.db = None
@@ -439,7 +439,7 @@ class Daemon:
             return {
                 "ok": False,
                 "protocol": PROTOCOL_VERSION,
-                "error": "invalid job spec: " + "; ".join(str(i) for i in e.issues),
+                "error": "egg failed candling: " + "; ".join(str(i) for i in e.issues),
             }
         digest = spec_hash(spec)
         expected = req.get("spec_hash")
@@ -447,7 +447,7 @@ class Daemon:
             return {
                 "ok": False,
                 "protocol": PROTOCOL_VERSION,
-                "error": f"spec hash mismatch: client sent sha256:{expected}, file is sha256:{digest}",
+                "error": f"egg hash mismatch: client sent sha256:{expected}, the spec on disk is sha256:{digest}",
             }
         try:
             weight = run_weight(spec.harness.adapter)
@@ -488,7 +488,7 @@ class Daemon:
         assert self.audit is not None
         self.audit.append(
             {
-                "event": "run.queued",
+                "event": "egg.queued",
                 "run_id": run_id,
                 "job_id": job_id,
                 "spec_hash": f"sha256:{digest}",
@@ -658,13 +658,13 @@ class Daemon:
         run_id = str(req.get("run_id", ""))
         run = self._run_row(run_id) if run_id else None
         if run is None:
-            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"unknown run: {run_id!r}"}
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"unknown chicken: {run_id!r}"}
         return {"ok": True, "op": "runs_show", "protocol": PROTOCOL_VERSION, "run": run}
 
     def _runs_logs(self, req: dict[str, Any]) -> dict[str, Any]:
         run_id = str(req.get("run_id", ""))
         if self.db is None or self._run_row(run_id) is None:
-            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"unknown run: {run_id!r}"}
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"unknown chicken: {run_id!r}"}
         events = self.db.execute(
             "SELECT seq, ts, level, source, line FROM run_events WHERE run_id = ? ORDER BY seq",
             (run_id,),
@@ -689,7 +689,7 @@ class Daemon:
         Expired on-disk artifacts (spec 08) are reported as expired, never served."""
         run_id = str(req.get("run_id", ""))
         if self.db is None or self._run_row(run_id) is None:
-            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"unknown run: {run_id!r}"}
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"unknown chicken: {run_id!r}"}
         row = self.db.execute(
             "SELECT valid, output_json, artifacts_dir, schema_errors FROM results WHERE run_id = ?",
             (run_id,),
@@ -698,7 +698,7 @@ class Daemon:
             return {
                 "ok": False,
                 "protocol": PROTOCOL_VERSION,
-                "error": f"no result stored for run {run_id!r} (the run never reached collecting)",
+                "error": f"no clutch in the nest box for chicken {run_id!r} (it never reached collecting)",
             }
         valid, output_json, artifacts_dir, schema_errors = row
         # spec 08: the on-disk artifacts may have expired under the retention
@@ -708,7 +708,7 @@ class Daemon:
                 "ok": False,
                 "protocol": PROTOCOL_VERSION,
                 "error": (
-                    f"result artifacts for run {run_id!r} expired"
+                    f"clutch for chicken {run_id!r} composted"
                     f" (results_retention_months={self.settings.results_retention_months})"
                 ),
                 "expired": True,
@@ -719,7 +719,7 @@ class Daemon:
             return {
                 "ok": False,
                 "protocol": PROTOCOL_VERSION,
-                "error": f"run {run_id!r} is quarantined: output failed schema validation",
+                "error": f"chicken {run_id!r} quarantined: the clutch failed candling (schema validation)",
                 "quarantined": True,
                 "schema_errors": json.loads(schema_errors) if schema_errors else [],
                 "raw_output": output_json,
@@ -781,7 +781,7 @@ class Daemon:
             return {
                 "ok": False,
                 "protocol": PROTOCOL_VERSION,
-                "error": f"no usage stats for job {job_id!r} (no finished runs yet)",
+                "error": f"no feed recorded for egg {job_id!r} (no finished chickens yet)",
             }
         return {
             "ok": True,
@@ -915,7 +915,7 @@ class Daemon:
 
     def _auth_providers(self) -> dict[str, Any]:
         """Every provider from providers.toml with its auth mode, plus the
-        stored seat session state (expiry only) — `SeatBroker.status()` never
+        stored perch seat state (expiry only) — `SeatBroker.status()` never
         returns token material, and neither does this response."""
         return {
             "ok": True,
@@ -981,7 +981,7 @@ class Daemon:
     def _auth_login_poll(self, req: dict[str, Any]) -> dict[str, Any]:
         """One poll step of a started device flow: pending / authorized /
         expired. On authorized the session is stored 0600 (same SeatBroker
-        path as the CLI) and audited as `auth.login` — provider + mode only,
+        path as the CLI) and audited as `perch.claimed` — provider + mode only,
         never tokens or codes."""
         provider = str(req.get("provider", ""))
         if not provider:
@@ -1010,7 +1010,7 @@ class Daemon:
             del self._device_grants[provider]
             session = outcome["session"]
             assert self.audit is not None
-            self.audit.append({"event": "auth.login", "provider": provider, "mode": "seat"})
+            self.audit.append({"event": "perch.claimed", "provider": provider, "mode": "seat"})
             return {
                 "ok": True,
                 "op": "auth_login_poll",
@@ -1034,8 +1034,8 @@ class Daemon:
         }
 
     def _auth_logout(self, req: dict[str, Any]) -> dict[str, Any]:
-        """Delete a provider's stored seat session (tokens removed, not
-        revoked) and audit `auth.logout` — provider + mode only."""
+        """Release a provider's stored perch seat (tokens removed, not
+        revoked) and audit `perch.released` — provider + mode only."""
         provider = str(req.get("provider", ""))
         if not provider:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "auth_logout requires provider"}
@@ -1044,7 +1044,7 @@ class Daemon:
         except SeatError as e:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": str(e)}
         assert self.audit is not None
-        self.audit.append({"event": "auth.logout", "provider": provider, "mode": "seat"})
+        self.audit.append({"event": "perch.released", "provider": provider, "mode": "seat"})
         return {"ok": True, "op": "auth_logout", "protocol": PROTOCOL_VERSION, "provider": provider}
 
     # --- spec 15: upload + validate job-spec bundles from the GUI -------------
@@ -1198,7 +1198,7 @@ class Daemon:
         assert self.audit is not None
         self.audit.append(
             {
-                "event": "job.uploaded",
+                "event": "egg.candled",
                 "job_id": spec.job.name,
                 "spec_hash": f"sha256:{digest}",
                 "spec_path": str(spec_path),
@@ -1225,7 +1225,7 @@ class Daemon:
         if self.audit is None:
             return
         self.audit.append(
-            {"event": "job.upload_rejected", "fields": [e["field"] for e in errors]}
+            {"event": "egg.rejected", "fields": [e["field"] for e in errors]}
         )
 
     # --- cron scheduling (spec 06) -------------------------------------------
@@ -1257,13 +1257,13 @@ class Daemon:
             )
         except Exception as e:
             self.audit.append(
-                {"event": "schedule.fire_failed", "job_id": job_id, "error": f"{type(e).__name__}: {e}"}
+                {"event": "rooster.missed", "job_id": job_id, "error": f"{type(e).__name__}: {e}"}
             )
             return
         if resp.get("ok"):
             self.audit.append(
                 {
-                    "event": "schedule.fired",
+                    "event": "rooster.crowed",
                     "job_id": job_id,
                     "run_id": resp.get("run_id"),
                     "spec_hash": f"sha256:{spec_hash}",
@@ -1272,7 +1272,7 @@ class Daemon:
             )
         else:
             self.audit.append(
-                {"event": "schedule.fire_failed", "job_id": job_id, "error": resp.get("error", "enqueue failed")}
+                {"event": "rooster.missed", "job_id": job_id, "error": resp.get("error", "enqueue failed")}
             )
 
     def _load_schedules(self) -> None:
@@ -1294,13 +1294,13 @@ class Daemon:
             return {
                 "ok": False,
                 "protocol": PROTOCOL_VERSION,
-                "error": "invalid job spec: " + "; ".join(str(i) for i in e.issues),
+                "error": "egg failed candling: " + "; ".join(str(i) for i in e.issues),
             }
         if spec.trigger.type != "cron" or not spec.trigger.schedule:
             return {
                 "ok": False,
                 "protocol": PROTOCOL_VERSION,
-                "error": f"job {spec.job.name!r} has trigger.type={spec.trigger.type!r}; only cron-triggered jobs carry a schedule",
+                "error": f"egg {spec.job.name!r} has trigger.type={spec.trigger.type!r}; only cron-triggered eggs carry a crow",
             }
         digest = spec_hash(spec)
         expected = req.get("spec_hash")
@@ -1308,7 +1308,7 @@ class Daemon:
             return {
                 "ok": False,
                 "protocol": PROTOCOL_VERSION,
-                "error": f"spec hash mismatch: client sent sha256:{expected}, file is sha256:{digest}",
+                "error": f"egg hash mismatch: client sent sha256:{expected}, the spec on disk is sha256:{digest}",
             }
         job_id = spec.job.name
         expr = spec.trigger.schedule
@@ -1331,7 +1331,7 @@ class Daemon:
         assert self.audit is not None
         self.audit.append(
             {
-                "event": "schedule.added",
+                "event": "rooster.scheduled",
                 "job_id": job_id,
                 "schedule": expr,
                 "spec_hash": f"sha256:{digest}",
@@ -1382,7 +1382,7 @@ class Daemon:
                 return {
                     "ok": False,
                     "protocol": PROTOCOL_VERSION,
-                    "error": f"no schedule registered for job {job_id!r}",
+                    "error": f"no crow registered for egg {job_id!r}",
                 }
             self.db.execute("DELETE FROM schedules WHERE job_id = ?", (job_id,))
             self.db.commit()
@@ -1390,7 +1390,7 @@ class Daemon:
             self.cron.remove(job_id)
         assert self.audit is not None
         self.audit.append(
-            {"event": "schedule.removed", "job_id": job_id, "schedule": row[0], "spec_hash": f"sha256:{row[1]}"}
+            {"event": "rooster.unscheduled", "job_id": job_id, "schedule": row[0], "spec_hash": f"sha256:{row[1]}"}
         )
         return {"ok": True, "op": "schedule_rm", "protocol": PROTOCOL_VERSION, "job_id": job_id}
 

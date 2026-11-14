@@ -71,7 +71,7 @@ def combined_output(result) -> str:
 
 
 def run_id_of(result) -> str:
-    m = re.search(r"queued run (run-[0-9a-f]+)", result.output)
+    m = re.search(r"egg queued (run-[0-9a-f]+)", result.output)
     assert m, f"no run id in output: {result.output}"
     return m.group(1)
 
@@ -669,7 +669,7 @@ def test_login_rejects_api_key_provider(seat_env) -> None:
 def test_cli_auth_login_status_logout_never_print_tokens(seat_env) -> None:
     r = runner.invoke(app, ["auth", "login", "seatco"])
     assert r.exit_code == 0, combined_output(r)
-    assert "seat session stored for provider 'seatco'" in r.output
+    assert "perch seat claimed for provider 'seatco'" in r.output
     assert "seat-access-1" not in r.output and "seat-refresh-1" not in r.output
     assert any("ABCD-EFGH" in line for line in r.output.splitlines())
 
@@ -684,7 +684,7 @@ def test_cli_auth_login_status_logout_never_print_tokens(seat_env) -> None:
     r = runner.invoke(app, ["auth", "status"])
     assert "none (run `tc auth login seatco`)" in r.output
     r = runner.invoke(app, ["auth", "logout", "seatco"])
-    assert r.exit_code == 1 and "no seat session" in combined_output(r)
+    assert r.exit_code == 1 and "no perch seat" in combined_output(r)
 
 
 # --- e2e through the daemon ------------------------------------------------------
@@ -721,9 +721,9 @@ def test_e2e_seat_run_succeeds_with_no_api_key_in_env(seat_env, seat_daemon, tmp
 
     # audit records the mode per run; no token anywhere in the audit log
     events = AuditLog(settings.audit_log_path).read_all()
-    auth_rows = [e for e in events if e["event"] == "auth.resolved" and e.get("run_id") == run_id]
+    auth_rows = [e for e in events if e["event"] == "perch.resolved" and e.get("run_id") == run_id]
     assert len(auth_rows) == 1 and auth_rows[0]["mode"] == "seat" and auth_rows[0]["token_expires_at"]
-    fin = [e for e in events if e["event"] == "run.finished" and e.get("run_id") == run_id]
+    fin = [e for e in events if e["event"] == "chicken.finished" and e.get("run_id") == run_id]
     assert fin and fin[0]["auth_mode"] == "seat"
     assert "seat-access-1" not in json.dumps(events)
 

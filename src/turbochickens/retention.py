@@ -7,7 +7,7 @@ result artifacts on disk expire after `results_retention_months` (default 6).
 The SQLite result index is append-only by construction (storage triggers), so
 expiry deletes the **on-disk artifacts** (`results/<run_id>/`, and
 `quarantine/<run_id>/` for invalid output) while the `results` row stays as
-the permanent index. Every deletion is itself audit-logged (`result.expired`).
+the permanent index. Every deletion is itself audit-logged (`clutch.composted`).
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ def sweep_expired_results(
             "retention_months": settings.results_retention_months,
         }
         expired.append(entry)
-        audit.append({"event": "result.expired", **entry})
+        audit.append({"event": "clutch.composted", **entry})
     return {
         "cutoff": cutoff.isoformat(),
         "results_retention_months": settings.results_retention_months,

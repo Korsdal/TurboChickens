@@ -1,14 +1,17 @@
 # Running TurboChickens in Docker — the `coop` container
 
-The `coop` image packages the whole platform — supervisor daemon, queue,
-SQLite store, append-only audit log, and the TurboChickens browser GUI — as
-one container. One container runs one daemon process; with the shipped
-settings that same process also serves the GUI over HTTP on port **8737**.
+The `coop` image packages the whole platform — coopd (the supervisor daemon),
+the pecking order, the SQLite store, the append-only Headcount, and the
+TurboChickens browser GUI — as one container. One container runs one coopd
+process; with the shipped settings that same process also serves the GUI over
+HTTP on port **8737**.
 The image adds no UI of its own: it runs the same SPA the daemon has served
 since spec 12 (`tc coop start` locally), installed from the same wheel.
 
-Naming (spec 11): the image and the daemon inside it are **coop**; the GUI
-branded in the browser is **TurboChickens**.
+Naming (spec 11, lexicon): the image and the daemon inside it are **coop** /
+**coopd**; the GUI branded in the browser is **TurboChickens**. The register
+comes from `docs/lexicon.md` — eggs, chickens, clutches, the rooster, the
+perch, the headcount.
 
 ```
 Dockerfile            # python:3.12-slim, pip install ., ships docker/settings.toml
@@ -57,20 +60,20 @@ Everything stateful lives **only** under the data dir (`data_dir = "/data"` in
 the shipped settings), and `/data` is the documented volume:
 
 ```
-/data/daemon.sock          # the JSON-lines IPC socket (0600)
+/data/daemon.sock          # the coopd JSON-lines IPC socket (0600)
 /data/turbochickens.db     # job_specs, runs, results, schedules, stats, ...
-/data/audit.jsonl          # append-only audit log, kept forever
-/data/results/<run_id>/    # validated result artifacts (TTL: 6 months)
-/data/quarantine/<run_id>/ # schema-invalid output, kept for inspection
-/data/uploads/<job>-<hash>/ # job-spec bundles uploaded from the browser
-/data/seats/               # seat-auth sessions (0600)
-/data/workspaces/          # per-run workspaces (ephemeral; torn down per run)
+/data/audit.jsonl          # the Headcount — append-only, kept forever
+/data/results/<run_id>/    # the Nest Box — candled clutches (TTL: 6 months)
+/data/quarantine/<run_id>/ # clutches that failed candling, kept for inspection
+/data/uploads/<job>-<hash>/ # egg bundles uploaded from the browser
+/data/seats/               # perch seats — auth sessions (0600)
+/data/workspaces/          # per-chicken workspaces (ephemeral; the abattoir tears them down)
 ```
 
-So replacing the container with the same volume keeps jobs, runs, results and
-schedules — the socket is re-created on start (a stale one is reaped), the DB
-and audit log are reopened in place, and persisted cron schedules are
-re-registered. "The coop remembers; the chickens don't."
+So replacing the container with the same volume keeps eggs, chickens, clutches
+and crows — the socket is re-created on start (a stale one is reaped), the DB
+and the Headcount are reopened in place, and persisted crows are re-registered.
+"The coop remembers; the chickens don't."
 
 You can drive the CLI inside a running container (the image's env already
 points at the right settings):
@@ -86,7 +89,7 @@ docker exec coop tc runs list
 The shipped settings bind `coop_host = "0.0.0.0"` with **no** configured
 `coop_auth_token`, so the GUI is never unauthenticated on a published port:
 
-- At startup the daemon mints an **ephemeral token** and prints it **exactly
+- At startup coopd mints an **ephemeral token** and prints it **exactly
   once** to stdout:
 
   ```sh
@@ -95,7 +98,7 @@ The shipped settings bind `coop_host = "0.0.0.0"` with **no** configured
 
   Paste it into the GUI login card. The browser sends it as
   `Authorization: Bearer …` and keeps it in `sessionStorage` — no cookies, so
-  no CSRF surface. The token is never written to the audit log, the status
+  no CSRF surface. The token is never written to the Headcount, the status
   payload, or the DB.
 - `GET /api/ping` stays **unauthenticated** (it is the healthcheck); every
   other `/api/*` route requires the bearer.
@@ -114,9 +117,9 @@ The image declares:
 HEALTHCHECK ... CMD python -c "... urllib.request.urlopen('http://127.0.0.1:8737/api/ping') ..."
 ```
 
-hitting `GET /api/ping` **on loopback** (the daemon binds `0.0.0.0`, so
+hitting `GET /api/ping` **on loopback** (coopd binds `0.0.0.0`, so
 loopback answers). `docker ps` shows `healthy` once the GUI is up; the
-healthcheck fails (503) if the daemon socket is unreachable. Note: if you
+healthcheck fails (503) if coopd's socket is unreachable. Note: if you
 override `coop_port` in a mounted settings file, override the healthcheck
 port to match.
 
@@ -172,11 +175,11 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8737/api/status      
 #    or via the browser at http://localhost:8737
 
 # 4. state survives container replacement on the same volume
-docker exec coop tc schedule list               # after adding a schedule
+docker exec coop tc schedule list               # after adding a crow
 docker rm -f coop
 docker run --name coop -d -p 8737:8737 -v coop-data:/data coop
-docker exec coop tc schedule list               # same schedule
-docker exec coop tc runs list                   # same runs
+docker exec coop tc schedule list               # same crow
+docker exec coop tc runs list                   # same chickens
 docker logs coop | grep -c "coop auth token:"   # 1 again (new ephemeral token)
 ```
 
@@ -184,6 +187,6 @@ docker logs coop | grep -c "coop auth token:"   # 1 again (new ephemeral token)
 
 `CMD ["tc", "daemon", "start"]` with the shipped settings — i.e. exactly
 `tc daemon start` with `coop_enabled = true`, `coop_host = "0.0.0.0"`,
-`coop_port = 8737`, `data_dir = "/data"`. No extra process, no second daemon,
-no extra UI: the GUI is served by the daemon itself in the same event loop,
+`coop_port = 8737`, `data_dir = "/data"`. No extra process, no second coopd,
+no extra UI: the GUI is served by coopd itself in the same event loop,
 and every GUI action is a thin mirror of the existing Unix-socket ops.

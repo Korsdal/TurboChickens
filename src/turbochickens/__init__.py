@@ -1,3 +1,3 @@
 """TurboChickens — local-first platform for ephemeral AI agent jobs."""
 
-__version__ = "0.0.12"
+__version__ = "0.0.13"

@@ -7,7 +7,7 @@ Seams (per spec 11/16 testing decisions — no browser automation):
   /api/schedule/{job_id} — with socket parity (schedule_list/schedule_add/
   schedule_rm) and CLI parity (`tc schedule add/list/rm`);
 - one real cron firing: a schedule added over HTTP fires a trigger=cron run
-  through the normal pipeline (next-minute cron, audit shows schedule.fired);
+  through the normal pipeline (next-minute cron, audit shows rooster.crowed);
 - rejections surface as clear inline errors (422 with the socket error):
   manual-trigger spec, invalid cron, spec-hash mismatch, malformed body (400);
 - auth-required 401s, dead-socket daemon-down payloads (never 500), served SPA
@@ -94,7 +94,7 @@ def test_schedule_add_over_http_appears_everywhere_and_readd_replaces(coop_daemo
     row = db_row(settings, "SELECT spec_path, schedule, spec_hash FROM schedules WHERE job_id = 'gui-cron'")
     assert row is not None and row[0] == str(spec_path.resolve()) and row[1] == "0 7 * * 1"
     events = [e["event"] for e in AuditLog(settings.audit_log_path).read_all()]
-    assert "schedule.added" in events
+    assert "rooster.scheduled" in events
     assert request(sock, "status", timeout=2.0)["schedules"] == 1
     jobs = request(sock, "jobs_list", timeout=2.0)["jobs"]
     assert jobs[0]["job_id"] == "gui-cron" and jobs[0]["spec_path"] == str(spec_path.resolve())
@@ -132,14 +132,14 @@ def test_schedule_rm_over_http_removes_it_everywhere(coop_daemon, tmp_path) -> N
     assert request(sock, "status", timeout=2.0)["schedules"] == 0
     assert db_row(settings, "SELECT * FROM schedules WHERE job_id = 'rm-job'") is None
     events = [e["event"] for e in AuditLog(settings.audit_log_path).read_all()]
-    assert "schedule.removed" in events
+    assert "rooster.unscheduled" in events
     result = runner.invoke(app, ["schedule", "list"])
-    assert result.exit_code == 0 and "no schedules" in result.output
+    assert result.exit_code == 0 and "no crows yet" in result.output
 
     # removing an unknown schedule is a 404 carrying the socket error
     r = c.delete("/api/schedule/rm-job")
     assert r.status_code == 404
-    assert r.json()["ok"] is False and "no schedule registered" in r.json()["error"]
+    assert r.json()["ok"] is False and "no crow registered" in r.json()["error"]
 
 
 # --- the acceptance behavior: an HTTP-added schedule fires a trigger=cron run ---
@@ -184,9 +184,9 @@ def test_http_added_schedule_fires_cron_run_through_the_pipeline(coop_daemon, fa
 
     # audit shows the fire + the queued run with trigger=cron; result over HTTP
     audit = AuditLog(settings.audit_log_path).read_all()
-    fired = [e for e in audit if e["event"] == "schedule.fired"]
+    fired = [e for e in audit if e["event"] == "rooster.crowed"]
     assert fired and fired[0]["run_id"] == run_id and fired[0]["trigger"] == "cron"
-    queued = [e for e in audit if e["event"] == "run.queued" and e.get("run_id") == run_id]
+    queued = [e for e in audit if e["event"] == "egg.queued" and e.get("run_id") == run_id]
     assert queued and queued[0]["trigger"] == "cron"
     res = c.get(f"/api/results/{run_id}")
     assert res.status_code == 200 and res.json()["ok"] is True
@@ -208,7 +208,7 @@ def test_schedule_add_rejections_are_clear_errors(coop_daemon, tmp_path) -> None
     manual = write_cron_job(tmp_path, name="manual-job", trigger_type="manual")
     r = c.post("/api/schedule", json={"spec_path": str(manual.resolve())})
     assert r.status_code == 422
-    assert r.json()["ok"] is False and "only cron-triggered jobs" in r.json()["error"]
+    assert r.json()["ok"] is False and "only cron-triggered eggs" in r.json()["error"]
 
     # invalid cron → field-named error like `tc jobs validate`
     bad = write_cron_job(tmp_path, name="bad-cron", schedule="not a cron")
@@ -218,7 +218,7 @@ def test_schedule_add_rejections_are_clear_errors(coop_daemon, tmp_path) -> None
     # spec-hash mismatch → refused
     good = write_cron_job(tmp_path, name="hash-job", schedule="0 7 * * 1")
     r = c.post("/api/schedule", json={"spec_path": str(good.resolve()), "spec_hash": "deadbeef"})
-    assert r.status_code == 422 and "spec hash mismatch" in r.json()["error"]
+    assert r.status_code == 422 and "egg hash mismatch" in r.json()["error"]
 
     # unreadable spec path → refused (not a 500)
     r = c.post("/api/schedule", json={"spec_path": str(tmp_path / "nope" / "job.toml")})
@@ -235,7 +235,7 @@ def test_schedule_add_rejections_are_clear_errors(coop_daemon, tmp_path) -> None
     assert c.get("/api/schedule").json()["schedules"] == []
     assert request(sock, "schedule_list", timeout=2.0)["schedules"] == []
     events = [e["event"] for e in AuditLog(coop_daemon.settings.audit_log_path).read_all()]
-    assert "schedule.added" not in events
+    assert "rooster.scheduled" not in events
 
 
 def test_schedule_add_accepts_files_bundle_in_one_call(coop_daemon, tmp_path) -> None:
@@ -257,7 +257,7 @@ def test_schedule_add_accepts_files_bundle_in_one_call(coop_daemon, tmp_path) ->
     manual = write_cron_job(tmp_path, name="bundle-manual", trigger_type="manual")
     r = c.post("/api/schedule", json={"files": bundle_of(manual)})
     assert r.status_code == 422
-    assert r.json()["ok"] is False and "only cron-triggered jobs" in r.json()["error"]
+    assert r.json()["ok"] is False and "only cron-triggered eggs" in r.json()["error"]
     assert str(tmp_path) not in r.text
     assert len(c.get("/api/schedule").json()["schedules"]) == 1  # unchanged
 
@@ -328,8 +328,8 @@ def test_spa_serves_schedules_view_and_no_host_paths(coop_daemon, tmp_path) -> N
     html = c.get("/").text
     for marker in (
         'id="view-schedules"', 'id="sched-form"', 'id="sched-spec"', 'id="sched-submit"',
-        ">Add schedule</button>", 'id="sched-error"', 'id="schedules-card"', 'id="schedules-tbody"',
-        'id="schedules-empty"', "Next run", "Cron", 'for="sched-spec"',
+        ">Add a crow</button>", 'id="sched-error"', 'id="schedules-card"', 'id="schedules-tbody"',
+        'id="schedules-empty"', "Next crow", "Cron", 'for="sched-spec"',
     ):
         assert marker in html, marker
     js = c.get("/app.js").text
@@ -385,16 +385,16 @@ def test_e2e_schedule_add_list_rm_over_http_subprocess(tmp_path, monkeypatch) ->
         # 3. a manual spec is refused with a clear inline error over HTTP
         manual = write_cron_job(tmp_path, name="e2e-manual", trigger_type="manual")
         r = c.post("/api/schedule", json={"spec_path": str(manual.resolve())})
-        assert r.status_code == 422 and "only cron-triggered jobs" in r.json()["error"]
+        assert r.status_code == 422 and "only cron-triggered eggs" in r.json()["error"]
 
         # 4. remove over HTTP; CLI shows none afterwards
         r = c.delete("/api/schedule/e2e-cron")
         assert r.status_code == 200 and r.json()["ok"] is True
         assert c.get("/api/schedule").json()["schedules"] == []
         cli = runner.invoke(app, ["schedule", "list"])
-        assert cli.exit_code == 0 and "no schedules" in cli.output
+        assert cli.exit_code == 0 and "no crows yet" in cli.output
         events = [e["event"] for e in AuditLog(settings.audit_log_path).read_all()]
-        assert "schedule.added" in events and "schedule.removed" in events
+        assert "rooster.scheduled" in events and "rooster.unscheduled" in events
 
         # 5. the SPA serves the Schedules view with the add form
         page = c.get("/")

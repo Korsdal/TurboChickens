@@ -135,7 +135,7 @@ def daemon(settings_file, fake_vibe):
 
 
 def run_id_of(result) -> str:
-    m = re.search(r"queued run (run-[0-9a-f]+)", result.output)
+    m = re.search(r"egg queued (run-[0-9a-f]+)", result.output)
     assert m, f"no run id in output: {result.output}"
     return m.group(1)
 
@@ -206,10 +206,10 @@ def test_run_reaches_succeeded_with_manifest_attestation_audit(daemon, tmp_path,
     att = db_row(settings, "SELECT process_reaped, workspace_removed, env_cleared FROM teardown_attestations WHERE run_id = ?", (run_id,))
     assert att == (1, 1, 1)
     events_audit = [r["event"] for r in AuditLog(settings.audit_log_path).read_all()]
-    assert "run.queued" in events_audit
-    assert "run.finished" in events_audit
-    assert "teardown.attested" in events_audit
-    finished = [r for r in AuditLog(settings.audit_log_path).read_all() if r["event"] == "run.finished"][0]
+    assert "egg.queued" in events_audit
+    assert "chicken.finished" in events_audit
+    assert "abattoir.attested" in events_audit
+    finished = [r for r in AuditLog(settings.audit_log_path).read_all() if r["event"] == "chicken.finished"][0]
     assert finished["status"] == "succeeded" and finished["run_id"] == run_id
     # workspace verified gone
     assert not (settings.data_dir / "workspaces" / run_id).exists()
@@ -244,7 +244,7 @@ def test_tc_runs_list_show_logs_display_the_run(daemon, tmp_path) -> None:
 def test_runs_show_unknown_run_exits_1(daemon) -> None:
     result = runner.invoke(app, ["runs", "show", "run-nope"])
     assert result.exit_code == 1
-    assert "unknown run" in combined_output(result)
+    assert "unknown chicken" in combined_output(result)
 
 
 # --- admission control: over-budget backlogs, never rejects ------------------
@@ -262,7 +262,7 @@ def test_over_budget_run_backlogs_in_queue_not_rejected(tmp_path, monkeypatch, f
         r1 = runner.invoke(app, ["run", str(slow)])
         r2 = runner.invoke(app, ["run", str(slow)])
         assert r1.exit_code == 0 and r2.exit_code == 0, combined_output(r1) + combined_output(r2)
-        assert "weight=1.0" in r1.output and "weight=1.0" in r2.output  # never rejected
+        assert "weight 1.0" in r1.output and "weight 1.0" in r2.output  # never rejected
         id1, id2 = run_id_of(r1), run_id_of(r2)
 
         # while run 1 is in flight (weight 1.0 = whole budget of 1), run 2 backlogs
@@ -301,7 +301,7 @@ def test_harness_error_marks_failed_but_still_attested(daemon, tmp_path) -> None
     att = db_row(settings, "SELECT process_reaped, workspace_removed, env_cleared FROM teardown_attestations WHERE run_id = ?", (run_id,))
     assert att == (1, 1, 1)
     events = [r["event"] for r in AuditLog(settings.audit_log_path).read_all()]
-    assert "run.finished" in events and "teardown.attested" in events
+    assert "chicken.finished" in events and "abattoir.attested" in events
     assert not (settings.data_dir / "workspaces" / run_id).exists()
 
 
@@ -376,7 +376,7 @@ def test_enqueue_op_validates_spec_and_hash_over_socket(daemon, tmp_path) -> Non
     spec_path = write_job(tmp_path)
     (spec_path.parent / "schemas" / "out.schema.json").unlink()  # broken file ref
     resp = request(daemon.settings.socket_path, "enqueue", timeout=5.0, spec_path=str(spec_path))
-    assert resp["ok"] is False and "invalid job spec" in resp["error"]
+    assert resp["ok"] is False and "egg failed candling" in resp["error"]
     (spec_path.parent / "schemas" / "out.schema.json").write_text('{"type": "object"}')
     resp = request(daemon.settings.socket_path, "enqueue", timeout=5.0, spec_path=str(spec_path), spec_hash="deadbeef")
     assert resp["ok"] is False and "hash mismatch" in resp["error"]
@@ -389,7 +389,7 @@ def test_tc_run_when_daemon_down_exits_1(settings_file, tmp_path) -> None:
     spec_path = write_job(tmp_path)
     result = runner.invoke(app, ["run", str(spec_path)])
     assert result.exit_code == 1
-    assert "no daemon" in combined_output(result)
+    assert "no coopd" in combined_output(result)
 
 
 # --- end-to-end: real daemon subprocess + real CLI + fake vibe binary ---------
@@ -439,7 +439,7 @@ def test_e2e_subprocess_daemon_tc_run_vibe_cli(settings_file, tmp_path, fake_vib
         att = db_row(settings, "SELECT process_reaped, workspace_removed, env_cleared FROM teardown_attestations WHERE run_id = ?", (run_id,))
         assert att == (1, 1, 1)
         events = [r["event"] for r in AuditLog(settings.audit_log_path).read_all()]
-        for expected in ("daemon.started", "run.queued", "teardown.attested", "run.finished", "daemon.stopped"):
+        for expected in ("coopd.started", "egg.queued", "abattoir.attested", "chicken.finished", "coopd.stopped"):
             assert expected in events
         assert not (settings.data_dir / "workspaces" / run_id).exists()
     finally:

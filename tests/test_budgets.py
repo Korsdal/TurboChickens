@@ -122,8 +122,8 @@ def test_timeout_hard_kills_run_marks_failed_attests_and_audits(daemon, tmp_path
     )
     assert att == (1, 1, 1)
     rows = [r for r in AuditLog(settings.audit_log_path).read_all() if r.get("run_id") == run_id]
-    assert "teardown.attested" in {r["event"] for r in rows}
-    finished = next(r for r in rows if r["event"] == "run.finished")
+    assert "abattoir.attested" in {r["event"] for r in rows}
+    finished = next(r for r in rows if r["event"] == "chicken.finished")
     assert finished["status"] == "failed" and "timeout" in finished["reason"]
     assert not (settings.data_dir / "workspaces" / run_id).exists()
     # the budget outcome is visible via tc runs show
@@ -155,7 +155,7 @@ def test_api_run_exceeding_timeout_is_hard_killed_and_attested(api_daemon, fake_
     )
     assert att == (1, 1, 1)
     rows = [r for r in AuditLog(settings.audit_log_path).read_all() if r.get("run_id") == run_id]
-    assert "teardown.attested" in {r["event"] for r in rows}
+    assert "abattoir.attested" in {r["event"] for r in rows}
     assert not (settings.data_dir / "workspaces" / run_id).exists()
 
 
@@ -196,8 +196,8 @@ def test_context_over_cap_fails_at_provisioning_before_harness_work(daemon, tmp_
     )
     assert att == (1, 1, 1)
     rows = [r for r in AuditLog(settings.audit_log_path).read_all() if r.get("run_id") == run_id]
-    assert "teardown.attested" in {r["event"] for r in rows}
-    finished = next(r for r in rows if r["event"] == "run.finished")
+    assert "abattoir.attested" in {r["event"] for r in rows}
+    finished = next(r for r in rows if r["event"] == "chicken.finished")
     assert finished["status"] == "failed" and "max_context_mb" in finished["reason"]
     assert not (settings.data_dir / "workspaces" / run_id).exists()
     assert db_row(settings, "SELECT 1 FROM results WHERE run_id = ?", (run_id,)) is None

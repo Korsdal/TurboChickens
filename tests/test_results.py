@@ -137,7 +137,7 @@ def daemon(settings_file, fake_vibe):
 
 
 def run_id_of(result) -> str:
-    m = re.search(r"queued run (run-[0-9a-f]+)", result.output)
+    m = re.search(r"egg queued (run-[0-9a-f]+)", result.output)
     assert m, f"no run id in output: {result.output}"
     return m.group(1)
 
@@ -204,12 +204,12 @@ def test_valid_output_stored_and_results_get_returns_it(daemon, tmp_path) -> Non
     assert result.exit_code == 0, combined_output(result)
     assert json.loads(result.stdout) == payload
 
-    # runs show surfaces the valid result; audit logged result.stored
+    # runs show surfaces the valid result; audit logged clutch.stored
     result = runner.invoke(app, ["runs", "show", run_id])
-    assert result.exit_code == 0 and "result: valid" in result.output
+    assert result.exit_code == 0 and "clutch: valid" in result.output
     events = [r["event"] for r in AuditLog(settings.audit_log_path).read_all()]
-    assert "result.stored" in events
-    assert "run.finished" in events and "teardown.attested" in events
+    assert "clutch.stored" in events
+    assert "chicken.finished" in events and "abattoir.attested" in events
 
     # teardown still attested, workspace gone
     att = db_row(settings, "SELECT process_reaped, workspace_removed, env_cleared FROM teardown_attestations WHERE run_id = ?", (run_id,))
@@ -271,7 +271,7 @@ def test_invalid_output_is_failed_quarantined_with_schema_errors(daemon, tmp_pat
 
     # audit + teardown attestation still complete
     events = [r["event"] for r in AuditLog(settings.audit_log_path).read_all()]
-    assert "result.quarantined" in events
+    assert "clutch.quarantined" in events
     att = db_row(settings, "SELECT process_reaped, workspace_removed, env_cleared FROM teardown_attestations WHERE run_id = ?", (run_id,))
     assert att == (1, 1, 1)
     assert not (settings.data_dir / "workspaces" / run_id).exists()
@@ -313,7 +313,7 @@ def test_results_get_never_returns_quarantined_output(daemon, tmp_path) -> None:
 def test_results_get_unknown_run_and_run_without_result_exit_1(daemon, tmp_path) -> None:
     result = runner.invoke(app, ["results", "get", "run-nope"])
     assert result.exit_code == 1
-    assert "unknown run" in combined_output(result)
+    assert "unknown chicken" in combined_output(result)
 
     # a run that fails in the harness never reaches collecting → no result row
     spec_path = write_job(tmp_path, name="rc-job", prompt="EXIT 3 boom")
@@ -324,7 +324,7 @@ def test_results_get_unknown_run_and_run_without_result_exit_1(daemon, tmp_path)
     assert row[0] == 0
     result = runner.invoke(app, ["results", "get", run_id])
     assert result.exit_code == 1
-    assert "no result stored" in combined_output(result)
+    assert "no clutch in the nest box" in combined_output(result)
 
 
 # --- e2e: real daemon subprocess + real CLI + fake vibe, both outcomes --------

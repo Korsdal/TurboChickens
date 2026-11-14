@@ -1,13 +1,14 @@
-"""The run pipeline: one queued run driven through its lifecycle.
+"""The Hatchery: one queued Egg driven through its lifecycle into a Chicken.
 
 queued → provisioning → running → collecting → finalizing → succeeded,
 with running → failed on harness error / timeout and collecting → failed on
-schema-validation failure, and every terminal state closed by a teardown
-attestation plus audit rows (baseline v0.2 §5, §10).
+candling failure, and every terminal state closed by an abattoir attestation
+plus Headcount rows (baseline v0.2 §5, §10; spec 20 lexicon).
 
-The pipeline owns all SQLite writes for a run: status transitions on `runs`,
-streamed `run_events`, the manifest, the `results` row (spec 04: valid output
-stored, invalid output quarantined), and the `teardown_attestations` row.
+The pipeline owns all SQLite writes for a chicken: status transitions on
+`runs`, streamed `run_events`, the manifest, the `results` row (spec 04: a
+valid clutch is stored in the nest box, an invalid one quarantined), and the
+`teardown_attestations` row.
 """
 
 from __future__ import annotations
@@ -125,7 +126,7 @@ class RunPipeline:
             )
             self.db.commit()
         self.audit.append(
-            {"event": "result.stored", "run_id": run_id, "artifacts_dir": str(artifacts_dir)}
+            {"event": "clutch.stored", "run_id": run_id, "artifacts_dir": str(artifacts_dir)}
         )
 
     async def _quarantine(self, run_id: str, raw_output: str, schema_errors: list[str]) -> None:
@@ -147,7 +148,7 @@ class RunPipeline:
             self.db.commit()
         self.audit.append(
             {
-                "event": "result.quarantined",
+                "event": "clutch.quarantined",
                 "run_id": run_id,
                 "artifacts_dir": str(qdir),
                 "schema_errors": schema_errors,
@@ -291,6 +292,16 @@ class RunPipeline:
         auth: dict[str, Any] = auth_telemetry_of(self.credential_provider, ctx)
         try:
             await self._set_status(run_id, "provisioning")
+            # spec 20: the Hatchery starts turning the Egg into a Chicken
+            self.audit.append(
+                {
+                    "event": "egg.hatched",
+                    "run_id": run_id,
+                    "job_id": ctx.job_id,
+                    "spec_hash": f"sha256:{ctx.spec_hash}",
+                    "trigger": ctx.trigger,
+                }
+            )
             injected_bytes = self._provision(ctx)
             budget["injected_context_bytes"] = injected_bytes
             cap_bytes = spec.resources.max_context_mb * 1024 * 1024
@@ -310,10 +321,10 @@ class RunPipeline:
                 prepared = adapter.prepare(ctx)
                 harness = prepared.harness
                 auth = prepared.auth or auth
-                # audit the mode per run (non-secret: mode + expiry only)
+                # audit the mode per chicken (non-secret: mode + expiry only)
                 self.audit.append(
                     {
-                        "event": "auth.resolved",
+                        "event": "perch.resolved",
                         "run_id": run_id,
                         "job_id": ctx.job_id,
                         "mode": auth.get("mode"),
@@ -347,7 +358,7 @@ class RunPipeline:
                 if outcome.valid:
                     await self._store_result(run_id, outcome)
                     await self._event(
-                        run_id, "validator", "info", f"output matches schema {ctx.spec.output.schema_file}"
+                        run_id, "validator", "info", f"clutch matches schema {ctx.spec.output.schema_file}"
                     )
                     await self._set_status(run_id, "finalizing")
                     status, reason = "succeeded", "ok"
@@ -359,7 +370,7 @@ class RunPipeline:
                         "error",
                         sanitize_log_line("; ".join(outcome.schema_errors), OUTPUT_EVENT_MAX_LEN),
                     )
-                    status, reason = "failed", f"output failed schema validation: {outcome.schema_errors[0]}"
+                    status, reason = "failed", f"clutch failed candling (schema validation): {outcome.schema_errors[0]}"
         except Exception as e:
             status, reason = "failed", f"{type(e).__name__}: {e}"
             with contextlib.suppress(Exception):
@@ -410,7 +421,7 @@ class RunPipeline:
             self.db.commit()
         self.audit.append(
             {
-                "event": "teardown.attested",
+                "event": "abattoir.attested",
                 "run_id": run_id,
                 "process_reaped": report.process_reaped,
                 "workspace_removed": report.workspace_removed,
@@ -419,7 +430,7 @@ class RunPipeline:
         )
         self.audit.append(
             {
-                "event": "run.finished",
+                "event": "chicken.finished",
                 "run_id": run_id,
                 "job_id": ctx.job_id,
                 "status": status,
@@ -427,7 +438,7 @@ class RunPipeline:
                 "auth_mode": (auth or {}).get("mode"),
             }
         )
-        await self._event(run_id, "supervisor", "info", f"run {status}: {reason}")
+        await self._event(run_id, "supervisor", "info", f"chicken {status}: {reason}")
         # spec 08: roll the run's token usage up into the per-job stats
         with contextlib.suppress(Exception):
             await self._rollup_usage_stats(ctx.job_id, ctx.spec)
@@ -453,5 +464,5 @@ class RunPipeline:
             )
             self.db.commit()
         self.audit.append(
-            {"event": "run.finished", "run_id": run_id, "status": "failed", "reason": "internal error (guard)"}
+            {"event": "chicken.finished", "run_id": run_id, "status": "failed", "reason": "internal error (guard)"}
         )

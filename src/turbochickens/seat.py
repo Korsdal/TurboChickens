@@ -146,7 +146,7 @@ class SeatStore:
             data = json.loads(path.read_text(encoding="utf-8"))
             return SeatSession.from_dict(data)
         except (OSError, ValueError, KeyError, TypeError) as e:
-            raise SeatError(f"seat session for provider {provider!r} is unreadable ({path}): {e}; run `tc auth login {provider}` again") from e
+            raise SeatError(f"perch seat for provider {provider!r} is unreadable ({path}): {e}; run `tc auth login {provider}` again") from e
 
     def delete(self, provider: str) -> bool:
         path = self._path(provider)
@@ -258,7 +258,7 @@ class SeatBroker:
         session = self.store.load(provider_name)
         if session is None:
             raise SeatError(
-                f"no seat session for provider {provider_name!r}; run `tc auth login {provider_name}` first"
+                f"no perch seat for provider {provider_name!r}; run `tc auth login {provider_name}` first"
             )
         if session.expired:
             session = self._refresh(provider_name, provider, session)
@@ -277,7 +277,7 @@ class SeatBroker:
         if not session.refresh_token:
             self.store.delete(provider_name)
             raise SeatError(
-                f"seat session for provider {provider_name!r} is expired and has no refresh token; "
+                f"perch seat for provider {provider_name!r} is expired and has no refresh token; "
                 f"run `tc auth login {provider_name}` again"
             )
         client, owned = self._http()
@@ -298,7 +298,7 @@ class SeatBroker:
         if resp.status_code != 200:
             self.store.delete(provider_name)
             raise SeatError(
-                f"seat session for provider {provider_name!r} is revoked or expired "
+                f"perch seat for provider {provider_name!r} is revoked or expired "
                 f"(token endpoint http {resp.status_code}: {resp.text[:200]}); "
                 f"run `tc auth login {provider_name}` again"
             )
@@ -433,7 +433,7 @@ class SeatBroker:
 
     def logout(self, provider_name: str) -> None:
         if not self.store.delete(provider_name):
-            raise SeatError(f"no seat session stored for provider {provider_name!r}")
+            raise SeatError(f"no perch seat stored for provider {provider_name!r}")
 
     def status(self) -> list[dict[str, Any]]:
         """Non-secret overview for `tc auth status`: each provider's auth mode

@@ -20,9 +20,9 @@ bundle — stored first, then scheduled by the stored path), and
 ``GET /api/stats`` (stats_list mirror), ``GET /api/stats/{job_id}``
 (stats_show mirror, 404 when the job has no stats yet) — and
 ``POST /api/retention/sweep`` (the on-demand retention_sweep op, whose
-response lists every deletion as a ``result.expired`` entry).
+response lists every deletion as a ``clutch.composted`` entry).
 Spec 19 adds the auth path: ``GET /api/auth/providers`` (each provider's auth
-mode + seat session expiry, never token material), ``GET /api/auth/access``
+mode + perch seat expiry, never token material), ``GET /api/auth/access``
 (the declared access scope — env allowlist, network policy, tools/data/MCP/
 connectors placeholders), ``POST /api/auth/login`` (starts the OAuth device
 flow, relaying only the user-facing user code + verification URI),
@@ -410,7 +410,7 @@ class CoopServer:
         assert resp is not None
         error = str(resp.get("error", ""))
         if not resp.get("ok") and (
-            "unknown run" in error or "no result stored" in error or "no usage stats" in error
+            "unknown chicken" in error or "no clutch in the nest box" in error or "no feed recorded" in error
         ):
             return web.json_response(resp, status=404)
         return web.json_response(resp)
@@ -486,7 +486,7 @@ class CoopServer:
         if down is not None:
             return down
         assert resp is not None
-        if not resp.get("ok") and "no schedule registered" in str(resp.get("error", "")):
+        if not resp.get("ok") and "no crow registered" in str(resp.get("error", "")):
             return web.json_response(resp, status=404)
         return web.json_response(resp)
 
@@ -507,7 +507,7 @@ class CoopServer:
     async def _api_retention_sweep(self, request: web.Request) -> web.Response:
         """POST /api/retention/sweep — run the on-demand retention sweep over
         the transport seam (the retention_sweep socket op): deletes expired
-        on-disk artifacts, audit-logs each as result.expired, and answers 200
+        on-disk artifacts, audit-logs each as clutch.composted, and answers 200
         with the summary (cutoff, expired entries, deleted count). A refused
         sweep is a 422 carrying the socket response; a dead socket gets the
         structured daemon-down payload (200), never a 500."""
@@ -577,12 +577,12 @@ class CoopServer:
     async def _api_auth_login_status(self, request: web.Request) -> web.Response:
         """POST /api/auth/login/status {provider} — one poll step of the
         started device flow: pending / authorized (session stored 0600 by the
-        daemon, audited as auth.login) / expired."""
+        daemon, audited as perch.claimed) / expired."""
         return await self._api_auth_mutation(request, "auth_login_poll")
 
     async def _api_auth_logout(self, request: web.Request) -> web.Response:
         """POST /api/auth/logout {provider} — delete the provider's stored
-        seat session (audited as auth.logout); 422 when none is stored."""
+        seat session (audited as perch.released); 422 when none is stored."""
         return await self._api_auth_mutation(request, "auth_logout")
 
     # --- static SPA ----------------------------------------------------------

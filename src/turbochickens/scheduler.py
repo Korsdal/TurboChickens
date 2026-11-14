@@ -1,12 +1,13 @@
-"""Internal cron scheduler (APScheduler) living inside the daemon (spec 06).
+"""The Rooster — internal cron scheduler (APScheduler) living in coopd (spec 06).
 
-One queue, one admission path, one source of truth (baseline v0.2 §3, §9):
-when a cron schedule fires, the callback submits the run through the daemon's
-own Unix socket exactly like a CLI `tc run` does — the fire path never touches
-the queue directly, so manual and cron runs are indistinguishable downstream.
+One pecking order, one admission path, one source of truth (baseline v0.2 §3,
+§9): when a crow fires, the callback queues an egg through coopd's own Unix
+socket exactly like a CLI `tc run` does — the fire path never touches the
+pecking order directly, so manual and cron chickens are indistinguishable
+downstream.
 
-Schedules are persisted in the ``schedules`` table and re-registered with
-APScheduler on every daemon start, so a daemon restart loses no schedule.
+Crows are persisted in the ``schedules`` table and re-registered with
+APScheduler on every coopd start, so a restart loses no crow.
 """
 
 from __future__ import annotations

@@ -13,7 +13,7 @@ from turbochickens.settings import SOCKET_STREAM_LIMIT
 
 
 class DaemonUnreachable(Exception):
-    """The daemon socket does not answer (daemon down or wrong path)."""
+    """The coopd socket does not answer (coopd down or wrong path)."""
 
 
 async def request_async(
@@ -30,17 +30,17 @@ async def request_async(
             await writer.drain()
             line = await reader.readline()
             if not line:
-                raise DaemonUnreachable("daemon closed the connection without a response")
+                raise DaemonUnreachable("coopd closed the connection without a response")
             try:
                 return json.loads(line.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as e:
-                raise DaemonUnreachable(f"invalid response from daemon: {e}") from e
+                raise DaemonUnreachable(f"invalid response from coopd: {e}") from e
         finally:
             writer.close()
             with contextlib.suppress(OSError):
                 await writer.wait_closed()
     except OSError as e:
-        raise DaemonUnreachable(f"no daemon at {socket_path}: {e}") from e
+        raise DaemonUnreachable(f"no coopd at {socket_path}: {e}") from e
 
 
 def request(socket_path: str | Path, op: str, timeout: float = 5.0, **payload: Any) -> dict[str, Any]:
@@ -52,4 +52,4 @@ def request(socket_path: str | Path, op: str, timeout: float = 5.0, **payload: A
     try:
         return asyncio.run(asyncio.wait_for(_go(), timeout=timeout))
     except asyncio.TimeoutError as e:
-        raise DaemonUnreachable(f"no daemon at {socket_path}: timed out after {timeout}s") from e
+        raise DaemonUnreachable(f"no coopd at {socket_path}: timed out after {timeout}s") from e

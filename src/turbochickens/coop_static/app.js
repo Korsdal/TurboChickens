@@ -253,8 +253,8 @@
     const data = await api("/api/status");
     if (data === null) return; /* 401 → login view shown */
     if (data.__networkError || !data.daemon || data.daemon.up === false) {
-      const reason = data.error || "the GUI could not reach the supervisor";
-      showBanner("coop · daemon not reachable — " + reason + ". The GUI is up; this banner clears when the socket answers again.");
+      const reason = data.error || "the GUI could not reach coopd";
+      showBanner("coop · coopd unreachable — " + reason + ". The GUI is up; this banner clears when the socket answers again.");
       setPill(false, "coop · down");
       return;
     }
@@ -265,9 +265,9 @@
     const retention = data.retention || {};
     const sweep = retention.last_sweep;
     const retentionText =
-      "audit " + (retention.audit_retention || "forever") +
-      " · results " + (retention.results_retention_months != null ? retention.results_retention_months + " mo" : "—") +
-      (sweep ? " · sweep " + (sweep.deleted || 0) + " expired" : "");
+      "headcount " + (retention.audit_retention || "forever") +
+      " · clutches " + (retention.results_retention_months != null ? retention.results_retention_months + " mo" : "—") +
+      (sweep ? " · composted " + (sweep.deleted || 0) : "");
 
     setStat("uptime", fmtUptime(d.uptime_sec));
     setStat("queue_depth", data.queue_depth != null ? data.queue_depth : "—");
@@ -310,9 +310,9 @@
     }
     const expired = sweep.expired || [];
     summary.textContent =
-      "Sweep at " + (sweep.cutoff || "—") + " (results older than " +
+      "Compost turned at " + (sweep.cutoff || "—") + " (clutches older than " +
       (sweep.results_retention_months != null ? sweep.results_retention_months + " months" : "—") +
-      ") — " + (sweep.deleted || 0) + " expired" + (expired.length ? ":" : ".");
+      ") — " + (sweep.deleted || 0) + " composted" + (expired.length ? ":" : ".");
     const sig = JSON.stringify(expired);
     if (list.dataset.sig !== sig) {
       list.dataset.sig = sig;
@@ -320,7 +320,7 @@
       for (const e of expired) {
         const li = el("li");
         li.appendChild(el("span", "run", e.run_id + " "));
-        li.appendChild(el("span", "kind", "(" + (e.kind || "result") + ", finished " + (e.finished_at || "—") + ")"));
+        li.appendChild(el("span", "kind", "(" + (e.kind || "clutch") + ", finished " + (e.finished_at || "—") + ")"));
         list.appendChild(li);
       }
     }
@@ -331,9 +331,9 @@
     const months = retention.results_retention_months;
     const sweep = retention.last_sweep;
     $("#retention-summary").textContent =
-      "audit log " + (retention.audit_retention || "forever") +
-      " · results expire after " + (months != null ? months + " months" : "—") +
-      (sweep ? " · last sweep deleted " + (sweep.deleted || 0) : " · no sweep yet");
+      "headcount " + (retention.audit_retention || "forever") +
+      " · clutches rot after " + (months != null ? months + " months" : "—") +
+      (sweep ? " · last compost deleted " + (sweep.deleted || 0) : " · no compost yet");
     renderSweepOutcome(sweep || null);
   }
 
@@ -349,14 +349,14 @@
       return;
     }
     if (resp.daemon && resp.daemon.up === false) {
-      sweepError("The supervisor is not reachable — " + (resp.error || "") + ".");
+      sweepError("coopd is not reachable — " + (resp.error || "") + ".");
       return;
     }
     if (!resp.ok) {
-      sweepError(resp.error || "sweep refused");
+      sweepError(resp.error || "compost refused");
       return;
     }
-    renderSweepOutcome(resp); // the result.expired entries of this sweep, listed inline
+    renderSweepOutcome(resp); // the clutch.composted entries of this sweep, listed inline
     loadStatus();
   });
 
@@ -371,12 +371,12 @@
     const data = await api("/api/jobs");
     if (data === null) return; /* 401 → login view shown */
     if (payloadDown(data)) {
-      showEmpty("#jobs-empty", "#jobs-card", "Jobs unavailable — " + (data.error || "the supervisor is not reachable") + ".");
+      showEmpty("#jobs-empty", "#jobs-card", "Eggs unavailable — " + (data.error || "coopd is not reachable") + ".");
       return;
     }
     const jobs = data.jobs || [];
     if (!jobs.length) {
-      showEmpty("#jobs-empty", "#jobs-card", "No registered jobs yet — run tc run <job.toml> once to register one.");
+      showEmpty("#jobs-empty", "#jobs-card", "No eggs yet — register one with tc run <job.toml>.");
       return;
     }
     showCard("#jobs-empty", "#jobs-card");
@@ -433,7 +433,7 @@
     const jobFile = $("#up-job").files[0];
     const promptFile = $("#up-prompt").files[0];
     const schemaFile = $("#up-schema").files[0];
-    if (!jobFile) return { error: "job.toml: choose the job spec file first." };
+    if (!jobFile) return { error: "job.toml: choose the egg file first." };
     if (!promptFile) return { error: "input.prompt_file: choose the prompt file." };
     if (!schemaFile) return { error: "output.schema_file: choose the schema file." };
     const files = {};
@@ -486,7 +486,7 @@
       }
     } else {
       const p = $("#upload-error");
-      p.textContent = resp.error || "upload failed";
+      p.textContent = resp.error || "egg upload failed";
       p.hidden = false;
     }
   }
@@ -532,7 +532,7 @@
       const resp = await apiPost("/api/jobs/validate", { files: built.files });
       if (resp === null) return; /* 401 → login view shown */
       if (resp.__networkError || (resp.daemon && resp.daemon.up === false)) {
-        showUploadErrors({ error: "The supervisor is not reachable — " + (resp.error || "") + "." });
+        showUploadErrors({ error: "coopd is not reachable — " + (resp.error || "") + "." });
         return;
       }
       if (!resp.ok || resp.valid !== true) {
@@ -543,9 +543,9 @@
       uploadValid = true;
       uploadSig = sig;
       uploadBundle = built;
-      $("#upload-submit").textContent = "Run job";
+      $("#upload-submit").textContent = "Queue egg";
       const res = $("#upload-result");
-      res.textContent = "valid — " + resp.job_id + " · sha256:" + String(resp.spec_hash).slice(0, 12) + "…";
+      res.textContent = "candled — " + resp.job_id + " · sha256:" + String(resp.spec_hash).slice(0, 12) + "…";
       res.hidden = false;
       return;
     }
@@ -553,12 +553,12 @@
     const resp = await apiPost("/api/runs", { files: uploadBundle.files });
     if (resp === null) return; /* 401 → login view shown */
     if (resp.__networkError || (resp.daemon && resp.daemon.up === false)) {
-      showUploadErrors({ error: "The supervisor is not reachable — " + (resp.error || "") + "." });
+      showUploadErrors({ error: "coopd is not reachable — " + (resp.error || "") + "." });
       return;
     }
     if (!resp.ok) {
       if (resp.errors) showUploadErrors(resp);
-      else showUploadErrors({ error: resp.error || "enqueue failed" });
+      else showUploadErrors({ error: resp.error || "queueing failed" });
       resetUploadState();
       return;
     }
@@ -600,8 +600,8 @@
   function renderRunsTable(runs) {
     if (!runs.length) {
       const msg = runsJobFilter || runsStatusFilter
-        ? "No runs match the active filters."
-        : "No runs yet — run a job above, or with tc run <job.toml>.";
+        ? "No chickens match the active filters."
+        : "No chickens yet — queue an egg above, or with tc run <job.toml>.";
       showEmpty("#runs-empty", "#runs-card", msg);
       lastRunSigs = {};
       return;
@@ -623,7 +623,7 @@
         const idTd = el("td");
         const openBtn = el("button", "linklike mono run-open", r.id);
         openBtn.type = "button";
-        openBtn.setAttribute("aria-label", "Open run " + r.id);
+        openBtn.setAttribute("aria-label", "Open chicken " + r.id);
         openBtn.addEventListener("click", () => selectRun(r.id));
         idTd.appendChild(openBtn);
         tr.appendChild(idTd);
@@ -679,7 +679,7 @@
     $("#detail-title").textContent = run.id;
     const authMode = run.manifest && run.manifest.auth && run.manifest.auth.mode;
     $("#detail-job").textContent = run.job_name + " · " + run.trigger + " · " + run.status + (authMode ? " · auth " + authMode : "");
-    $("#tab-result").textContent = run.result && run.result.valid === false ? "Quarantine" : "Result";
+    $("#tab-result").textContent = run.result && run.result.valid === false ? "Quarantine" : "Clutch";
 
     const manifestPre = $("#manifest-pre");
     const mSig = JSON.stringify(run);
@@ -719,20 +719,20 @@
     state.replaceChildren();
     state.hidden = true;
     if (!result || result.__networkError || (result.daemon && result.daemon.up === false)) {
-      label.textContent = "result unavailable";
+      label.textContent = "clutch unavailable";
       return;
     }
     if (result.ok === true && result.output !== undefined) {
-      label.textContent = "validated result";
+      label.textContent = "validated clutch";
       pre.dataset.sig = JSON.stringify(result.output);
       pre.textContent = JSON.stringify(result.output, null, 2);
       return;
     }
     if (result.quarantined) {
-      label.textContent = "quarantined raw output";
+      label.textContent = "quarantined clutch";
       state.hidden = false;
       const note = el("div", "quarantine-note");
-      note.textContent = "Quarantined — the output failed schema validation. It is kept for inspection and never served as a valid result.";
+      note.textContent = "Quarantined — the clutch failed candling (schema validation). It is kept for inspection and never served as a valid clutch.";
       state.appendChild(note);
       if (result.schema_errors && result.schema_errors.length) {
         const ul = el("ul", "schema-errors mono");
@@ -744,17 +744,17 @@
       return;
     }
     if (result.expired) {
-      label.textContent = "result";
+      label.textContent = "clutch";
       state.hidden = false;
       const note = el("div", "quarantine-note neutral-note");
-      note.textContent = "Expired — the on-disk artifacts were removed by the retention sweep; the append-only index row remains.";
+      note.textContent = "Composted — the on-disk clutch was removed by the compost sweep; the append-only index row remains.";
       state.appendChild(note);
       return;
     }
-    label.textContent = "result";
+    label.textContent = "clutch";
     state.hidden = false;
     const note = el("div", "quarantine-note neutral-note");
-    note.textContent = "No result yet — the run never reached collecting (it may still be running).";
+    note.textContent = "No clutch yet — the chicken never reached collecting (it may still be running).";
     state.appendChild(note);
   }
 
@@ -794,7 +794,7 @@
     const data = await api("/api/runs" + (qs.toString() ? "?" + qs.toString() : ""));
     if (data === null) return; /* 401 → login view shown */
     if (payloadDown(data)) {
-      showEmpty("#runs-empty", "#runs-card", "Runs unavailable — " + (data.error || "the supervisor is not reachable") + ".");
+      showEmpty("#runs-empty", "#runs-card", "Chickens unavailable — " + (data.error || "coopd is not reachable") + ".");
       return;
     }
     renderRunsTable(data.runs || []);
@@ -807,7 +807,7 @@
     const err = $("#run-error");
     const specPath = input.value.trim();
     if (!specPath) {
-      err.textContent = "Enter the in-container path of a job spec (job.toml).";
+      err.textContent = "Enter the in-container path of an egg (job.toml).";
       err.hidden = false;
       return;
     }
@@ -819,12 +819,12 @@
       return;
     }
     if (resp.daemon && resp.daemon.up === false) {
-      err.textContent = "The supervisor is not reachable — " + (resp.error || "") + ".";
+      err.textContent = "coopd is not reachable — " + (resp.error || "") + ".";
       err.hidden = false;
       return;
     }
     if (!resp.ok) {
-      err.textContent = resp.error || "enqueue failed";
+      err.textContent = resp.error || "queueing failed";
       err.hidden = false;
       return;
     }
@@ -889,7 +889,7 @@
     const previous = sel.value;
     sel.replaceChildren();
     if (!options.length) {
-      const o = el("option", null, "No registered specs with a known path");
+      const o = el("option", null, "No registered eggs with a known path");
       o.value = "";
       sel.appendChild(o);
       sel.disabled = true;
@@ -909,7 +909,7 @@
 
   function renderSchedulesTable(schedules) {
     if (!schedules.length) {
-      showEmpty("#schedules-empty", "#schedules-card", "No schedules yet — pick a cron-triggered spec above, or tc schedule add <job.toml>.");
+      showEmpty("#schedules-empty", "#schedules-card", "The rooster has no crows yet — pick a cron-triggered egg above, or tc schedule add <job.toml>.");
       schedRowSig = "";
       return;
     }
@@ -946,7 +946,7 @@
     if (data === null) return; /* 401 → login view shown */
     if (payloadDown(data)) {
       schedError("");
-      showEmpty("#schedules-empty", "#schedules-card", "Schedules unavailable — " + (data.error || "the supervisor is not reachable") + ".");
+      showEmpty("#schedules-empty", "#schedules-card", "Rooster unavailable — " + (data.error || "coopd is not reachable") + ".");
       return;
     }
     renderSchedulesTable(data.schedules || []);
@@ -958,7 +958,7 @@
     const sel = $("#sched-spec");
     const specPath = sel.value;
     if (!specPath) {
-      schedError("No registered spec to pick — run or upload a cron-triggered job first (Jobs view).");
+      schedError("No registered egg to pick — queue or upload a cron-triggered egg first (Eggs view).");
       return;
     }
     const opt = sel.selectedOptions[0];
@@ -971,12 +971,12 @@
       return;
     }
     if (resp.daemon && resp.daemon.up === false) {
-      schedError("The supervisor is not reachable — " + (resp.error || "") + ".");
+      schedError("coopd is not reachable — " + (resp.error || "") + ".");
       return;
     }
     if (!resp.ok) {
       // manual-trigger spec, invalid cron, hash mismatch, unreadable spec — inline
-      schedError(resp.error || (resp.errors && resp.errors.map((e) => e.message).join("\n")) || "schedule refused");
+      schedError(resp.error || (resp.errors && resp.errors.map((e) => e.message).join("\n")) || "crow refused");
       return;
     }
     loadSchedules();
@@ -991,11 +991,11 @@
       return;
     }
     if (resp.daemon && resp.daemon.up === false) {
-      schedError("The supervisor is not reachable — " + (resp.error || "") + ".");
+      schedError("coopd is not reachable — " + (resp.error || "") + ".");
       return;
     }
     if (!resp.ok) {
-      schedError(resp.error || "remove refused");
+      schedError(resp.error || "crow removal refused");
       return;
     }
     loadSchedules();
@@ -1022,7 +1022,7 @@
 
   function renderStatsCards(stats) {
     if (!stats.length) {
-      showEmpty("#stats-empty", "#stats-grid", "No usage stats yet — run a job to completion and its rollup lands here.");
+      showEmpty("#stats-empty", "#stats-grid", "No feed recorded yet — let a chicken finish and its rollup lands here.");
       return;
     }
     showCard("#stats-empty", "#stats-grid");
@@ -1035,7 +1035,7 @@
       const card = el("div", "card stat-card");
       const head = el("button", "job-head");
       head.type = "button";
-      head.setAttribute("aria-label", "Show stats for " + s.job_id);
+      head.setAttribute("aria-label", "Show feed ledger for " + s.job_id);
       head.appendChild(el("span", "job-name", s.job_name || s.job_id));
       head.appendChild(el("span", "job-id mono", s.job_id));
       head.addEventListener("click", () => selectStatsJob(s.job_id));
@@ -1047,11 +1047,11 @@
         n.appendChild(el("span", "num-value mono" + (small ? " small" : ""), value));
         return n;
       };
-      nums.appendChild(cell("runs", fmtNum(s.n_runs)));
+      nums.appendChild(cell("chickens", fmtNum(s.n_runs)));
       nums.appendChild(cell("tokens in mean·p50·p95", statsTriple(s.tokens_in_mean, s.tokens_in_p50, s.tokens_in_p95), true));
       nums.appendChild(cell("tokens out mean·p50·p95", statsTriple(s.tokens_out_mean, s.tokens_out_p50, s.tokens_out_p95), true));
       nums.appendChild(cell("tokens total p95", fmtNum(s.tokens_p95)));
-      nums.appendChild(cell("expected cost / run", fmtCost(s.expected_cost_usd)));
+      nums.appendChild(cell("expected feed / chicken", fmtCost(s.expected_cost_usd)));
       nums.appendChild(cell("updated", s.updated_at || "—", true));
       card.appendChild(nums);
       grid.appendChild(card);
@@ -1082,14 +1082,14 @@
     const rows = s
       ? [
           ["job_id", s.job_id],
-          ["runs n", fmtNum(s.n_runs)],
+          ["chickens n", fmtNum(s.n_runs)],
           ["tokens_in mean / p50 / p95", statsTriple(s.tokens_in_mean, s.tokens_in_p50, s.tokens_in_p95)],
           ["tokens_out mean / p50 / p95", statsTriple(s.tokens_out_mean, s.tokens_out_p50, s.tokens_out_p95)],
           ["tokens_total_p95", fmtNum(s.tokens_p95)],
           ["expected_cost_usd_per_run", fmtCost(s.expected_cost_usd)],
           ["updated_at", s.updated_at || "—"],
         ]
-      : [["error", data.error || "no usage stats for this job yet"]];
+      : [["error", data.error || "no feed recorded for this egg yet"]];
     const list = $("#stats-detail-list");
     const sig = JSON.stringify(rows);
     if (list.dataset.sig !== sig) {
@@ -1108,7 +1108,7 @@
     const data = await api("/api/stats");
     if (data === null) return; /* 401 → login view shown */
     if (payloadDown(data)) {
-      showEmpty("#stats-empty", "#stats-grid", "Stats unavailable — " + (data.error || "the supervisor is not reachable") + ".");
+      showEmpty("#stats-empty", "#stats-grid", "Feed unavailable — " + (data.error || "coopd is not reachable") + ".");
       return;
     }
     renderStatsCards(data.stats || []);
@@ -1162,12 +1162,12 @@
       : chipData;
     if (data === null) return;
     if (payloadDown(data)) {
-      showEmpty("#audit-empty", "#audit-card", "Audit unavailable — " + (data.error || "the supervisor is not reachable") + ".");
+      showEmpty("#audit-empty", "#audit-card", "Headcount unavailable — " + (data.error || "coopd is not reachable") + ".");
       return;
     }
     const events = data.events || [];
     if (!events.length) {
-      showEmpty("#audit-empty", "#audit-card", auditFilter ? "No audit events of type '" + auditFilter + "' yet." : "The audit log is empty.");
+      showEmpty("#audit-empty", "#audit-card", auditFilter ? "No headcount events of type '" + auditFilter + "' yet." : "The headcount is empty.");
       return;
     }
     showCard("#audit-empty", "#audit-card");
@@ -1188,7 +1188,7 @@
     const data = await api("/api/settings");
     if (data === null) return; /* 401 → login view shown */
     if (payloadDown(data)) {
-      showEmpty("#settings-empty", "#settings-card", "Settings unavailable — " + (data.error || "the supervisor is not reachable") + ".");
+      showEmpty("#settings-empty", "#settings-card", "Settings unavailable — " + (data.error || "coopd is not reachable") + ".");
       return;
     }
     const s = data.settings || {};
@@ -1197,9 +1197,9 @@
       ["data_dir", s.data_dir],
       ["socket_path", s.socket_path],
       ["db_path", s.db_path],
-      ["audit_log_path", s.audit_log_path],
-      ["results_dir", s.results_dir],
-      ["quarantine_dir", s.quarantine_dir],
+      ["audit_log_path — the headcount", s.audit_log_path],
+      ["results_dir — the nest box", s.results_dir],
+      ["quarantine_dir — candling quarantine", s.quarantine_dir],
       ["seats_dir", s.seats_dir],
       ["providers_path", s.providers_path || "—"],
       ["weight_budget", String(s.weight_budget) + (s.weight_budget_override != null ? " (override)" : " (derived)")],
@@ -1352,7 +1352,7 @@
     const [prov, acc] = await Promise.all([api("/api/auth/providers"), api("/api/auth/access")]);
     if (prov === null || acc === null) return; /* 401 → login view shown */
     if (payloadDown(prov)) {
-      showEmpty("#auth-empty", "#auth-card", "Auth unavailable — " + (prov.error || "the supervisor is not reachable") + ".");
+      showEmpty("#auth-empty", "#auth-card", "Perch unavailable — " + (prov.error || "coopd is not reachable") + ".");
     } else {
       renderProviders(prov.providers || []);
     }
@@ -1387,7 +1387,7 @@
     }
     if (resp.status === "authorized") {
       stopDevicePoll();
-      deviceStatus("Authorized — seat session stored.");
+      deviceStatus("Authorized — perch seat claimed.");
       loadAuth();
       setTimeout(() => { $("#device-card").hidden = true; }, 1600);
       return;
@@ -1410,7 +1410,7 @@
       return;
     }
     if (resp.daemon && resp.daemon.up === false) {
-      authError("The supervisor is not reachable — " + (resp.error || "") + ".");
+      authError("coopd is not reachable — " + (resp.error || "") + ".");
       return;
     }
     if (!resp.ok) {
@@ -1439,7 +1439,7 @@
       return;
     }
     if (resp.daemon && resp.daemon.up === false) {
-      authError("The supervisor is not reachable — " + (resp.error || "") + ".");
+      authError("coopd is not reachable — " + (resp.error || "") + ".");
       return;
     }
     if (!resp.ok) {

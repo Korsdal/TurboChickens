@@ -9,7 +9,7 @@ Seams (per spec 11/19 testing decisions — no browser automation):
   auth_login_poll / auth_logout), 422 refusals, 400 malformed bodies;
 - the device login flow end-to-end over HTTP (auto-approve and pending-then-
   approve), the session stored 0600 under <data_dir>/seats/ exactly as the CLI
-  path, audit rows auth.login / auth.logout carrying provider + mode only;
+  path, audit rows perch.claimed / perch.released carrying provider + mode only;
 - an assertion that no response body (and no audit row) ever contains token or
   device-code material;
 - auth-required 401s when bound non-loopback with a token, dead-socket
@@ -226,9 +226,9 @@ def test_device_login_flow_over_http_stores_session_0600_and_audits(seat_coop_da
     # providers now show the session; socket parity for the read op
     assert request(sock, "auth_providers", timeout=2.0) == c.get("/api/auth/providers").json()
 
-    # audit: auth.login with provider + mode only — never tokens or codes
+    # audit: perch.claimed with provider + mode only — never tokens or codes
     events = AuditLog(settings.audit_log_path).read_all()
-    logins = [e for e in events if e["event"] == "auth.login"]
+    logins = [e for e in events if e["event"] == "perch.claimed"]
     assert len(logins) == 1
     assert logins[0]["provider"] == "seatco" and logins[0]["mode"] == "seat"
     audit_text = json.dumps(events)
@@ -266,10 +266,10 @@ def test_socket_ops_standalone_login_poll_logout(seat_coop_daemon) -> None:
     assert out["ok"] is True and out["provider"] == "seatco"
     assert not (settings.seats_dir / "seatco.json").exists()
     again = request(sock, "auth_logout", provider="seatco", timeout=2.0)
-    assert again["ok"] is False and "no seat session" in again["error"]
+    assert again["ok"] is False and "no perch seat" in again["error"]
 
     events = [e["event"] for e in AuditLog(settings.audit_log_path).read_all()]
-    assert "auth.login" in events and "auth.logout" in events
+    assert "perch.claimed" in events and "perch.released" in events
 
 
 def test_login_and_logout_refusals_and_malformed_bodies(seat_coop_daemon) -> None:
@@ -282,7 +282,7 @@ def test_login_and_logout_refusals_and_malformed_bodies(seat_coop_daemon) -> Non
     r = c.post("/api/auth/login/status", json={"provider": "seatco"})
     assert r.status_code == 422 and "no device login in progress" in r.json()["error"]
     r = c.post("/api/auth/logout", json={"provider": "seatco"})
-    assert r.status_code == 422 and "no seat session" in r.json()["error"]
+    assert r.status_code == 422 and "no perch seat" in r.json()["error"]
     # malformed bodies → 400
     assert c.post("/api/auth/login", json={}).status_code == 400
     assert c.post("/api/auth/login", json={"provider": 42}).status_code == 400
@@ -309,7 +309,7 @@ def test_logout_over_http_deletes_session_and_audits(seat_coop_daemon) -> None:
     assert seatco["session"] is None
 
     events = AuditLog(settings.audit_log_path).read_all()
-    logouts = [e for e in events if e["event"] == "auth.logout"]
+    logouts = [e for e in events if e["event"] == "perch.released"]
     assert len(logouts) == 1 and logouts[0]["provider"] == "seatco" and logouts[0]["mode"] == "seat"
     for marker in (*SECRET_MARKERS, USER_CODE):
         assert marker not in json.dumps(events)
@@ -440,9 +440,9 @@ def test_runs_list_carries_auth_mode_over_http_and_socket(seat_coop_env, seat_co
     show = c.get(f"/api/runs/{enq['run_id']}").json()["run"]
     assert show["manifest"]["auth"]["mode"] == "seat"
     assert "access_token" not in json.dumps(show)
-    # the audit run.finished row carries auth_mode (spec 09) — surfaced in the Audit view
+    # the audit chicken.finished row carries auth_mode (spec 09) — surfaced in the Audit view
     events = AuditLog(seat_coop_daemon.settings.audit_log_path).read_all()
-    fin = [e for e in events if e["event"] == "run.finished" and e.get("run_id") == enq["run_id"]]
+    fin = [e for e in events if e["event"] == "chicken.finished" and e.get("run_id") == enq["run_id"]]
     assert fin and fin[0]["auth_mode"] == "seat"
 
 
@@ -486,7 +486,7 @@ def test_spa_serves_auth_view_and_runs_auth_column(seat_coop_daemon, tmp_path) -
         'id="auth-error"', 'id="device-card"', 'id="device-code"', 'id="device-provider"',
         'id="device-verification"', 'id="device-status"', 'id="device-expires"', 'id="device-cancel"',
         'id="access-card"', 'id="access-list"', 'id="access-scope-table"', 'id="access-scope-tbody"',
-        'data-view="auth"', "/icons/key-round.svg", ">Auth</a>",
+        'data-view="auth"', "/icons/key-round.svg", ">Perch</a>",
         "<th scope=\"col\">Auth</th>",  # runs table column
     ):
         assert marker in html, marker
@@ -570,7 +570,7 @@ def test_e2e_auth_flow_over_http_subprocess(tmp_path, monkeypatch) -> None:
 
         events = AuditLog(settings.audit_log_path).read_all()
         kinds = [e["event"] for e in events]
-        assert "auth.login" in kinds and "auth.logout" in kinds
+        assert "perch.claimed" in kinds and "perch.released" in kinds
 
         # no token/device-code material in any response or audit row
         everything = "\n".join(bodies) + "\n" + json.dumps(events)
