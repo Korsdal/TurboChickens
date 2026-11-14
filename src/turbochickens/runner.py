@@ -25,6 +25,12 @@ Resolved clutch bytes count toward `max_context_mb` like any injected context,
 and the manifest records the resolved sources (`chaining`) plus a
 `clutch.consumed` Headcount row.
 
+Spec 23 (Free-Range) adds `resources.free_range`: a Free-Range chicken has no
+fence — the hard wall-clock kill is removed (`timeout_sec` is optional in the
+egg, and never enforced as a kill for a free-range chicken) — so it dies only
+via `run_stop` (spec 22) or daemon shutdown, both ending in the same attested
+`stopped` teardown as any terminal state.
+
 The pipeline owns all SQLite writes for a chicken: status transitions on
 `runs`, streamed `run_events`, the manifest, the `results` row (spec 04: a
 valid clutch is stored in the nest box, an invalid one quarantined), and the
@@ -116,6 +122,9 @@ class RunPipeline:
         # actively driving; `request_stop` sets the event and the run ends
         # `stopped` (SIGTERM, then hard kill) instead of collecting output
         self._active: dict[str, asyncio.Event] = {}
+        # spec 23: the active Free-Range chickens (no fence — they die only via
+        # `run_stop` or daemon shutdown), so shutdown can ask them to stop
+        self._active_free_range: set[str] = set()
 
     def request_stop(self, run_id: str) -> bool:
         """Spec 22: ask an active chicken to stop. Returns True when the run
@@ -126,6 +135,13 @@ class RunPipeline:
             return False
         event.set()
         return True
+
+    def request_stop_free_range(self) -> list[str]:
+        """Spec 23: daemon shutdown asks every active Free-Range chicken to
+        stop through the spec-22 stop path (SIGTERM, then hard kill → terminal
+        `stopped` with the abattoir's attested teardown). Returns the run ids
+        that were signalled."""
+        return [run_id for run_id in sorted(self._active_free_range) if self.request_stop(run_id)]
 
     # --- db helpers -------------------------------------------------------
 
@@ -320,6 +336,8 @@ class RunPipeline:
             # spec 09: non-secret auth telemetry — mode + token expiry only
             "auth": auth,
             "resources": {
+                # spec 23: Free-Range flag mirrored in the manifest
+                "free_range": spec.resources.free_range,
                 "timeout_sec": spec.resources.timeout_sec,
                 "max_context_mb": spec.resources.max_context_mb,
                 "max_cost_usd": spec.resources.max_cost_usd,
@@ -379,6 +397,9 @@ class RunPipeline:
             "temperature": spec.harness.temperature,
         }
         budget: dict[str, Any] = {
+            # spec 23: a Free-Range chicken has no fence — timeout_sec is the
+            # declared value (possibly None) and no hard kill is enforced
+            "free_range": spec.resources.free_range,
             "timeout_sec": spec.resources.timeout_sec,
             "max_context_mb": spec.resources.max_context_mb,
             "max_cost_usd": spec.resources.max_cost_usd,
@@ -388,6 +409,12 @@ class RunPipeline:
             "cost_exceeded": False,
             "outcome": "ok",
         }
+        # spec 23: the enforced wall-clock budget — None for a Free-Range
+        # chicken, which dies only via run_stop or daemon shutdown (both
+        # attested), never by the clock
+        hard_timeout: int | None = None if spec.resources.free_range else spec.resources.timeout_sec
+        if spec.resources.free_range:
+            self._active_free_range.add(run_id)
         # spec 09: auth telemetry for the manifest/audit — mode + token expiry,
         # never a token. Refreshed from the credential provider when available.
         auth: dict[str, Any] = auth_telemetry_of(self.credential_provider, ctx)
@@ -478,14 +505,14 @@ class RunPipeline:
                 else:
                     await self._set_status(run_id, "running")
                     result, stopped_reason = await self._execute_harness(
-                        adapter, prepared, ctx, stop_event, spec.resources.timeout_sec
+                        adapter, prepared, ctx, stop_event, hard_timeout
                     )
             if stopped_reason is not None:
                 status, reason = "stopped", stopped_reason
             elif result is not None and result.timed_out:
                 budget["timed_out"] = True
                 budget["outcome"] = "timeout"
-                status, reason = "failed", f"timeout: hard-killed after {spec.resources.timeout_sec}s"
+                status, reason = "failed", f"timeout: hard-killed after {hard_timeout}s"
             elif result is not None and result.error:
                 status, reason = "failed", result.error
             elif result is None:
@@ -536,6 +563,7 @@ class RunPipeline:
                 await self._event(run_id, "supervisor", "error", sanitize_log_line(str(e)))
         finally:
             self._active.pop(run_id, None)
+            self._active_free_range.discard(run_id)
             await self._finalize(item, ctx, harness, result, status, reason, adapter, budget, auth, chaining)
 
     async def _execute_harness(
@@ -544,13 +572,14 @@ class RunPipeline:
         prepared: PreparedRun,
         ctx: RunContext,
         stop_event: asyncio.Event,
-        timeout_sec: int,
+        timeout_sec: int | None,
     ) -> tuple[HarnessResult, str | None]:
         """Spec 22: run the harness to completion, racing an operator stop.
         When `run_stop` fires mid-run, the harness process gets SIGTERM first
         and a hard kill after `STOP_TERM_GRACE_SEC`; the run then ends
         `stopped` and its output is never collected or candled. Returns
-        (harness result, stopped reason or None)."""
+        (harness result, stopped reason or None). `timeout_sec=None` (spec 23,
+        Free-Range) means no wall-clock kill — only the stop event ends it."""
         run_id = ctx.run_id
 
         async def sink(source: str, level: str, line: str) -> None:

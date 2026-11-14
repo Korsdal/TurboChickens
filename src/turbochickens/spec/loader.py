@@ -81,8 +81,14 @@ def spec_hash(spec: JobSpec) -> str:
     separators, unset optionals omitted), so formatting and key order in the
     TOML source do not affect the hash. Used later for run manifests.
     """
+    data = spec.model_dump(mode="json", exclude_none=True)
+    # spec 23: `free_range = false` is the pre-23 default — like the None
+    # optionals, it stays out of the hash so existing egg hashes are unchanged
+    resources = data.get("resources")
+    if isinstance(resources, dict) and resources.get("free_range") is False:
+        del resources["free_range"]
     canonical = json.dumps(
-        spec.model_dump(mode="json", exclude_none=True),
+        data,
         sort_keys=True,
         separators=(",", ":"),
     )

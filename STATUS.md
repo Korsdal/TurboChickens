@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-14, after spec 25 landed (chaining — `attachments = ["nestbox://<run_id>/output.json"]` in `[input]`: URI shape validated at spec load with field-named errors (`input.attachments`), resolved at provisioning from the Nest Box via the new `chaining.py` seam — valid clutches only, quarantined/composted/missing/malformed → fail-closed provisioning failure before `running` with attested teardown (1,1,1) and no results row; resolved clutch bytes count toward `max_context_mb` (over-cap chain → `budget.outcome = "context_cap"` exactly like spec 07); lineage in the manifest `chaining` block (run id + artifact path + bytes) + `clutch.consumed` Headcount rows + a run-log line; `jobs_upload` bundles no longer need nestbox attachments shipped in them; lexicon gained Chaining; full suite green, 340 passed). Same day earlier: spec 24 landed (Feed Budget cost cap — optional per-egg `resources.max_cost_usd` in USD, off by default, enforced finalize-only: over cap → run failed with `budget.outcome = "cost_cap"` in the existing manifest budget block, cost/token telemetry still recorded, teardown attested as usual; pure seam `cost_cap_exceeded`; full suite green, 307 passed). Same day earlier: spec 22 landed (lifecycle ops — socket ops `run_stop`/`run_rerun`, CLI `tc runs stop`/`tc runs rerun`, terminal states `cancelled`/`stopped` with attested teardown on every stop path, `egg.cancelled`/`chicken.stopped` Headcount rows, `rerun_of` lineage, lexicon terms added first; full suite green, 298 passed). Same day earlier: spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier then: 22, 24, 25); still no code changed.
+**Last updated:** 2026-11-14, after spec 23 landed (Free-Range chickens — `resources.free_range = true` removes the hard wall-clock kill: `timeout_sec` becomes optional (`int | None`, `gt=0`, `validate_default=True`) with the pairing enforced at spec load (`free_range = false` — the default — requires `timeout_sec > 0`, field-named `resources.timeout_sec` error; `free_range = true` allows it absent and never hard-kills even if present; `extra="forbid"` intact; `spec_hash` drops `free_range=false` so pre-23 egg hashes are unchanged, the shipped example still `sha256:18efbd8c…80b959`); adapters take `timeout_sec: int | None` (`None` = no hard kill — `wait_for(..., None)` waits forever, the API adapter keeps only its 10s connect timeout); the Hatchery enforces `hard_timeout = None if free_range else timeout_sec` and the manifest `resources` + `budget` blocks gain `free_range`; a Free-Range chicken dies only via `run_stop` (spec 22) or daemon shutdown — on shutdown the daemon calls `pipeline.request_stop_free_range()` before the bounded drain, so an in-flight free-range chicken ends `stopped` via the SIGTERM/hard-kill path with attestation (1,1,1) + `chicken.stopped`/`abattoir.attested` audit rows before exit; decision-log amendment for baseline invariants 1/2 recorded in `specs/23-free-range-chickens.md` + §5 below; full suite green, 353 passed (340 + 13 new tests/test_free_range.py)). Same day: spec 25 landed (chaining — `attachments = ["nestbox://<run_id>/output.json"]` in `[input]`: URI shape validated at spec load with field-named errors (`input.attachments`), resolved at provisioning from the Nest Box via the new `chaining.py` seam — valid clutches only, quarantined/composted/missing/malformed → fail-closed provisioning failure before `running` with attested teardown (1,1,1) and no results row; resolved clutch bytes count toward `max_context_mb` (over-cap chain → `budget.outcome = "context_cap"` exactly like spec 07); lineage in the manifest `chaining` block (run id + artifact path + bytes) + `clutch.consumed` Headcount rows + a run-log line; `jobs_upload` bundles no longer need nestbox attachments shipped in them; lexicon gained Chaining; full suite green, 340 passed). Same day earlier: spec 24 landed (Feed Budget cost cap — optional per-egg `resources.max_cost_usd` in USD, off by default, enforced finalize-only: over cap → run failed with `budget.outcome = "cost_cap"` in the existing manifest budget block, cost/token telemetry still recorded, teardown attested as usual; pure seam `cost_cap_exceeded`; full suite green, 307 passed). Same day earlier: spec 22 landed (lifecycle ops — socket ops `run_stop`/`run_rerun`, CLI `tc runs stop`/`tc runs rerun`, terminal states `cancelled`/`stopped` with attested teardown on every stop path, `egg.cancelled`/`chicken.stopped` Headcount rows, `rerun_of` lineage, lexicon terms added first; full suite green, 298 passed). Same day earlier: spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier then: 22, 24, 25); still no code changed.
 
 ---
 
@@ -27,7 +27,7 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10, specs 12–20, and specs 22, 24, and 25 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, the spec-20 commit, the spec-22 commit, the spec-24 commit, and the spec-25 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
+**Spec 01 through spec 10, specs 12–20, and specs 22–25 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, the spec-20 commit, the spec-22 commit, the spec-23 commit, the spec-24 commit, and the spec-25 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
 
 Spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality. Spec 19 gave seat auth a GUI surface (see below).
 Verified this session:
@@ -278,6 +278,17 @@ Verified this session:
 #     "error input.attachments: … malformed nestbox URI …"; well-formed nestbox:// URI → OK rc 0
 #   → alerts: 0; tc daemon stop → rc 0
 #   → full suite: 340 passed (307 + 33 new tests/test_chaining.py)
+# spec-23 smoke (subprocess daemon, temp data_dir, fake vibe binary via $TURBOCHICKENS_VIBE_BIN,
+#   free-range job with no timeout_sec):
+#   → tc jobs validate <free-range job> → OK rc 0; tc jobs validate examples/weekly-incidents-digest/job.toml
+#     → sha256:18efbd8c…80b959 (unchanged — free_range=false stays out of the hash)
+#   → 2x tc run <SLEEP 8 free-range job> → both status=running after 3s (no hard kill, no TTL)
+#   → tc runs stop <one> → rc 0 "chicken run-… → stopped (stopped by operator: SIGTERM (reaped within
+#     5s grace))"; manifest resources.free_range=true timeout_sec=None budget.free_range=true
+#   → tc daemon stop with the other in flight → rc 0 in <1s; both runs terminal stopped with
+#     attestation (1,1,1); audit chicken.stopped + abattoir.attested + coopd.stopped; no results rows
+#   → fenced control (timeout_sec=1, SLEEP 30) → failed budget.outcome=timeout as today
+#   → full suite: 353 passed (340 + 13 new tests/test_free_range.py)
 ```
 
 What exists:
@@ -391,7 +402,10 @@ src/turbochickens/
 │                          # auth telemetry (spec 09); seat runs report cost_usd=0.0 billed_via=seat;
 │                          # module-level resolve_vibe_bin/vibe_version helpers (spec 10 probe);
 │                          # spec 25: _messages reads each attachment from the workspace under
-│                          # attachment_workspace_name (chained clutches land there at provisioning)
+│                          # attachment_workspace_name (chained clutches land there at provisioning);
+│                          # spec 23: execute(..., timeout_sec: int | None) — None = no hard kill
+│                          # (Free-Range), wait_for(..., None) waits forever; the API adapter keeps
+│                          # only its 10s connect timeout
 ├── providers.py           # spec 05: providers.toml registry — provider/model presets, base_url,
 │                          # credential env var, context_window, per-token pricing; resolution:
 │                          # settings.providers_path > $TURBOCHICKENS_PROVIDERS > <data_dir>/providers.toml
@@ -421,7 +435,12 @@ src/turbochickens/
 │                          # the run fails at provisioning before `running` (attested teardown as usual,
 │                          # no results row); resolved clutch bytes count toward the spec-07 context cap;
 │                          # the manifest gains a `chaining` block (attachment URI + run id + artifact
-│                          # path + size_bytes) and the Headcount gains `clutch.consumed` rows
+│                          # path + size_bytes) and the Headcount gains `clutch.consumed` rows;
+│                          # spec 23 (Free-Range): `hard_timeout = None if spec.resources.free_range
+│                          # else timeout_sec` — no wall-clock kill for free-range chickens; the
+│                          # manifest `resources` + `budget` blocks gain `free_range`; active
+│                          # free-range chickens are tracked (`_active_free_range`) and
+│                          # `request_stop_free_range()` stops them via the spec-22 stop path
 ├── scheduler.py           # spec 06: CronScheduler over APScheduler AsyncIOScheduler; standard
 │                          # POSIX cron semantics (aps_trigger resolves the day-of-week field via
 │                          # croniter because APScheduler numbers 0=Monday); schedules re-registered
@@ -467,7 +486,11 @@ src/turbochickens/
 │                          # egg from job_specs.spec_path as a fresh run, trigger=rerun, lineage
 │                          # `rerun_of` on the item → manifest + the egg.queued row); the scheduler checks
 │                          # the cancel set when popping/admitting so a cancelled egg is never hatched;
-│                          # runs_list rows also carry status_reason (spec 22)
+│                          # runs_list rows also carry status_reason (spec 22);
+│                          # spec 23 (Free-Range): on shutdown, serve() calls
+│                          # pipeline.request_stop_free_range() before the bounded drain, so an
+│                          # in-flight free-range chicken is stopped via the spec-22 path (SIGTERM →
+│                          # hard kill → terminal `stopped`, attested (1,1,1)) before exit
 ├── client.py              # request(socket, op, **payload) → parsed response; DaemonUnreachable;
 │                          # spec 12: request_async(...) — the same exchange awaitable inside a running
 │                          # loop (used by the coop web layer's SocketTransport); spec 15: the stream
@@ -482,12 +505,17 @@ src/turbochickens/
 │                          # (jsonschema Draft 2020-12 + format checker; never raises on bad output)
 ├── spec/
 │   ├── model.py           # Pydantic v2 model, all 6 sections, extra="forbid"
+│   │                      # (spec 23: resources.free_range — bool, default false, declared before
+│   │                      #  timeout_sec which is now int | None (gt=0, validate_default=True) with the
+│   │                      #  pairing validator: free_range=false requires timeout_sec > 0, true allows
+│   │                      #  it absent — field-named resources.timeout_sec errors)
 │   │                      # (spec 24: resources.max_cost_usd — optional USD cost cap,
 │   │                      #  positive-only, default None = off; still no max_tokens)
 │   │                      # (spec 25: [input].attachments entries that are URI-shaped must be
 │   │                      #  exactly nestbox://<run_id>/output.json — field-named error otherwise)
 │   └── loader.py          # load_spec(), SpecValidationError (field-named issues), spec_hash()
-│                          # (spec_hash excludes None optionals, so pre-24 spec hashes are unchanged)
+│                          # (spec_hash excludes None optionals and free_range=false, so pre-23
+│                          #  spec hashes are unchanged)
 └── cli/main.py            # Typer app `tc`: run [--wait] | runs list/show/logs/stop/rerun (spec 22:
                            # stop = run_stop — queued egg → cancelled, running chicken → SIGTERM then hard
                            # kill → stopped, rc 0 / clear error for unknown or already-terminal; rerun =
@@ -608,6 +636,15 @@ tests/
                            # tc runs show; at-cap run → succeeded; no-cap run → telemetry + stats;
                            # vibe-cli over/at cap via the fake vibe binary; seat run with a tiny cap →
                            # succeeded (cost_usd 0.0)
+├── test_free_range.py      # spec 23: the free_range/timeout_sec pairing seam (default false requires
+                           #  timeout_sec, true allows absent/present-but-positive, extra=forbid intact,
+                           #  field-named load_spec + tc jobs validate errors, spec_hash stable for pre-23
+                           #  eggs incl. the shipped example), and e2e over a thread daemon + subprocess
+                           #  daemon with the fake vibe binary: free-range chicken not hard-killed at any
+                           #  TTL while a fenced control times out, free_range + timeout present still not
+                           #  killed, run_stop → stopped with attestation (1,1,1) + chicken.stopped audit
+                           #  (socket + CLI), and daemon shutdown with a free-range chicken in flight →
+                           #  attested stopped before exit
 └── test_chaining.py        # spec 25: the nestbox:// URI parse seam (valid / 13 malformed shapes), the
                            # spec-load validator (field-named input.attachments errors via load_spec +
                            # tc jobs validate, extra=forbid intact), the pure Nest-Box resolver seam
@@ -623,7 +660,7 @@ examples/weekly-incidents-digest/   # baseline-format example job (job.toml, pro
 examples/hello-vibe-cli/            # manual vibe-cli example job (job.toml, prompt, schema)
 examples/providers.toml             # spec 05 reference provider registry (mistral presets + pricing,
                            # commented other-provider example) — copy to ~/.turbochickens/providers.toml
-pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.16, deps: pydantic, typer, rich, croniter,
+pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.17, deps: pydantic, typer, rich, croniter,
                            # jsonschema (+ rfc3339-validator for format checks), httpx, apscheduler (spec 06),
                            # aiohttp (spec 12, coop web server); dev: pytest
 Dockerfile                 # spec 18: the coop image — python:3.12-slim, pip install . (the wheel ships
@@ -1125,6 +1162,7 @@ Spec-18 deliverables, concretely:
 | 20 | Lexicon adoption — every surface speaks farm (`docs/lexicon.md` rolled out to Headcount events, GUI copy, CLI output, errors, docs; machine interfaces unchanged; legacy rows aliased on read) | **done** (2026-11-14) | 01–19 |
 | 21 | Hatchery & Farmhand overview v0.1 — lifecycle ops (stop/re-run), Free-Range, cost cap (off by default), chaining, Farmhand MCP (stdio/https/both), ChickenSubs, connectors registry, GUI for everything | overview v0.1 — **not ready-for-agent**; split into slices 22+ via to-tickets before implementation | 01–20 |
 | 22 | Lifecycle ops — `run_stop` (queued → `cancelled`, running → SIGTERM/hard kill → `stopped`, attested) + `run_rerun` (lineage) over socket, CLI, and audit | **done** (2026-11-14) | 02–04 |
+| 23 | Free-Range chickens — `resources.free_range = true` removes the hard TTL (`timeout_sec` optional, pairing validated); death only by `run_stop` or daemon shutdown, both attested | **done** (2026-11-14) | 22 |
 | 24 | Feed Budget cost cap — `resources.max_cost_usd` (USD, off by default, finalize-only `budget.outcome = "cost_cap"`, telemetry always recorded) | **done** (2026-11-14) | 05, 08 |
 | 25 | Chaining — `nestbox://<run_id>/output.json` attachments resolved from the Nest Box at provisioning (valid clutches only), counted toward the context cap, lineage in manifest/audit | **done** (2026-11-14) | 04, 07 |
 
@@ -1165,6 +1203,18 @@ SQLite MVP tables (baseline §12, to be created in spec 02): `job_specs`, `runs`
 `run_events`, `results`, `teardown_attestations`, `job_usage_stats` (trajectory
 tables deliberately excluded).
 
+**Amendments to the baseline decision log (recorded at slice boundaries, per the
+slice spec files):** spec 23 (2026-11-14) — invariant 1: the wall-clock
+`timeout_sec` hard kill moves from "always enforced" to **"enforced unless
+free-range"** (`resources.free_range = true` carries no hard TTL and dies only
+via `run_stop` or daemon shutdown, both attested; `free_range = false` keeps
+the pre-23 behavior; `max_context_mb` unchanged; still no `max_tokens`).
+Invariant 2 (spec 22): terminal states additionally include `cancelled` (queued
+egg pulled from the pecking order — never hatches, still attested) and
+`stopped` (running chicken ended by operator or daemon shutdown) — every
+terminal state still requires the teardown attestation. Full text:
+`specs/23-free-range-chickens.md` §"Decision-log amendment".
+
 ## 6. Working conventions for agents
 
 - **Environment:** `uv`-managed venv at `.venv/` (already built). Run tests with
@@ -1193,7 +1243,7 @@ tables deliberately excluded).
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 - **Version management is a human responsibility.** Coding agents can bump the
   last part of a version number (`0.0.X`) — every other bump (minor, major) is
-  human initiated. Current version: `0.0.16`.
+  human initiated. Current version: `0.0.17`.
 - **No agent as a contributor on GitHub.** See the commits bullet above: the
   `Co-Authored-By` agent trailer is what made GitHub list `mistral-vibe` as a
   contributor — it is banned from commits; humans only in the contributor
@@ -1358,6 +1408,25 @@ log ("chained clutch from chicken …"). `jobs_upload` bundles no longer need
 `nestbox://` attachments shipped in them. Lexicon gained **Chaining** first.
 Verified e2e with the fake vibe binary (happy path + quarantined/missing/
 composted refusals + over-cap chain + upload-and-run), full suite 340 passed.
+
+Spec 23 (Free-Range chickens) landed: `resources.free_range = true` removes
+the hard wall-clock kill — `timeout_sec` becomes optional in the egg and the
+pairing is validated at spec load (`free_range = false`, the default, still
+requires `timeout_sec > 0`; field-named `resources.timeout_sec` error;
+`extra="forbid"` intact; `spec_hash` keeps pre-23 hashes stable). Adapters take
+`timeout_sec: int | None` (`None` = no hard kill), and the Hatchery enforces
+`hard_timeout = None` for free-range chickens; the manifest `resources` and
+`budget` blocks carry `free_range`. A Free-Range chicken dies only via
+`run_stop` (spec 22) or daemon shutdown: on shutdown the daemon asks every
+active free-range chicken to stop through the spec-22 SIGTERM/hard-kill path
+before the bounded drain, so it ends `stopped` with the abattoir's (1,1,1)
+attestation and `chicken.stopped`/`abattoir.attested` Headcount rows before
+exit (a missing attestation stays an alert condition). The baseline
+invariants-1/2 decision-log amendment is recorded in
+`specs/23-free-range-chickens.md` and §5 above. Verified e2e with the fake vibe
+binary (no-kill past any TTL while a fenced control times out, attested
+`run_stop`, attested shutdown teardown in a subprocess daemon), full suite
+353 passed.
 
 The MVP spec pipeline (01–10) and the GUI spec 11 slices (12–20) are
 complete; what remains is the post-MVP roadmap in baseline §13.

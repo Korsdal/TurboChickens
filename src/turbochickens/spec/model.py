@@ -7,6 +7,10 @@ optional USD cap ``resources.max_cost_usd`` (spec 24), enforced at finalize.
 Any extra key (including ``max_tokens``) is rejected with a field-named error.
 Spec 25 (chaining) adds ``nestbox://<run_id>/output.json`` URIs as valid
 ``[input].attachments`` entries — shape-checked here, resolved at provisioning.
+Spec 23 (Free-Range) adds ``resources.free_range``: a Free-Range chicken has
+no fence — no hard wall-clock kill — so ``timeout_sec`` becomes optional and
+the pairing is validated here (``free_range = false`` requires
+``timeout_sec > 0``; ``free_range = true`` allows it absent).
 """
 
 from __future__ import annotations
@@ -71,12 +75,35 @@ class HarnessSection(_StrictModel):
 
 
 class ResourcesSection(_StrictModel):
-    timeout_sec: int = Field(gt=0, description="hard wall-clock kill budget")
+    # spec 23 (Free-Range): a Free-Range chicken has no fence — the hard
+    # wall-clock kill is removed and `timeout_sec` is optional. The pairing
+    # is enforced below: free_range = false (the default, pre-23 behavior)
+    # still requires timeout_sec > 0; free_range = true allows it absent (a
+    # present value must still be positive, and is then not enforced as a
+    # kill — a Free-Range chicken dies only via run_stop or daemon shutdown).
+    # Declared before timeout_sec so the pairing validator can see it.
+    free_range: bool = False
+    timeout_sec: int | None = Field(
+        default=None,
+        gt=0,
+        validate_default=True,  # the pairing rule must also fire when the key is absent
+        description="hard wall-clock kill budget; required unless free_range = true",
+    )
     max_context_mb: int = Field(gt=0, description="hard cap on injected context size")
     # spec 24: optional Feed Budget cost cap in USD (never a token count),
     # enforced finalize-only. Absent = no cap (off by default).
     max_cost_usd: float | None = Field(default=None, gt=0.0, description="optional USD cost cap, enforced at finalize")
     network: Literal["none"] = "none"
+
+    @field_validator("timeout_sec")
+    @classmethod
+    def _check_timeout_pairing(cls, v: int | None, info: ValidationInfo) -> int | None:
+        if not info.data.get("free_range", False) and v is None:
+            raise ValueError(
+                "is required when free_range is false — a fenced chicken needs a hard"
+                " wall-clock kill (or set free_range = true for a Free-Range chicken)"
+            )
+        return v
 
 
 class InputSection(_StrictModel):

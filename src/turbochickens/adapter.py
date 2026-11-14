@@ -188,11 +188,13 @@ class HarnessAdapter(Protocol):
         self,
         prepared: PreparedRun,
         event_sink: Callable[[str, str, str], Awaitable[None]],
-        timeout_sec: int,
+        timeout_sec: int | None,
     ) -> HarnessResult:
         """Run the job inside the workspace, stream sanitized log lines to the
         supervisor via `event_sink(source, level, line)`, return raw output +
-        usage + exit status. Hard-kill on `timeout_sec`."""
+        usage + exit status. Hard-kill on `timeout_sec`; ``None`` means no
+        hard kill at all (spec 23: a Free-Range chicken dies only via
+        `run_stop` or daemon shutdown, never by wall clock)."""
         ...
 
     async def teardown(self, run: RunContext) -> TeardownReport:
@@ -259,8 +261,10 @@ class VibeCLIAdapter:
         self,
         prepared: PreparedRun,
         event_sink: Callable[[str, str, str], Awaitable[None]],
-        timeout_sec: int,
+        timeout_sec: int | None,
     ) -> HarnessResult:
+        # spec 23: timeout_sec=None (Free-Range) → no hard kill; wait_for with
+        # timeout=None simply waits for the process forever
         run = prepared.context
         workspace = run.workspace
         prompt_dst = workspace / "prompt.txt"
@@ -435,8 +439,11 @@ class MistralAPIAdapter:
         self,
         prepared: PreparedRun,
         event_sink: Callable[[str, str, str], Awaitable[None]],
-        timeout_sec: int,
+        timeout_sec: int | None,
     ) -> HarnessResult:
+        # spec 23: timeout_sec=None (Free-Range) → no hard kill over the whole
+        # call (wait_for with timeout=None waits indefinitely; the httpx client
+        # keeps only its 10s connect timeout)
         run = prepared.context
         api_key = run.env.get(self.provider.api_key_env)
         if not api_key:

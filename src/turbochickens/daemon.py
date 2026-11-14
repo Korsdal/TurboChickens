@@ -59,6 +59,13 @@ Headcount rows ``egg.cancelled`` / ``chicken.stopped``) and ``run_rerun``
 ``rerun_of`` in the manifest and the ``egg.queued`` row). ``TERMINAL_STATES``
 gains ``cancelled``/``stopped``, so a missing attestation on them stays an
 alert condition. ``runs_list`` rows also carry ``status_reason``.
+
+Spec 23 (Free-Range) removes the hard wall-clock kill for eggs with
+``resources.free_range = true`` (``timeout_sec`` optional there): such a
+chicken dies only via ``run_stop`` or daemon shutdown — on shutdown the
+daemon asks every active Free-Range chicken to stop through the same
+spec-22 stop path (SIGTERM → hard kill → terminal ``stopped`` with the
+abattoir's attested teardown) before exiting.
 """
 
 from __future__ import annotations
@@ -240,6 +247,12 @@ class Daemon:
         try:
             await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         finally:
+            # spec 23: a Free-Range chicken has no fence — daemon shutdown is
+            # one of its two attested death paths, so ask every active one to
+            # stop via the spec-22 stop path (SIGTERM → hard kill → `stopped`)
+            # instead of waiting out the bounded drain below
+            if self.pipeline is not None:
+                self.pipeline.request_stop_free_range()
             if self.coop is not None:
                 with contextlib.suppress(Exception):
                     await self.coop.stop()

@@ -233,6 +233,7 @@ def test_success_manifest_records_budget_outcome_ok(daemon, tmp_path) -> None:
     m = run["manifest"]
     assert m["timed_out"] is False
     assert m["budget"] == {
+        "free_range": False,  # spec 23: fenced by default
         "timeout_sec": 30,
         "max_context_mb": 2,
         "max_cost_usd": None,  # spec 24: no cost cap set by default
@@ -256,5 +257,6 @@ def test_resources_section_has_no_token_cap() -> None:
     # the enforced budgets are wall-clock timeout + injected-context cap + the
     # optional USD cost cap (spec 24) — still no token cap
     res = ResourcesSection.model_validate({"timeout_sec": 600, "max_context_mb": 2, "network": "none"})
-    assert set(res.model_dump()) == {"timeout_sec", "max_context_mb", "max_cost_usd", "network"}
+    assert set(res.model_dump()) == {"free_range", "timeout_sec", "max_context_mb", "max_cost_usd", "network"}
     assert res.max_cost_usd is None  # off by default
+    assert res.free_range is False  # spec 23: fenced by default
