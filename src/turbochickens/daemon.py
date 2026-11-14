@@ -119,6 +119,18 @@ error, never silently ignored), only ``MUTABLE_SETTINGS_FIELDS`` may change
 (everything else is read-only at runtime), the change is audited as
 ``settings.changed``, and the coop mounts/unmounts the Farmhand HTTPS endpoint
 when ``farmhand_transport`` crosses the https boundary.
+
+Spec 32 (ticket 10, review finding G8) establishes socket caller identity:
+every connection's peer credentials are read from the kernel (SO_PEERCRED)
+and the peer pid is resolved — directly or via its /proc ancestry — against
+the registry of chicken pids the Hatchery records at spawn, so a
+chicken-owned connection is identified server-side. On such a connection,
+``enqueue`` forces ``parent_run_id`` and ``run_stop`` forces ``caller_run_id``
+from the peer (client-sent lineage fields are ignored), so the ChickenSub
+depth cap and the ancestor-stop refusal hold even against a direct socket
+caller. ``runs_list`` rows and the manifest's harness block carry the
+chicken's ``pid``. Trust model: socket and Coop HTTP access mean operator;
+Chickens are not operators (see ``docs/lexicon.md``).
 """
 
 from __future__ import annotations
@@ -131,9 +143,12 @@ import os
 import re
 import shutil
 import signal
+import socket
 import sqlite3
+import struct
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -188,6 +203,52 @@ UPLOAD_MAX_FILES = 200
 MUTABLE_SETTINGS_FIELDS = ("farmhand_transport",)
 
 PROTOCOL_VERSION = 1
+
+
+@dataclass
+class CallerIdentity:
+    """Spec 32 (ticket 10, review finding G8): who is on the other end of a
+    socket connection, established server-side from the kernel's peer
+    credentials (SO_PEERCRED), never from the request body. `run_id` is set
+    when the peer pid is a live chicken (or a descendant of one) — such a
+    connection is chicken-owned and its lineage fields are forced from the
+    peer, not trusted from the client. Socket/HTTP access means operator;
+    Chickens are not operators."""
+
+    pid: int | None
+    uid: int | None
+    gid: int | None
+    run_id: str | None = None
+
+    @property
+    def is_chicken(self) -> bool:
+        return self.run_id is not None
+
+
+def _peer_credentials(writer: asyncio.StreamWriter) -> tuple[int | None, int | None, int | None]:
+    """Read the peer credentials of a unix-socket connection (Linux
+    SO_PEERCRED: pid, uid, gid of the connecting process). Returns
+    (None, None, None) where the kernel offers no peer credentials — such a
+    caller is treated as an operator, same as any non-chicken peer."""
+    sock = writer.get_extra_info("socket")
+    if sock is None or not hasattr(socket, "SO_PEERCRED"):
+        return None, None, None
+    try:
+        raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        pid, uid, gid = struct.unpack("3i", raw)
+        return pid, uid, gid
+    except OSError:
+        return None, None, None
+
+
+def _ppid_of(pid: int) -> int | None:
+    """Parent pid from /proc (Linux), or None when unreadable."""
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        # the comm field may contain spaces/parens — parse after the last ')'
+        return int(data.rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def _safe_bundle_relpath(key: str) -> str | None:
@@ -249,6 +310,10 @@ class Daemon:
         # spec 19: seat broker for the auth ops + in-flight device grants
         self._broker: SeatBroker | None = None
         self._device_grants: dict[str, DeviceGrant] = {}
+        # spec 32 (ticket 10, G8): chicken pid → run_id registry, shared with
+        # the pipeline (which registers each harness pid at spawn) — used to
+        # resolve a socket peer pid to the owning chicken
+        self._chicken_pids: dict[int, str] = {}
 
     def request_stop(self) -> None:
         if self._stop is not None:
@@ -284,7 +349,9 @@ class Daemon:
             if await self._socket_alive():
                 raise DaemonAlreadyRunning(f"daemon already running on {s.socket_path}")
             s.socket_path.unlink()  # stale socket from a dead daemon
-        self.pipeline = RunPipeline(s, self.db, self.audit, providers=self.providers)
+        self.pipeline = RunPipeline(
+            s, self.db, self.audit, providers=self.providers, pid_registry=self._chicken_pids
+        )
         # spec 08: retention — sweep expired result artifacts once at startup
         # (the audit log itself is never TTL-deleted), then periodically
         self._last_retention = sweep_expired_results(s, self.db, self.audit)
@@ -360,9 +427,38 @@ class Daemon:
             with contextlib.suppress(OSError):
                 s.socket_path.unlink()
 
+    def _caller_run_id(self, pid: int | None) -> str | None:
+        """Spec 32 (ticket 10, G8): resolve a socket peer pid to the chicken
+        that owns it. The peer itself may be the chicken's harness process,
+        or a descendant of it (e.g. the Farmhand serve process the chicken's
+        runtime spawned) — walk the /proc ancestry up to PID 1 and return the
+        first registered chicken pid found. Returns None for any non-chicken
+        caller (operator CLI, coop web layer, cron loopback — all of which
+        connect from processes that are not chickens)."""
+        if pid is None:
+            return None
+        seen: set[int] = set()
+        cur: int | None = pid
+        while cur is not None and cur > 1 and cur not in seen:
+            seen.add(cur)
+            run_id = self._chicken_pids.get(cur)
+            if run_id is not None:
+                return run_id
+            cur = _ppid_of(cur)
+        return None
+
+    def _caller_identity(self, writer: asyncio.StreamWriter) -> CallerIdentity:
+        """Establish the caller of a socket connection from the kernel's peer
+        credentials (read once per connection, on every connection)."""
+        pid, uid, gid = _peer_credentials(writer)
+        return CallerIdentity(pid=pid, uid=uid, gid=gid, run_id=self._caller_run_id(pid))
+
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        # spec 32 (ticket 10, G8): caller identity is established server-side
+        # from SO_PEERCRED on every connection, before any request is read
+        caller = self._caller_identity(writer)
         try:
             while self._stop is None or not self._stop.is_set():
                 try:
@@ -381,7 +477,7 @@ class Daemon:
                     break
                 if not line:
                     break
-                resp = await self._respond(line)
+                resp = await self._respond(line, caller)
                 writer.write(json.dumps(resp, ensure_ascii=False).encode("utf-8") + b"\n")
                 await writer.drain()
         except (ConnectionResetError, BrokenPipeError):
@@ -391,7 +487,7 @@ class Daemon:
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
-    async def _respond(self, line: bytes) -> dict[str, Any]:
+    async def _respond(self, line: bytes, caller: CallerIdentity | None = None) -> dict[str, Any]:
         try:
             req = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -399,11 +495,11 @@ class Daemon:
         if not isinstance(req, dict):
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "request must be a JSON object"}
         try:
-            return await self._dispatch(req)
+            return await self._dispatch(req, caller)
         except Exception as e:  # never let one bad request kill the connection loop
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"{type(e).__name__}: {e}"}
 
-    async def _dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
+    async def _dispatch(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
         op = req.get("op")
         if op == "ping":
             return {
@@ -418,7 +514,7 @@ class Daemon:
         if op == "status":
             return self._status()
         if op == "enqueue":
-            return await self._enqueue(req)
+            return await self._enqueue(req, caller)
         if op == "runs_list":
             return self._runs_list(req)
         if op == "runs_show":
@@ -428,7 +524,7 @@ class Daemon:
         if op == "workspace_peek":
             return self._workspace_peek(req)
         if op == "run_stop":
-            return await self._run_stop(req)
+            return await self._run_stop(req, caller)
         if op == "run_rerun":
             return await self._run_rerun(req)
         if op == "results_get":
@@ -546,7 +642,7 @@ class Daemon:
 
     # --- run submission (spec 03) ------------------------------------------
 
-    async def _enqueue(self, req: dict[str, Any]) -> dict[str, Any]:
+    async def _enqueue(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
         spec_path_raw = req.get("spec_path")
         if not spec_path_raw:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "enqueue requires spec_path"}
@@ -554,6 +650,12 @@ class Daemon:
         trigger = str(req.get("trigger", "manual"))
         rerun_of = req.get("rerun_of")  # spec 22: `run_rerun` lineage
         parent_run_id = req.get("parent_run_id")  # spec 27: ChickenSub lineage
+        if caller is not None and caller.is_chicken:
+            # spec 32 (ticket 10, G8): the connection is chicken-owned (peer
+            # pid resolved to a live chicken) — lineage is forced from the
+            # authenticated peer; any client-sent parent_run_id is ignored,
+            # so the depth cap holds even against a direct socket caller
+            parent_run_id = caller.run_id
         try:
             spec = load_spec(spec_path)
         except SpecValidationError as e:
@@ -863,6 +965,7 @@ class Daemon:
             cost_usd = None
             max_cost_usd = None
             budget_outcome = None
+            pid = None
             if r[9]:
                 try:
                     manifest = json.loads(r[9])
@@ -871,6 +974,11 @@ class Daemon:
                         if isinstance(auth, dict):
                             auth_mode = auth.get("mode")
                         status_reason = manifest.get("status_reason")
+                        # spec 32 (ticket 10): the chicken's pid, recorded at
+                        # hatch/spawn, mirrored in the manifest harness block
+                        harness = manifest.get("harness")
+                        if isinstance(harness, dict):
+                            pid = harness.get("pid")
                         # spec 30: feed-budget telemetry for the coop table
                         usage = manifest.get("usage")
                         if isinstance(usage, dict) and usage.get("cost_usd") is not None:
@@ -894,6 +1002,8 @@ class Daemon:
                     "result_valid": None if r[8] is None else bool(r[8]),
                     "auth_mode": auth_mode,
                     "status_reason": status_reason,
+                    # spec 32 (ticket 10): the chicken's pid recorded at spawn
+                    "pid": pid,
                     # spec 30: measured cost vs the egg's feed-budget cap
                     "cost_usd": cost_usd,
                     "max_cost_usd": max_cost_usd,
@@ -1048,7 +1158,7 @@ class Daemon:
             cur = row[0]
         return ancestors
 
-    async def _run_stop(self, req: dict[str, Any]) -> dict[str, Any]:
+    async def _run_stop(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
         """End a chicken deliberately. A queued egg is pulled from the pecking
         order → terminal `cancelled` (it never hatches); a chicken already in
         the Hatchery gets SIGTERM, then a hard kill → terminal `stopped`. Both
@@ -1057,7 +1167,12 @@ class Daemon:
 
         Spec 27: when the request carries `caller_run_id` (a Farmhand running
         inside a sub-chicken), a target that is one of the caller's ancestors
-        is refused — a sub-chicken cannot stop its ancestors."""
+        is refused — a sub-chicken cannot stop its ancestors.
+
+        Spec 32 (ticket 10, G8): on a chicken-owned connection (peer pid
+        resolved to a live chicken) `caller_run_id` is forced from the
+        authenticated peer — a client-sent value is ignored, so the
+        ancestor-stop refusal holds even against a direct socket caller."""
         run_id = str(req.get("run_id", ""))
         if not run_id:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "run_stop requires run_id"}
@@ -1074,6 +1189,11 @@ class Daemon:
                 "error": f"chicken {run_id!r} is already terminal ({status}) — nothing to stop",
             }
         caller_run_id = req.get("caller_run_id")
+        if caller is not None and caller.is_chicken:
+            # spec 32 (ticket 10, G8): forced from the peer credentials —
+            # the client-sent caller_run_id is ignored on a chicken-owned
+            # connection, so the ancestor refusal cannot be bypassed
+            caller_run_id = caller.run_id
         if caller_run_id:
             caller_run_id = str(caller_run_id)
             if run_id in self._ancestor_run_ids(caller_run_id):

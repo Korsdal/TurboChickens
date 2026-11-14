@@ -52,6 +52,15 @@ The pipeline owns all SQLite writes for a chicken: status transitions on
 `runs`, streamed `run_events`, the manifest, the `results` row (spec 04: a
 valid clutch is stored in the nest box, an invalid one quarantined), and the
 `teardown_attestations` row.
+
+Spec 32 (ticket 10, review finding G8) records each Chicken's pid at
+hatch/spawn: the adapter's spawn hook writes the harness process pid into the
+pipeline's shared pid registry (chicken pid → run id) and the manifest's
+harness block carries `pid`. The daemon reads SO_PEERCRED on every socket
+connection and resolves the peer pid (the chicken itself or one of its
+descendants) to the owning run through that registry, so lineage
+(`parent_run_id` / `caller_run_id`) is forced from the authenticated peer —
+client-sent lineage fields are ignored on chicken-owned connections.
 """
 
 from __future__ import annotations
@@ -125,6 +134,7 @@ class RunPipeline:
         audit: AuditLog,
         providers: ProvidersConfig | None = None,
         credential_provider: Any = None,
+        pid_registry: dict[int, str] | None = None,
     ) -> None:
         self.settings = settings
         self.db = db
@@ -142,6 +152,26 @@ class RunPipeline:
         # spec 23: the active Free-Range chickens (no fence — they die only via
         # `run_stop` or daemon shutdown), so shutdown can ask them to stop
         self._active_free_range: set[str] = set()
+        # spec 32 (ticket 10): chicken pid → run_id registry shared with the
+        # daemon — the daemon reads SO_PEERCRED on every socket connection and
+        # resolves the peer pid (a chicken or one of its descendants) to the
+        # owning run, so lineage is forced from the peer, never client-sent
+        self._pid_registry = pid_registry
+
+    def _register_chicken_pid(self, run_id: str, pid: int) -> None:
+        """Spec 32 (ticket 10): a chicken's harness process pid is registered
+        at spawn (called from the adapter's spawn hook) so the daemon can
+        attribute socket connections from that pid (or its descendants) to
+        this run."""
+        if self._pid_registry is not None:
+            self._pid_registry[pid] = run_id
+
+    def _unregister_chicken_pids(self, run_id: str) -> None:
+        if self._pid_registry is None:
+            return
+        for pid, rid in list(self._pid_registry.items()):
+            if rid == run_id:
+                del self._pid_registry[pid]
 
     def request_stop(self, run_id: str) -> bool:
         """Spec 22: ask an active chicken to stop. Returns True when the run
@@ -390,6 +420,10 @@ class RunPipeline:
         # spawn_subs chicken's Farmhand
         if item.get("parent_run_id"):
             manifest["parent_run_id"] = item["parent_run_id"]
+        # spec 32 (ticket 10): the chicken's pid, recorded at hatch/spawn
+        # (None when the harness runs no process of its own, e.g. the API
+        # adapter) — mirrored in the harness block of the manifest
+        manifest["harness"]["pid"] = ctx.pid
         return manifest
 
     # --- the lifecycle ----------------------------------------------------
@@ -413,6 +447,11 @@ class RunPipeline:
             # spec 27 (ChickenSubs): sub-chicken lineage
             parent_run_id=item.get("parent_run_id"),
         )
+        # spec 32 (ticket 10): the spawn hook records the chicken's pid in
+        # the shared registry at hatch/spawn, so the daemon can force lineage
+        # from the socket peer's credentials
+        if self._pid_registry is not None:
+            ctx.on_spawn = lambda pid: self._register_chicken_pid(run_id, pid)
         status = "failed"
         reason = "internal error"
         result: HarnessResult | None = None
@@ -613,6 +652,9 @@ class RunPipeline:
         finally:
             self._active.pop(run_id, None)
             self._active_free_range.discard(run_id)
+            # spec 32 (ticket 10): the chicken is gone — drop its pid from the
+            # peer-identity registry so a reused pid is never attributed to it
+            self._unregister_chicken_pids(run_id)
             await self._finalize(item, ctx, harness, result, status, reason, adapter, budget, auth, chaining)
 
     async def _execute_harness(
@@ -697,6 +739,8 @@ class RunPipeline:
                 "spawn_subs": spec.harness.spawn_subs,
                 # spec 28: gate names mirrored in the manifest (names only)
                 "connectors": list(spec.harness.connectors),
+                # spec 32 (ticket 10): never hatched, so no pid
+                "pid": None,
             },
             "started_at": item.get("started_at"),
             "finished_at": now,
