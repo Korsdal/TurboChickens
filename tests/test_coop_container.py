@@ -9,6 +9,13 @@ settings, so these tests cover exactly what the container runs, in-process:
 - the Dockerfile contract (base image, EXPOSE, VOLUME, HEALTHCHECK on
   loopback /api/ping, ENV, CMD) and the .dockerignore context trim;
 - the compose example and the docs (build/run/compose/token/reverse-proxy);
+- spec 32 / G12: the non-root + hardened container contract — the Dockerfile
+  USER (created with uid/gid > 0, /data chowned to it before VOLUME,
+  PYTHONDONTWRITEBYTECODE for the read-only rootfs), every compose hardening
+  property (user pin, cap_drop ALL, no-new-privileges, read_only + tmpfs
+  /tmp, init, memory/CPU limits), the writable-paths-covered cross-check,
+  the docs, and a subprocess e2e proving the CMD serves the Coop, runs a
+  job, and shuts down gracefully as a non-root user;
 - a subprocess e2e of the container CMD semantics — `tc daemon start` with
   the shipped settings (only data_dir/port redirected to the sandbox) —
   serving the GUI, printing the ephemeral token exactly once, answering the
@@ -348,3 +355,179 @@ def test_container_cmd_serves_gui_and_persists_over_data_dir(tmp_path, monkeypat
         daemon2.stop()
     assert daemon2.proc.returncode == 0
     assert len(daemon2.token_lines()) == 1
+
+
+# --- spec 32 / G12: the coop container runs non-root and hardened --------------
+#
+# No Docker daemon is needed: USER and the runtime hardening live in the
+# Dockerfile / compose file, so contract tests pin them there, and one
+# subprocess e2e proves the container CMD still starts, serves the Coop, runs
+# a job, and shuts down gracefully while running as a non-root user.
+
+
+def test_dockerfile_runs_as_non_root_user() -> None:
+    text = DOCKERFILE.read_text()
+    # explicit runtime USER, and it is not root
+    user_m = re.search(r"^USER (\S+)$", text, re.M)
+    assert user_m, "Dockerfile must set an explicit USER"
+    user = user_m.group(1)
+    assert user.split(":")[0] not in ("root", "0")
+    # the user is created with a real uid/gid > 0 (no login shell, no home)
+    uid_m = re.search(r"useradd .*?--uid (\d+)", text)
+    gid_m = re.search(r"groupadd .*?--gid (\d+)", text)
+    assert uid_m and gid_m, "Dockerfile must create the runtime user"
+    assert int(uid_m.group(1)) > 0 and int(gid_m.group(1)) > 0
+    assert "nologin" in text
+    # /data is chowned to that user BEFORE VOLUME, so a fresh named volume
+    # inherits the ownership and the non-root daemon can write its socket,
+    # db, audit, results and workspaces there
+    chown_m = re.search(r"^RUN .*chown (\S+) /data\s*$", text, re.M)
+    vol_m = re.search(r'^VOLUME \["/data"\]$', text, re.M)
+    assert chown_m and vol_m and chown_m.start() < vol_m.start()
+    assert chown_m.group(1).split(":")[0] == user.split(":")[0]
+    # nothing ever switches back to root
+    assert not re.search(r"^USER (root|0)\s*$", text, re.M)
+    # with a read-only rootfs the interpreter must not need bytecode writes
+    assert "PYTHONDONTWRITEBYTECODE=1" in text
+
+
+def test_compose_pins_every_hardening_property() -> None:
+    text = COMPOSE.read_text()
+    # non-root runtime user pinned in compose too (matches the image USER)
+    user_m = re.search(r'^\s*user:\s*"(\d+):(\d+)"\s*$', text, re.M)
+    assert user_m and int(user_m.group(1)) != 0 and int(user_m.group(2)) != 0
+    # all Linux capabilities dropped
+    assert re.search(r"cap_drop:\s*\n\s*-\s*ALL\s*$", text, re.M)
+    # no-new-privileges: setuid/file-caps can never re-elevate
+    assert re.search(r"security_opt:\s*\n\s*-\s*no-new-privileges:true\s*$", text, re.M)
+    # read-only root filesystem …
+    assert re.search(r"^\s*read_only:\s*true\s*$", text, re.M)
+    # … with a tmpfs /tmp for scratch
+    assert re.search(r"tmpfs:\s*\n\s*-\s*/tmp\s*$", text, re.M)
+    # an init process so PID 1 reaps orphaned children
+    assert re.search(r"^\s*init:\s*true\s*$", text, re.M)
+    # memory limit of at least 256 MiB
+    mem_m = re.search(r'^\s*mem_limit:\s*"?(\d+(?:\.\d+)?)\s*([kKmMgG])"?\s*$', text, re.M)
+    assert mem_m, "compose must set a memory limit"
+    mult = {"k": 1024, "m": 1024**2, "g": 1024**3}[mem_m.group(2).lower()]
+    assert float(mem_m.group(1)) * mult >= 256 * 1024**2
+    # CPU limit > 0
+    cpus_m = re.search(r'^\s*cpus:\s*"?(\d+(?:\.\d+)?)"?\s*$', text, re.M)
+    assert cpus_m and float(cpus_m.group(1)) > 0
+    # the /data volume stays mounted — the only writable stateful path under
+    # a read-only rootfs
+    assert re.search(r"-\s*coop-data:/data\s*$", text, re.M)
+
+
+def test_read_only_rootfs_writable_paths_are_all_covered() -> None:
+    """read_only only works because every stateful path of the shipped
+    settings lives under the /data volume (plus the /tmp tmpfs): pin that
+    combination across the shipped settings, Dockerfile and compose file."""
+    settings = load_settings(SHIPPED_SETTINGS)
+    stateful = [
+        settings.socket_path,
+        settings.db_path,
+        settings.audit_log_path,
+        settings.results_dir,
+        settings.quarantine_dir,
+        settings.seats_dir,
+        settings.uploads_dir,
+        settings.data_dir / "workspaces",
+    ]
+    for p in stateful:
+        assert p == Path("/data") or p.is_relative_to("/data"), p
+    dockerfile = DOCKERFILE.read_text()
+    compose = COMPOSE.read_text()
+    assert re.search(r'^VOLUME \["/data"\]$', dockerfile, re.M)
+    assert re.search(r"-\s*coop-data:/data\s*$", compose, re.M)
+    assert re.search(r"tmpfs:\s*\n\s*-\s*/tmp\s*$", compose, re.M)
+    assert re.search(r"^\s*read_only:\s*true\s*$", compose, re.M)
+    assert "PYTHONDONTWRITEBYTECODE=1" in dockerfile
+
+
+def test_docs_cover_the_hardened_non_root_runtime() -> None:
+    text = DOCS.read_text()
+    for flag in (
+        "--user 10001:10001",
+        "--cap-drop ALL",
+        "no-new-privileges:true",
+        "--read-only",
+        "--tmpfs /tmp",
+        "--init",
+        "--memory",
+        "--cpus",
+    ):
+        assert flag in text, flag
+    assert re.search(r"non-root", text, re.I) and "10001" in text
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="the non-root e2e needs a non-root test runner (CI runs as non-root); "
+    "the Dockerfile/compose contract tests pin USER + hardening statically",
+)
+def test_container_cmd_serves_coop_and_shuts_down_gracefully_as_non_root(tmp_path, monkeypatch) -> None:
+    """Positive path: the container CMD (`tc daemon start` with the shipped
+    settings, only data_dir/port redirected) starts as the current non-root
+    user, serves the Coop, runs a job end to end, and shuts down gracefully
+    on SIGTERM."""
+    assert os.geteuid() != 0
+    port = free_port()
+    settings_file = _container_settings(tmp_path, port)
+    monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(settings_file))
+    settings = load_settings(settings_file)
+    assert settings.coop_enabled and settings.coop_host == "0.0.0.0"  # as shipped
+
+    bin_path = tmp_path / "fake-vibe"
+    bin_path.write_text(FAKE_VIBE)
+    bin_path.chmod(0o755)
+    monkeypatch.setenv("TURBOCHICKENS_VIBE_BIN", str(bin_path))
+
+    env = dict(os.environ)
+    job = write_job(tmp_path, "nonroot-job")
+    base = f"http://127.0.0.1:{port}"
+
+    daemon = _DaemonProc(env)
+    try:
+        daemon.wait_socket(settings)
+        # the daemon really runs non-root: the socket it created on disk is
+        # owned by the (non-root) uid of this test process
+        assert os.stat(settings.socket_path).st_uid == os.geteuid() != 0
+        token = daemon.token()
+        auth = {"Authorization": f"Bearer {token}"}
+        c = httpx.Client(base_url=base, timeout=5.0)
+
+        # healthcheck + GUI served; /api/* behind the bearer
+        assert c.get("/api/ping").status_code == 200
+        page = c.get("/")
+        assert page.status_code == 200 and "TurboChickens" in page.text
+        assert c.get("/api/status").status_code == 401
+        st = c.get("/api/status", headers=auth)
+        assert st.status_code == 200 and st.json()["coop"]["auth_required"] is True
+        assert token not in settings.audit_log_path.read_text()
+
+        # one full run as the non-root user: egg queued → hatched (workspace
+        # under the data dir) → clutch in the nest box → attested teardown
+        r = c.post("/api/runs", headers=auth, json={"spec_path": str(job)})
+        assert r.status_code == 200 and r.json()["ok"], r.text
+        run_id = r.json()["run_id"]
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            show = c.get(f"/api/runs/{run_id}", headers=auth).json()
+            if show["run"]["status"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.2)
+        assert show["run"]["status"] == "succeeded", show
+        res = c.get(f"/api/results/{run_id}", headers=auth)
+        assert res.status_code == 200 and res.json()["ok"] is True
+        assert res.json()["output"]["message"] == "hello from fake vibe"
+        # the abattoir removed the workspace
+        assert not (settings.data_dir / "workspaces" / run_id).exists()
+    finally:
+        daemon.stop()
+    # graceful shutdown as non-root: SIGTERM → exit 0, exactly one token
+    # line, and the HTTP port refuses connections afterwards
+    assert daemon.proc.returncode == 0
+    assert len(daemon.token_lines()) == 1
+    with pytest.raises(httpx.ConnectError):
+        httpx.get(f"{base}/api/ping", timeout=2.0)

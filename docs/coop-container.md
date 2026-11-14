@@ -54,6 +54,43 @@ docker run -p 8737:8737 -v coop-data:/data coop
 docker compose -f docker/compose.yaml up -d --build
 ```
 
+## Non-root, hardened runtime (spec 32 / G12)
+
+The image itself never runs as root: the Dockerfile creates the unprivileged
+**coop** user (uid/gid **10001**, no login shell, no home) and switches to it
+with `USER coop`, and `/data` is owned by that user so a named volume mounted
+there is writable by the non-root daemon. `docker/compose.yaml` layers the
+runtime hardening on top — the same properties you get with plain
+`docker run` flags:
+
+```sh
+docker run --name coop -d -p 8737:8737 -v coop-data:/data \
+  --user 10001:10001 \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --read-only --tmpfs /tmp \
+  --init \
+  --memory 1g --cpus 2 \
+  coop
+```
+
+| Property | Where | Effect |
+|---|---|---|
+| non-root `USER coop` (10001:10001) | Dockerfile + compose `user:` | a coop compromise is not root |
+| `cap_drop: ALL` | compose `--cap-drop ALL` | no Linux capabilities at all |
+| `no-new-privileges:true` | compose `security_opt` | setuid/file-caps can never re-elevate |
+| `read_only: true` + `tmpfs: /tmp` | compose `--read-only --tmpfs /tmp` | root filesystem immutable; scratch only in `/tmp` |
+| `init: true` | compose `--init` | tini is PID 1 and reaps orphaned children (the daemon is not an un-reaping PID 1) |
+| `mem_limit: 1g`, `cpus: "2"` | compose `--memory 1g --cpus 2` | a runaway flock cannot OOM or starve the host |
+
+With the read-only root filesystem, every write goes to the two writable
+places: the `/data` volume (socket, DB, Headcount, clutches, uploads, seats,
+workspaces — all under `data_dir`, see below) and the `/tmp` tmpfs. The image
+also sets `PYTHONDONTWRITEBYTECODE=1`, so the interpreter never needs to
+write next to the installed package. Shutdown stays graceful: `docker stop`
+sends SIGTERM to the daemon, which tears the coop down and exits 0 (with
+`init: true` the signal is reaped correctly even if children linger).
+
 ## The `/data` volume — the coop's memory
 
 Everything stateful lives **only** under the data dir (`data_dir = "/data"` in
@@ -160,6 +197,10 @@ the CMD is just `tc daemon start` with the shipped settings):
 docker build -t coop .
 docker run --name coop -d -p 8737:8737 -v coop-data:/data coop
 
+# 0. the container runs non-root and hardened
+docker exec coop id -u                            # 10001
+docker inspect coop --format '{{.HostConfig.CapDrop}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.SecurityOpt}}'
+
 # 1. GUI is served; healthcheck goes green
 docker ps                                   # coop: (healthy)
 curl -s http://localhost:8737/api/ping      # 200, unauthenticated
@@ -190,3 +231,5 @@ docker logs coop | grep -c "coop auth token:"   # 1 again (new ephemeral token)
 `coop_port = 8737`, `data_dir = "/data"`. No extra process, no second coopd,
 no extra UI: the GUI is served by coopd itself in the same event loop,
 and every GUI action is a thin mirror of the existing Unix-socket ops.
+The process runs as the non-root `coop` user (10001:10001) — see the
+hardened-runtime section above.
