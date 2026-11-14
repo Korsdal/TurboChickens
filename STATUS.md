@@ -1910,6 +1910,10 @@ slice map (22–31) are complete; what remains is the post-MVP roadmap in
 baseline §13.
 
 **Next items (the next session starts here):**
+- Code review + documentation pass — the next task: a full code review of the
+  repo, then the missing top-level docs — `ARCHITECTURE.md`, `SECURITY.md`,
+  `CONTRIBUTING.md`, `NOTICE`, `LICENSE`, an SBOM — and a catchy
+  chicken-themed `README.md`.
 - Local test of the container and the UI — build the coop image and run it
   locally, then click through the GUI (including the new Auth view); the
   spec-18 container smoke ran on a real Docker daemon in-session, this is the
