@@ -79,6 +79,7 @@ from turbochickens.chaining import (
     parse_nestbox_uri,
     resolve_nestbox_clutch,
 )
+from turbochickens.fence import UnsafeRefError, contained_ref
 from turbochickens.providers import ProvidersConfig, ProvidersError, load_providers
 from turbochickens.seat import SeatBroker
 from turbochickens.settings import Settings
@@ -193,9 +194,24 @@ class RunPipeline:
         cannot be bypassed by chaining) and the resolved chaining sources for
         the manifest (injected trajectory state is post-MVP)."""
         ws = ctx.workspace
-        ws.mkdir(parents=True, exist_ok=True)
         spec_dir = ctx.spec_path.parent
-        prompt_src = spec_dir / ctx.spec.input.prompt_file
+        # spec 32 (G1): defensive re-check at the fence BEFORE any file is
+        # copied or read — Candling already enforced containment, but the egg
+        # on disk may have changed since, so every host-path ref (prompt,
+        # plain attachments, schema) is re-contained here. An escaping ref
+        # (`..`, absolute, backslash, symlink out of the egg dir) raises
+        # UnsafeRefError and fails the run closed at provisioning with a
+        # field-named Fox refusal — nothing lands in the workspace.
+        prompt_src = contained_ref(spec_dir, ctx.spec.input.prompt_file, "input.prompt_file")
+        contained_ref(spec_dir, ctx.spec.output.schema_file, "output.schema_file")
+        plain_sources: dict[str, tuple[Path, str]] = {}
+        for att in ctx.spec.input.attachments:
+            if parse_nestbox_uri(att) is None:
+                plain_sources[att] = (
+                    contained_ref(spec_dir, att, "input.attachments"),
+                    attachment_workspace_name(att),
+                )
+        ws.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(prompt_src, ws / "prompt.txt")
         injected = prompt_src.stat().st_size
         chaining: list[dict[str, Any]] = []
@@ -217,8 +233,8 @@ class RunPipeline:
                         }
                     )
                 else:
-                    src = spec_dir / att
-                    shutil.copyfile(src, ws / attachment_workspace_name(att))
+                    src, name = plain_sources[att]
+                    shutil.copyfile(src, ws / name)
                     injected += src.stat().st_size
         except NestboxError as e:
             e.injected_bytes = injected
@@ -489,12 +505,16 @@ class RunPipeline:
                         f"chained clutch from chicken {c['run_id']}: {c['attachment']}"
                         f" → {attachment_workspace_name(c['attachment'])} ({c['size_bytes']} bytes)",
                     )
-            except NestboxError as e:
+            except (NestboxError, UnsafeRefError) as e:
                 # spec 25 fail-closed: a quarantined / composted / missing /
                 # malformed clutch fails the run at provisioning, before any
-                # harness work — attested teardown as usual
+                # harness work — attested teardown as usual.
+                # spec 32 (G1): the same for a spec ref that crosses the fence
+                # at the Hatchery re-check — nothing was copied, nothing is
+                # shipped to the feeder, the run fails closed at provisioning
                 provision_error = str(e)
-                budget["injected_context_bytes"] = e.injected_bytes
+                if isinstance(e, NestboxError):
+                    budget["injected_context_bytes"] = e.injected_bytes
                 status, reason = "failed", f"provisioning failed: {e}"
                 await self._event(run_id, "supervisor", "error", sanitize_log_line(reason))
             cap_bytes = spec.resources.max_context_mb * 1024 * 1024
@@ -588,7 +608,11 @@ class RunPipeline:
                     await self._event(run_id, "supervisor", "error", reason)
                 else:
                     # spec 04: raw output is untrusted until it passes the job schema
-                    schema_path = ctx.spec_path.parent / ctx.spec.output.schema_file
+                    # spec 32 (G1): re-check the fence right before the schema
+                    # file is read — an escaping ref fails the run closed here
+                    schema_path = contained_ref(
+                        ctx.spec_path.parent, ctx.spec.output.schema_file, "output.schema_file"
+                    )
                     outcome = validate_output(result.raw_output, schema_path)
                     if outcome.valid:
                         await self._store_result(run_id, outcome)
