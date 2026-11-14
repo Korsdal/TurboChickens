@@ -4,12 +4,12 @@
 
 **Blocked by:** 26 (Farmhand server + settings block), 28 (connectors registry + socket ops)
 
-**Status:** ready-for-agent (split from spec 21 via to-tickets, 2026-11-14)
+**Status:** done (2026-11-14)
 
-- [ ] Farmhand view: active transport mode(s), HTTPS `/mcp` URL, exposed tools list, copy-paste client config snippets (stdio command; HTTPS URL + "send the coop bearer" note); settings form to switch `farmhand_transport` among `stdio`/`https`/`both` with `extra=forbid` validation server-side
-- [ ] The bearer token never appears in any Farmhand view payload, page markup, or client-config snippet
-- [ ] Connectors view: list (name + transport + non-secret summary), add form (name, transport=stdio → command/args/env, or transport=https → url), remove action; inline errors for unknown-transport or missing-field entries; changes audit-logged via the socket ops
-- [ ] Nav: sidebar gains Farmhand and Connectors entries (design system, spec 00)
-- [ ] All new `/api/*` endpoints mirror their socket ops exactly, with dead-socket `200 {ok:false, daemon.up:false}` and bearer 401 handling like specs 12–19
-- [ ] Tests: HTTP parity for every new endpoint, served-markup smoke for both views, secrecy assertion (no bearer/token material in any response); full suite green
-- [ ] `STATUS.md` updated at the slice boundary — this completes the spec 21 slice map
+- [x] Farmhand view: active transport mode(s), HTTPS `/mcp` URL, exposed tools list, copy-paste client config snippets (stdio command; HTTPS URL + "send the coop bearer" note); settings form to switch `farmhand_transport` among `stdio`/`https`/`both` with `extra=forbid` validation server-side
+- [x] The bearer token never appears in any Farmhand view payload, page markup, or client-config snippet
+- [x] Connectors view: list (name + transport + non-secret summary), add form (name, transport=stdio → command/args/env, or transport=https → url), remove action; inline errors for unknown-transport or missing-field entries; changes audit-logged via the socket ops
+- [x] Nav: sidebar gains Farmhand and Connectors entries (design system, spec 00)
+- [x] All new `/api/*` endpoints mirror their socket ops exactly, with dead-socket `200 {ok:false, daemon.up:false}` and bearer 401 handling like specs 12–19
+- [x] Tests: HTTP parity for every new endpoint, served-markup smoke for both views, secrecy assertion (no bearer/token material in any response); full suite green
+- [x] `STATUS.md` updated at the slice boundary — this completes the spec 21 slice map

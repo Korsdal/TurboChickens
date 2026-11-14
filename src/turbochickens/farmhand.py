@@ -116,6 +116,49 @@ def spec_bundle_b64(spec_path: Path) -> dict[str, str]:
 SUB_SCOPE_EXCLUDED = ("jobs_validate", "run_rerun", "schedule_add", "schedule_list", "schedule_rm", "settings_get")
 
 
+async def farmhand_tool_surface(settings: Settings) -> list[dict[str, str]]:
+    """The Farmhand's exposed tool surface (name + description per tool), read
+    straight off a server built for the operator (full scope — a sub-chicken's
+    narrowed set is a runtime concern, not shown here). Used by the spec-31
+    ``farmhand_info`` socket op so the GUI's tool list can never drift from
+    the real tools."""
+    server = build_server(settings)
+    return [{"name": t.name, "description": t.description or ""} for t in await server.list_tools()]
+
+
+def client_config_snippets(https_url: str | None) -> dict[str, Any]:
+    """Ready-to-paste MCP client configs for the Farmhand (spec 31): the stdio
+    command ``tc farmhand serve --transport stdio``, and — when the coop serves
+    the HTTPS endpoint — the streamable-HTTP URL with a *placeholder* bearer
+    header. The real coop token is never included, not even here."""
+    stdio = {
+        "mcpServers": {
+            FARMHAND_NAME: {"command": "tc", "args": ["farmhand", "serve", "--transport", "stdio"]}
+        }
+    }
+    https: dict[str, Any] | None = None
+    if https_url:
+        https = {
+            "mcpServers": {
+                FARMHAND_NAME: {
+                    "url": https_url,
+                    # placeholder only — the token itself is never served anywhere
+                    "headers": {"Authorization": "Bearer <coop token>"},
+                }
+            }
+        }
+    return {
+        "stdio": stdio,
+        "https": https,
+        "https_note": (
+            "send the coop bearer as Authorization: Bearer <token> when the coop requires auth —"
+            " the token itself is never served, printed (beyond the one-time startup line), or audited"
+        )
+        if https_url
+        else None,
+    }
+
+
 def farmhand_serve_command() -> tuple[str, list[str]]:
     """The command spawning the Farmhand over stdio: ``tc farmhand serve
     --transport stdio`` via the ``tc`` entry point sitting next to the

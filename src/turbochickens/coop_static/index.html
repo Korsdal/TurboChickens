@@ -30,6 +30,8 @@
         <a href="#/audit" data-view="audit"><img class="icon" src="/icons/list.svg" alt="" width="18" height="18">Headcount</a>
         <a href="#/settings" data-view="settings"><img class="icon" src="/icons/settings.svg" alt="" width="18" height="18">Settings</a>
         <a href="#/auth" data-view="auth"><img class="icon" src="/icons/key-round.svg" alt="" width="18" height="18">Perch</a>
+        <a href="#/farmhand" data-view="farmhand"><img class="icon" src="/icons/bot.svg" alt="" width="18" height="18">Farmhand</a>
+        <a href="#/connectors" data-view="connectors"><img class="icon" src="/icons/plug.svg" alt="" width="18" height="18">Gates</a>
       </nav>
       <div class="sidebar-foot">
         <span class="pill" id="daemon-pill" title="coop status"><span class="pill-dot" id="pill-dot"></span><span id="pill-text">coop · …</span></span>
@@ -405,6 +407,130 @@
               <tbody id="access-scope-tbody"></tbody>
             </table>
           </div>
+        </section>
+
+        <section class="view" id="view-farmhand" hidden aria-labelledby="farmhand-heading">
+          <header class="view-header" data-enter>
+            <div>
+              <h2 id="farmhand-heading">Farmhand</h2>
+              <p class="intro">The hired helper — MCP chores through coopd's own socket ops — polling every 2&nbsp;s.</p>
+            </div>
+            <form class="view-actions farmhand-form" id="farmhand-form" novalidate>
+              <label for="fh-transport">Transport</label>
+              <select id="fh-transport" name="farmhand_transport">
+                <option value="stdio">stdio</option>
+                <option value="https">https</option>
+                <option value="both">both</option>
+              </select>
+              <button type="submit" class="btn btn-primary" id="fh-save">Save transport</button>
+            </form>
+          </header>
+          <p class="field-error view-error" id="farmhand-error" hidden></p>
+
+          <div class="card farmhand-card" id="farmhand-card" hidden>
+            <div class="card-head">
+              <h3>Transports</h3>
+              <p class="muted" id="farmhand-summary">—</p>
+            </div>
+            <dl class="settings-list" id="farmhand-list"></dl>
+          </div>
+          <div class="card empty-state" id="farmhand-empty"><p>Farmhand unavailable.</p></div>
+
+          <div class="card table-card" id="farmhand-tools-card" hidden>
+            <div class="card-head">
+              <h3>Exposed tools</h3>
+              <p class="muted" id="farmhand-tools-count">—</p>
+            </div>
+            <table class="data-table">
+              <thead>
+                <tr><th scope="col">Tool</th><th scope="col">Chore</th></tr>
+              </thead>
+              <tbody id="farmhand-tools-tbody"></tbody>
+            </table>
+          </div>
+
+          <div class="card snippet-card" id="farmhand-snippet-card" hidden>
+            <div class="card-head">
+              <h3>MCP client config</h3>
+              <p class="muted">Paste into your MCP client. The bearer below is a placeholder — the coop token itself never appears on this page.</p>
+            </div>
+            <div class="pane-bar"><span class="muted">stdio — same machine</span><button type="button" class="btn btn-secondary btn-copy" data-copy-target="fh-snippet-stdio">Copy</button></div>
+            <pre class="mono data-pane" id="fh-snippet-stdio"></pre>
+            <div class="pane-bar"><span class="muted">https — the coop endpoint</span><button type="button" class="btn btn-secondary btn-copy" data-copy-target="fh-snippet-https">Copy</button></div>
+            <pre class="mono data-pane" id="fh-snippet-https"></pre>
+          </div>
+        </section>
+
+        <section class="view" id="view-connectors" hidden aria-labelledby="connectors-heading">
+          <header class="view-header" data-enter>
+            <div>
+              <h2 id="connectors-heading">Gates</h2>
+              <p class="intro">Registered connectors — openings in the fence to outside tool services — polling every 2&nbsp;s.</p>
+            </div>
+          </header>
+
+          <div class="card gate-form-card" id="gate-form-card">
+            <div class="card-head">
+              <h3>Register a gate</h3>
+              <p class="muted">A gate is registered here; a chicken opts in per egg via <span class="mono">harness.connectors</span>. Env/header values may be <span class="mono">$REFS</span> — they stay at rest and are never served.</p>
+            </div>
+            <form class="gate-form" id="gate-form" novalidate>
+              <div class="gate-grid">
+                <div class="upload-field">
+                  <label for="gate-name">Name</label>
+                  <input id="gate-name" class="mono" type="text" autocomplete="off" spellcheck="false" required>
+                  <p class="field-error" id="gate-name-error" hidden></p>
+                </div>
+                <div class="upload-field">
+                  <label for="gate-transport">Transport</label>
+                  <select id="gate-transport">
+                    <option value="stdio">stdio</option>
+                    <option value="https">https</option>
+                  </select>
+                </div>
+                <div class="upload-field" data-for="stdio">
+                  <label for="gate-command">Command</label>
+                  <input id="gate-command" class="mono" type="text" autocomplete="off" spellcheck="false">
+                  <p class="field-error" id="gate-command-error" hidden></p>
+                </div>
+                <div class="upload-field" data-for="stdio">
+                  <label for="gate-args">Args (comma-separated)</label>
+                  <input id="gate-args" class="mono" type="text" autocomplete="off" spellcheck="false">
+                  <p class="field-error" id="gate-args-error" hidden></p>
+                </div>
+                <div class="upload-field" data-for="stdio">
+                  <label for="gate-env">Env — one KEY=VALUE per line</label>
+                  <textarea id="gate-env" class="mono" rows="3" spellcheck="false"></textarea>
+                  <p class="field-error" id="gate-env-error" hidden></p>
+                </div>
+                <div class="upload-field" data-for="https">
+                  <label for="gate-url">URL</label>
+                  <input id="gate-url" class="mono" type="text" autocomplete="off" spellcheck="false">
+                  <p class="field-error" id="gate-url-error" hidden></p>
+                </div>
+                <div class="upload-field" data-for="https">
+                  <label for="gate-headers">Headers — one KEY=VALUE per line</label>
+                  <textarea id="gate-headers" class="mono" rows="3" spellcheck="false"></textarea>
+                  <p class="field-error" id="gate-headers-error" hidden></p>
+                </div>
+              </div>
+              <p class="field-error upload-error" id="gate-error" hidden></p>
+              <div class="upload-actions">
+                <button type="submit" class="btn btn-primary" id="gate-submit">Register gate</button>
+              </div>
+            </form>
+          </div>
+
+          <p class="field-error view-error" id="connectors-error" hidden></p>
+          <div class="card table-card" id="connectors-card" hidden>
+            <table class="data-table">
+              <thead>
+                <tr><th scope="col">Gate</th><th scope="col">Transport</th><th scope="col">Summary</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr>
+              </thead>
+              <tbody id="connectors-tbody"></tbody>
+            </table>
+          </div>
+          <div class="card empty-state" id="connectors-empty"><p>No gates registered yet — register one above, or with <span class="mono">tc connectors add …</span>.</p></div>
         </section>
       </div>
     </main>

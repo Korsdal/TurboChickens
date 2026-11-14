@@ -74,6 +74,22 @@ same listener also serves the Farmhand MCP endpoint — streamable-HTTP at
 ``farmhand_https_path`` (default ``/mcp``), mounted via a small ASGI bridge
 into this aiohttp app and behind the same bearer middleware as ``/api/*``
 (loopback-open rule included).
+
+Spec 31 (the Farmhand & Connectors GUI views) adds ``GET /api/farmhand`` — a
+thin mirror of the new ``farmhand_info`` socket op (active transport(s), the
+HTTPS endpoint URL on the coop host + whether it is mounted, bearer-required
+flag, the exposed tool list, and ready-to-paste client-config snippets whose
+bearer header is a placeholder only — the token never appears in any payload)
+— and ``POST /api/settings``, the mirror of the new ``settings_set`` op behind
+the Farmhand view's transport form (200 with the fresh ``settings_get``
+payload, 422 with field-named errors on an invalid or read-only update — the
+server re-validates through the ``Settings`` model with ``extra="forbid"``
+intact — 400 on a malformed body, and the structured daemon-down payload (200)
+when the socket is dead). The Farmhand MCP route is now always registered at
+``farmhand_https_path``; the handler answers 404 while
+``farmhand_transport`` excludes ``"https"``, and ``set_farmhand_transport``
+mounts/unmounts the endpoint at runtime when the operator switches the
+transport through ``settings_set``.
 """
 
 from __future__ import annotations
@@ -239,10 +255,15 @@ class CoopServer:
         app.router.add_post("/api/auth/login", self._api_auth_login)
         app.router.add_post("/api/auth/login/status", self._api_auth_login_status)
         app.router.add_post("/api/auth/logout", self._api_auth_logout)
-        # spec 26: the Farmhand MCP endpoint (streamable-HTTP) at farmhand_https_path
-        if self.farmhand is not None:
-            app.router.add_route("*", self.farmhand.path, self.farmhand.handler)
-            app.router.add_route("*", self.farmhand.path + "/", self.farmhand.handler)
+        # spec 31: the Farmhand view + runtime settings updates from the GUI
+        app.router.add_get("/api/farmhand", self._api_farmhand_info)
+        app.router.add_post("/api/settings", self._api_settings_set)
+        # spec 26/31: the Farmhand MCP endpoint (streamable-HTTP) at
+        # farmhand_https_path — always routed; the handler answers 404 while
+        # farmhand_transport excludes "https" (set_farmhand_transport can mount
+        # or unmount it at runtime via settings_set)
+        app.router.add_route("*", self.settings.farmhand_https_path, self._api_farmhand_mcp)
+        app.router.add_route("*", self.settings.farmhand_https_path + "/", self._api_farmhand_mcp)
         app.router.add_get("/", self._index)
         app.router.add_get("/{tail:.*}", self._static_file)
         await self._runner.setup()
@@ -260,6 +281,22 @@ class CoopServer:
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
+
+    async def set_farmhand_transport(self, transport: str) -> None:
+        """Spec 31: mount/unmount the Farmhand HTTPS endpoint when the operator
+        switches ``farmhand_transport`` at runtime (the ``settings_set`` op).
+        Mounting is lazy — the endpoint only exists while the transport includes
+        ``"https"``; otherwise the (always-registered) route answers 404."""
+        wants_https = transport in ("https", "both")
+        if wants_https and self.farmhand is None:
+            from turbochickens.farmhand import FarmhandHTTP  # lazy: farmhand imports coop
+
+            self.farmhand = FarmhandHTTP(self.settings)
+            await self.farmhand.start()
+        elif not wants_https and self.farmhand is not None:
+            with contextlib.suppress(Exception):
+                await self.farmhand.stop()
+            self.farmhand = None
 
     # --- auth ---------------------------------------------------------------
 
@@ -742,6 +779,65 @@ class CoopServer:
         """POST /api/auth/logout {provider} — delete the provider's stored
         seat session (audited as perch.released); 422 when none is stored."""
         return await self._api_auth_mutation(request, "auth_logout")
+
+    # --- spec 31: the Farmhand view + runtime settings updates from the GUI ----
+
+    async def _api_farmhand_info(self, request: web.Request) -> web.Response:
+        """GET /api/farmhand — the Farmhand view's data: active transport(s),
+        the HTTPS endpoint on the coop host (mounted or not), the
+        bearer-required flag, the exposed tool list, and the client-config
+        snippets (placeholder bearer only — the token is never in the payload).
+        Thin mirror of the ``farmhand_info`` socket op; the structured
+        daemon-down payload (200) when the socket is dead."""
+        return await self._mirror("farmhand_info")
+
+    async def _api_settings_set(self, request: web.Request) -> web.Response:
+        """POST /api/settings — apply one runtime settings update (the Farmhand
+        view's transport form). The body is a JSON object of setting updates,
+        forwarded to the ``settings_set`` socket op: 200 with the fresh
+        ``settings_get`` payload, 422 with the field-named errors when the
+        update is invalid (the server re-validates through the Settings model
+        with ``extra="forbid"`` intact) or read-only at runtime, 400 on a
+        malformed body, and the structured daemon-down payload (200, never a
+        500) when the socket is dead."""
+        body, err = await self._json_body(request)
+        if err is not None:
+            return err
+        if not isinstance(body, dict) or not body:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "op": "settings_set",
+                    "error": 'POST /api/settings needs a JSON object of setting updates, e.g. {"farmhand_transport": "https"}',
+                },
+                status=400,
+            )
+        payload = {k: v for k, v in body.items() if k not in ("op", "protocol")}
+        resp, down = await self._call("settings_set", **payload)
+        if down is not None:
+            return down
+        assert resp is not None
+        return web.json_response(resp, status=200 if resp.get("ok") else 422)
+
+    async def _api_farmhand_mcp(self, request: web.Request) -> web.Response:
+        """The Farmhand MCP endpoint (spec 26) at ``farmhand_https_path`` on
+        this listener — always routed, but it answers 404 while
+        ``farmhand_transport`` excludes ``"https"`` (the endpoint is not
+        mounted then; ``set_farmhand_transport`` mounts/unmounts it at
+        runtime, spec 31). Behind the same bearer rule as ``/api/*`` when
+        mounted (see _auth_middleware)."""
+        if self.farmhand is None:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": (
+                        "the Farmhand HTTPS endpoint is not served while"
+                        f" farmhand_transport={self.settings.farmhand_transport!r}"
+                    ),
+                },
+                status=404,
+            )
+        return await self.farmhand.handler(request)
 
     # --- static SPA ----------------------------------------------------------
 

@@ -105,6 +105,20 @@ abattoir's attested teardown already removed the workspace. Paths are locked
 inside that run's workspace (traversal refused) and the chicken's private
 harness config (``.vibe/``, the farmhand settings file) is never served — see
 ``beak.py`` for the pure seam.
+
+Spec 31 (the Farmhand & Connectors GUI views) adds ``farmhand_info`` — the
+Farmhand view's payload: active transport(s), the HTTPS endpoint URL on the
+coop host, whether it is currently mounted, whether the coop requires the
+bearer, the exposed tool list (read straight off the built MCP server, so the
+GUI can never drift from the real tools), and ready-to-paste client-config
+snippets whose bearer header is a placeholder only (the token is never in any
+payload) — and ``settings_set``, the runtime settings update behind the view's
+transport form: the patch is re-validated server-side through the ``Settings``
+model with ``extra="forbid"`` semantics (an unknown key is a field-named
+error, never silently ignored), only ``MUTABLE_SETTINGS_FIELDS`` may change
+(everything else is read-only at runtime), the change is audited as
+``settings.changed``, and the coop mounts/unmounts the Farmhand HTTPS endpoint
+when ``farmhand_transport`` crosses the https boundary.
 """
 
 from __future__ import annotations
@@ -168,6 +182,10 @@ AUDIT_TAIL_MAX = 1000
 
 #: spec 15 `jobs_upload` bound on the number of files in one bundle
 UPLOAD_MAX_FILES = 200
+
+#: spec 31 `settings_set`: the settings mutable at runtime from the GUI (the
+#: Farmhand view's transport switch). Everything else stays read-only there.
+MUTABLE_SETTINGS_FIELDS = ("farmhand_transport",)
 
 PROTOCOL_VERSION = 1
 
@@ -435,6 +453,11 @@ class Daemon:
             return self._audit_tail(req)
         if op == "settings_get":
             return self._settings_get()
+        # spec 31: the Farmhand view's info + runtime settings updates from the GUI
+        if op == "farmhand_info":
+            return await self._farmhand_info()
+        if op == "settings_set":
+            return await self._settings_set(req)
         # spec 19: auth & access management for the GUI
         if op == "auth_providers":
             return self._auth_providers()
@@ -1355,6 +1378,100 @@ class Daemon:
             "ok": True,
             "op": "settings_get",
             "protocol": PROTOCOL_VERSION,
+            "settings": {**self.settings.public_dict(), "coop": self._coop_block()},
+        }
+
+    # --- spec 31: the Farmhand view + runtime settings updates from the GUI ----
+
+    async def _farmhand_info(self) -> dict[str, Any]:
+        """The Farmhand view's payload (spec 31): the active transport mode(s)
+        from ``farmhand_transport``, the HTTPS endpoint (``farmhand_https_path``
+        on the coop host) and whether it is currently mounted, whether the coop
+        requires the bearer, the exposed tool list (introspected from the MCP
+        server built for the operator — the full 17-tool scope), and
+        ready-to-paste client-config snippets. The bearer token never appears:
+        the https snippet carries a placeholder header only."""
+        from turbochickens.farmhand import TRANSPORTS, client_config_snippets, farmhand_tool_surface
+
+        s = self.settings
+        coop = self._coop_block()
+        transport = s.farmhand_transport
+        transports = [t for t in TRANSPORTS if t != "both" and (transport == "both" or t == transport)]
+        https_url = s.coop_url.rstrip("/") + s.farmhand_https_path if s.coop_enabled else None
+        return {
+            "ok": True,
+            "op": "farmhand_info",
+            "protocol": PROTOCOL_VERSION,
+            "transport": transport,
+            "transports": transports,
+            "https_path": s.farmhand_https_path,
+            "https_url": https_url,
+            "https_mounted": self.coop is not None and transport in ("https", "both"),
+            "coop_enabled": bool(coop.get("enabled")),
+            "auth_required": bool(coop.get("auth_required")),
+            "tools": await farmhand_tool_surface(s),
+            "stdio_command": {"command": "tc", "args": ["farmhand", "serve", "--transport", "stdio"]},
+            "client_config": client_config_snippets(https_url),
+        }
+
+    async def _settings_set(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Apply one runtime settings update from the GUI (spec 31 — the
+        Farmhand view's transport form). The patch is re-validated server-side
+        through the ``Settings`` model, so ``extra="forbid"`` stays intact: an
+        unknown key (e.g. ``max_tokens``) is a field-named error, never
+        silently ignored. Only ``MUTABLE_SETTINGS_FIELDS`` may actually change;
+        every other key is read-only at runtime (field-named refusal). When
+        ``farmhand_transport`` changes, the coop mounts/unmounts the Farmhand
+        HTTPS endpoint accordingly. The change is audited as
+        ``settings.changed`` (field names + the new values — none of them
+        secret), and the response is the fresh ``settings_get`` payload (the
+        coop token is never included)."""
+        patch = {k: v for k, v in req.items() if k not in ("op", "protocol")}
+        if not patch or not all(isinstance(k, str) and k for k in patch):
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": 'settings_set requires a JSON object of setting updates, e.g. {"farmhand_transport": "https"}',
+            }
+        merged = self.settings.model_dump(mode="json")
+        merged.update(patch)
+        try:
+            validated = Settings.model_validate(merged)
+        except ValidationError as e:
+            errors = [
+                {"field": ".".join(str(x) for x in err["loc"]) or "<root>", "message": err["msg"]}
+                for err in e.errors()
+            ]
+            return {"ok": False, "valid": False, "protocol": PROTOCOL_VERSION, "errors": errors}
+        read_only = sorted(k for k in patch if k not in MUTABLE_SETTINGS_FIELDS)
+        if read_only:
+            errors = [
+                {
+                    "field": f"settings.{k}",
+                    "message": (
+                        f"{k} is read-only at runtime — mutable from the GUI:"
+                        f" {', '.join(MUTABLE_SETTINGS_FIELDS)}"
+                    ),
+                }
+                for k in read_only
+            ]
+            return {"ok": False, "valid": False, "protocol": PROTOCOL_VERSION, "errors": errors}
+        changed: dict[str, Any] = {}
+        for k in MUTABLE_SETTINGS_FIELDS:
+            if k in patch and getattr(self.settings, k) != getattr(validated, k):
+                changed[k] = getattr(validated, k)
+                setattr(self.settings, k, getattr(validated, k))
+        if "farmhand_transport" in changed and self.coop is not None:
+            # mount/unmount the Farmhand HTTPS endpoint on the coop listener
+            await self.coop.set_farmhand_transport(self.settings.farmhand_transport)
+        if changed:
+            assert self.audit is not None
+            self.audit.append({"event": "settings.changed", "changes": changed})
+        return {
+            "ok": True,
+            "op": "settings_set",
+            "protocol": PROTOCOL_VERSION,
+            "changed": changed,
             "settings": {**self.settings.public_dict(), "coop": self._coop_block()},
         }
 

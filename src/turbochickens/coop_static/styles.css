@@ -702,6 +702,63 @@ html, body {
 .cost-item { display: flex; align-items: baseline; gap: 4px; flex-wrap: wrap; }
 .cost-item .linklike { font-size: 13px; }
 
+/* --- spec 31: farmhand view (transport form, transports card, tools, snippets) --- */
+
+.farmhand-form { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; padding-bottom: 6px; }
+.farmhand-form label { font-size: 13px; font-weight: 500; color: var(--p-muted); padding-bottom: 2px; }
+.farmhand-form select {
+  height: 44px;
+  min-width: 140px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-s);
+  background: var(--p-bg);
+  color: var(--p-ink);
+  font-size: 13px;
+  padding: 0 14px;
+}
+.farmhand-form select:focus-visible { outline: 2px solid var(--p-action); outline-offset: 1px; }
+.farmhand-card { padding: 8px 0; margin-bottom: 24px; }
+.card-head { padding: 20px 24px 0; }
+.card-head h3 { margin: 0 0 4px; font-size: 20px; font-weight: 500; letter-spacing: -0.01em; }
+.card-head p { margin: 0; font-size: 14px; color: var(--p-muted); }
+.farmhand-card .settings-list { margin-top: 8px; }
+#farmhand-tools-card { margin-bottom: 24px; }
+#farmhand-tools-card .card-head { padding-bottom: 8px; }
+.snippet-card { padding: 20px 24px; }
+.snippet-card .data-pane { margin-bottom: 16px; }
+.gate-summary { overflow-wrap: anywhere; max-width: 560px; }
+
+/* --- spec 31: connectors view (gates): register form + table --- */
+
+.gate-form-card { padding: 20px 24px; margin-bottom: 24px; }
+.gate-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px 24px; margin-top: 18px; }
+.gate-grid .upload-field[hidden] { display: none; }
+.gate-form textarea {
+  width: 100%;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-s);
+  background: var(--p-bg);
+  color: var(--p-ink);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 10px 14px;
+  resize: vertical;
+}
+.gate-form textarea:focus-visible { outline: 2px solid var(--p-action); outline-offset: 1px; }
+.gate-form .upload-field select {
+  height: 48px;
+  width: 100%;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-s);
+  background: var(--p-bg);
+  color: var(--p-ink);
+  font-size: 13px;
+  padding: 0 14px;
+}
+.gate-form .upload-field select:focus-visible,
+.gate-form .upload-field input:focus-visible { outline: 2px solid var(--p-action); outline-offset: 1px; }
+.gate-remove { font-size: 13px; }
+
 /* --- settings: read-only rows --- */
 
 .settings-card { padding: 8px 0; }

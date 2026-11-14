@@ -6,8 +6,8 @@
 
   const TOKEN_KEY = "tc.coop.token";
   const POLL_MS = 2000;
-  const VIEWS = ["dashboard", "runs", "jobs", "schedules", "stats", "audit", "settings", "auth"];
-  const VIEW_LOADERS = { dashboard: loadStatus, runs: loadRuns, jobs: loadJobs, schedules: loadSchedules, stats: loadStats, audit: loadAudit, settings: loadSettings, auth: loadAuth };
+  const VIEWS = ["dashboard", "runs", "jobs", "schedules", "stats", "audit", "settings", "auth", "farmhand", "connectors"];
+  const VIEW_LOADERS = { dashboard: loadStatus, runs: loadRuns, jobs: loadJobs, schedules: loadSchedules, stats: loadStats, audit: loadAudit, settings: loadSettings, auth: loadAuth, farmhand: loadFarmhand, connectors: loadConnectors };
 
   const RUN_STATUSES = ["queued", "provisioning", "running", "collecting", "finalizing", "succeeded", "failed", "cancelled", "stopped"];
   // spec 30: terminal states — a terminal chicken can be re-run, a live one stopped
@@ -1916,9 +1916,298 @@
     });
   });
 
+  /* --- farmhand view (spec 31): transports, tools, client config, transport form --- */
+
+  function fhError(msg) {
+    const p = $("#farmhand-error");
+    if (!msg) {
+      p.hidden = true;
+      p.textContent = "";
+      return;
+    }
+    p.textContent = msg;
+    p.hidden = false;
+  }
+
+  function renderFarmhand(info) {
+    const transports = info.transports && info.transports.length ? info.transports : [info.transport];
+    const rows = [
+      ["transport", transports.join(" + ")],
+      ["https endpoint", info.https_url ? info.https_url + (info.https_mounted ? " · served now" : " · not served — pick https or both above") : "— (coop disabled)"],
+      ["bearer", info.auth_required ? "required — send Authorization: Bearer <token>" : "not required (loopback, no token configured)"],
+      ["stdio command", "tc farmhand serve --transport stdio"],
+    ];
+    $("#farmhand-summary").textContent =
+      transports.join(" + ") + " · " + (info.https_mounted ? (info.https_url || "https") + " mounted" : "https endpoint not mounted") +
+      (info.auth_required ? " · bearer required" : " · open");
+    const list = $("#farmhand-list");
+    const card = $("#farmhand-card");
+    const sig = JSON.stringify(rows);
+    if (list.dataset.sig !== sig) {
+      list.dataset.sig = sig;
+      list.replaceChildren();
+      for (const [k, v] of rows) {
+        const row = el("div", "settings-row");
+        row.appendChild(el("dt", null, k));
+        row.appendChild(el("dd", null, v == null ? "—" : String(v)));
+        list.appendChild(row);
+      }
+      flashCard(card);
+    }
+    // the exposed tool list — read straight off the built MCP server
+    const tools = info.tools || [];
+    $("#farmhand-tools-card").hidden = !tools.length;
+    if (tools.length) {
+      $("#farmhand-tools-count").textContent = tools.length + " tools — thin wrappers over coopd's socket ops";
+      const tbody = $("#farmhand-tools-tbody");
+      const tSig = JSON.stringify(tools);
+      if (tbody.dataset.sig !== tSig) {
+        tbody.dataset.sig = tSig;
+        tbody.replaceChildren();
+        for (const t of tools) {
+          const tr = el("tr");
+          tr.appendChild(el("td", "mono job-name", t.name));
+          tr.appendChild(el("td", "muted gate-summary", t.description || ""));
+          tbody.appendChild(tr);
+        }
+        flashCard($("#farmhand-tools-card"));
+      }
+    }
+    // ready-to-paste client configs (the bearer header is a placeholder only)
+    const cfg = info.client_config || {};
+    $("#farmhand-snippet-card").hidden = false;
+    $("#fh-snippet-stdio").textContent = cfg.stdio ? JSON.stringify(cfg.stdio, null, 2) : "";
+    $("#fh-snippet-https").textContent = cfg.https
+      ? JSON.stringify(cfg.https, null, 2)
+      : "// the coop exposes no HTTPS endpoint (coop disabled)";
+    // keep the transport form in sync unless the operator is editing it
+    const sel = $("#fh-transport");
+    if (document.activeElement !== sel && sel.value !== info.transport) sel.value = info.transport;
+  }
+
+  async function loadFarmhand() {
+    const data = await api("/api/farmhand");
+    if (data === null) return; /* 401 → login view shown */
+    if (payloadDown(data)) {
+      showEmpty("#farmhand-empty", "#farmhand-card", "Farmhand unavailable — " + (data.error || "coopd is not reachable") + ".");
+      $("#farmhand-tools-card").hidden = true;
+      $("#farmhand-snippet-card").hidden = true;
+      return;
+    }
+    $("#farmhand-empty").hidden = true;
+    $("#farmhand-card").hidden = false;
+    renderFarmhand(data);
+  }
+
+  $("#farmhand-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    fhError("");
+    const resp = await apiPost("/api/settings", { farmhand_transport: $("#fh-transport").value });
+    if (resp === null) return; /* 401 → login view shown */
+    if (resp.__networkError) {
+      fhError("The GUI could not reach the coop server.");
+      return;
+    }
+    if (resp.daemon && resp.daemon.up === false) {
+      fhError("coopd is not reachable — " + (resp.error || "") + ".");
+      return;
+    }
+    if (!resp.ok) {
+      const errs = resp.errors || [];
+      const line = errs.map((e) => (e.field || "") + ": " + (e.message || "")).join("\n");
+      fhError(line || resp.error || "transport update refused");
+      return;
+    }
+    loadFarmhand();
+  });
+
+  /* --- connectors view (spec 31): gates CRUD over /api/connectors/* --- */
+
+  function connError(msg) {
+    const p = $("#connectors-error");
+    if (!msg) {
+      p.hidden = true;
+      p.textContent = "";
+      return;
+    }
+    p.textContent = msg;
+    p.hidden = false;
+  }
+
+  const GATE_FIELD_ERRORS = {
+    name: "#gate-name-error",
+    transport: "#gate-error",
+    command: "#gate-command-error",
+    args: "#gate-args-error",
+    env: "#gate-env-error",
+    url: "#gate-url-error",
+    headers: "#gate-headers-error",
+  };
+
+  function setGateError(leaf, msg) {
+    const sel = GATE_FIELD_ERRORS[leaf] || "#gate-error";
+    const p = $(sel);
+    p.textContent = msg;
+    p.hidden = false;
+  }
+
+  function clearGateErrors() {
+    $$("#gate-form .field-error").forEach((p) => {
+      p.hidden = true;
+      p.textContent = "";
+    });
+  }
+
+  function parseKvLines(text) {
+    const out = {};
+    for (const line of String(text).split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      const eq = t.indexOf("=");
+      if (eq <= 0) throw new Error("each line must be KEY=VALUE — got: " + t);
+      out[t.slice(0, eq).trim()] = t.slice(eq + 1).trim();
+    }
+    return out;
+  }
+
+  function gateSummaryText(g) {
+    if (g.transport === "stdio") {
+      const args = (g.args || []).join(" ");
+      const env = (g.env_keys || []).join(", ");
+      return (g.command || "—") + (args ? " " + args : "") + (env ? "  ·  env: " + env : "");
+    }
+    const headers = Object.entries(g.headers || {}).map(([k, v]) => k + ": " + v).join(", ");
+    return (g.url || "—") + (headers ? "  ·  headers: " + headers : "");
+  }
+
+  function toggleGateTransportFields() {
+    const t = $("#gate-transport").value;
+    $$("#gate-form [data-for]").forEach((f) => {
+      f.hidden = f.dataset.for !== t;
+    });
+  }
+
+  async function loadConnectors() {
+    const data = await api("/api/connectors");
+    if (data === null) return; /* 401 → login view shown */
+    if (payloadDown(data)) {
+      showEmpty("#connectors-empty", "#connectors-card", "Gates unavailable — " + (data.error || "coopd is not reachable") + ".");
+      return;
+    }
+    const gates = data.connectors || [];
+    if (!gates.length) {
+      showEmpty("#connectors-empty", "#connectors-card", "No gates registered yet — register one above, or with tc connectors add …");
+      return;
+    }
+    showCard("#connectors-empty", "#connectors-card");
+    const tbody = $("#connectors-tbody");
+    const card = $("#connectors-card");
+    const sig = JSON.stringify(gates);
+    if (tbody.dataset.sig !== sig) {
+      tbody.dataset.sig = sig;
+      tbody.replaceChildren();
+      for (const g of gates) {
+        const tr = el("tr");
+        tr.appendChild(el("td", "mono job-name", g.name));
+        const tTd = el("td");
+        tTd.appendChild(el("span", "badge " + (g.transport === "https" ? "badge-seat" : "badge-api-key"), g.transport || "—"));
+        tr.appendChild(tTd);
+        tr.appendChild(el("td", "mono muted gate-summary", gateSummaryText(g)));
+        const actionTd = el("td");
+        const rm = el("button", "linklike gate-remove", "Remove");
+        rm.type = "button";
+        rm.setAttribute("aria-label", "Remove gate " + g.name);
+        rm.addEventListener("click", () => removeGate(g.name));
+        actionTd.appendChild(rm);
+        tr.appendChild(actionTd);
+        tbody.appendChild(tr);
+      }
+      flashCard(card);
+    }
+  }
+
+  async function removeGate(name) {
+    connError("");
+    const resp = await apiPost("/api/connectors/rm", { name });
+    if (resp === null) return; /* 401 → login view shown */
+    if (resp.__networkError) {
+      connError("The GUI could not reach the coop server.");
+      return;
+    }
+    if (resp.daemon && resp.daemon.up === false) {
+      connError("coopd is not reachable — " + (resp.error || "") + ".");
+      return;
+    }
+    if (!resp.ok) {
+      connError(resp.error || "remove refused");
+      return;
+    }
+    loadConnectors();
+  }
+
+  $("#gate-transport").addEventListener("change", toggleGateTransportFields);
+
+  $("#gate-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    clearGateErrors();
+    const name = $("#gate-name").value.trim();
+    const transport = $("#gate-transport").value;
+    if (!name) {
+      setGateError("name", "Name is required.");
+      return;
+    }
+    const body = { name, transport };
+    try {
+      if (transport === "stdio") {
+        const command = $("#gate-command").value.trim();
+        if (command) body.command = command;
+        const argsRaw = $("#gate-args").value.trim();
+        if (argsRaw) body.args = argsRaw.split(",").map((s) => s.trim()).filter(Boolean);
+        const env = parseKvLines($("#gate-env").value);
+        if (Object.keys(env).length) body.env = env;
+      } else {
+        const url = $("#gate-url").value.trim();
+        if (url) body.url = url;
+        const headers = parseKvLines($("#gate-headers").value);
+        if (Object.keys(headers).length) body.headers = headers;
+      }
+    } catch (err) {
+      setGateError(transport === "stdio" ? "env" : "headers", String(err.message || err));
+      return;
+    }
+    const resp = await apiPost("/api/connectors/add", body);
+    if (resp === null) return; /* 401 → login view shown */
+    if (resp.__networkError) {
+      setGateError("", "The GUI could not reach the coop server.");
+      return;
+    }
+    if (resp.daemon && resp.daemon.up === false) {
+      setGateError("", "coopd is not reachable — " + (resp.error || "") + ".");
+      return;
+    }
+    if (!resp.ok) {
+      const errs = resp.errors || [];
+      if (errs.length) {
+        // field-named: connectors.<name>.<field> (or connectors.name)
+        for (const e of errs) {
+          const parts = String(e.field || "").split(".");
+          const leaf = parts[parts.length - 1];
+          setGateError(leaf === "<root>" ? "" : leaf, (e.field || "") + ": " + (e.message || ""));
+        }
+      } else {
+        setGateError("", resp.error || "gate refused");
+      }
+      return;
+    }
+    $("#gate-form").reset();
+    toggleGateTransportFields();
+    loadConnectors();
+  });
+
   /* --- boot --- */
 
   if (token) $("#signout").hidden = false;
+  toggleGateTransportFields();
   if (location.hash === "" ) location.hash = "#/dashboard";
   route();
 })();
