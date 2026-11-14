@@ -209,8 +209,8 @@ def seat_providers_config() -> ProvidersConfig:
                     "base_url": "http://provider.test/v1",
                     "api_key_env": "SEATCO_TOKEN",
                     "auth": "seat",
-                    "oauth_device_url": "http://oauth.test/device",
-                    "oauth_token_url": "http://oauth.test/token",
+                    "oauth_device_url": "https://oauth.test/device",
+                    "oauth_token_url": "https://oauth.test/token",
                     "oauth_client_id": "tc-test-client",
                     "oauth_scope": "openid",
                     "models": {
@@ -464,7 +464,9 @@ class FakeOAuthHandler(BaseHTTPRequestHandler):
                 {
                     "device_code": "dev-123",
                     "user_code": "ABCD-EFGH",
-                    "verification_uri": f"http://127.0.0.1:{port}/verify",
+                    # https-only at ingest (spec 32/G7); the verify page is
+                    # never fetched by the client, only shown as a link
+                    "verification_uri": f"https://127.0.0.1:{port}/verify",
                     "interval": 0.05,
                     "expires_in": 300,
                 },

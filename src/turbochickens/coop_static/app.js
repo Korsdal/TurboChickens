@@ -16,6 +16,18 @@
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
+  /* The Fox only links https: an untrusted URI (e.g. a `javascript:` scheme
+     injected by a hostile auth server) must never become an href in the coop
+     origin — it would run with access to the sessionStorage bearer. */
+  function httpsOnlyHref(uri) {
+    try {
+      const u = new URL(uri);
+      return u.protocol === "https:" ? u.href : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
   let token = sessionStorage.getItem(TOKEN_KEY);
   let pollTimer = null;
   let lastStats = {};
@@ -1873,8 +1885,14 @@
     $("#device-provider").textContent = provider;
     $("#device-code").textContent = resp.user_code || "—";
     const link = $("#device-verification");
-    link.textContent = resp.verification_uri || "";
-    link.href = resp.verification_uri || "#";
+    const uri = resp.verification_uri || "";
+    link.textContent = uri;
+    const safeHref = httpsOnlyHref(uri);
+    if (safeHref) {
+      link.href = safeHref;
+    } else {
+      link.removeAttribute("href"); // not https → shown as text only, never linked
+    }
     $("#device-expires").textContent = "code expires " + (resp.expires_at || "—");
     deviceStatus("Waiting for authorization…");
     $("#device-card").hidden = false;
