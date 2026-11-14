@@ -21,7 +21,7 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 | **Feeders** | Model providers — who feeds the Chickens | `providers.py` |
 | **Feed Budget** | Per-run budgets: timeout, context cap, cost | run budgets / `budget.outcome` |
 | **Feed Ledger** | The per-egg rollup of what the flock was actually fed — tokens in/out, expected feed per Chicken | `stats.py`, the Feed view |
-| **Clutch** | A run's output artifacts — the eggs a Chicken lays | run results / artifacts |
+| **Clutch** | A run's output artifacts — the eggs a Chicken lays; size-capped — an over-cap Clutch is stored truncated with a `truncated` marker in the manifest budget, never unbounded in memory, DB, or disk | run results / artifacts |
 | **Nest Box** | Results store — where Clutches are found | `storage.py` (results) |
 | **Abattoir** | De-provisioning with attested, verifiable teardown | teardown / destruction |
 | **Compost** | Retention — old Clutches rot away; audit records stay forever | `retention.py` |
@@ -31,6 +31,7 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 | **Chaining** | An Egg consuming an earlier Chicken's Clutch via a `nestbox://<run_id>/output.json` attachment — resolved from the Nest Box at provisioning, valid clutches only | `chaining.py`, manifest `chaining`, Headcount `clutch.consumed` |
 | **ChickenSub** | A sub-chicken — a Chicken spawned by another Chicken through its attached Farmhand (stdio), enqueued as an ordinary Egg in the same Pecking Order with lineage `parent_run_id`, depth capped at 1, and a narrower Farmhand tool set (enqueue + read only; it cannot stop its ancestors) | `harness.spawn_subs`, `runs.parent_run_id`, `farmhand.py` |
 | **Gate** | A registered external MCP connector — an opening in the fence to an outside tool service. The platform only *registers* gates (connectors.toml, CRUD via `connectors_*` ops, Headcount `gate.registered`/`gate.removed`/`gate.rejected`); it never provisions or pays for the third party. A Chicken opts in per egg via `[harness] connectors = ["name", …]` and gets the chosen gates injected into its harness runtime's MCP config. Env/header values are secrets: refs (`$VAR`) stay refs in every served payload, values never appear in any response, audit row, or manifest | `connectors.toml`, `connectors.py`, `harness.connectors` |
+| **Fence** | The resource caps around Coopd and the Coop — keepalive time, connection count, per-handler time, the per-chicken run-event log, and the output (Clutch) size. When the fence is full or a request runs past its time, the Fox refuses it with a short named error; `runs_logs` serves only a bounded tail of a capped log | G20 caps in `settings.py`, enforced in `daemon.py`, `coop.py`, `adapter.py`, `runner.py` |
 
 ## Support Cast
 

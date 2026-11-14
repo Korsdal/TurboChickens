@@ -27,6 +27,7 @@ import httpx
 
 from turbochickens.chaining import attachment_workspace_name
 from turbochickens.providers import ProvidersConfig, ProvidersError, load_providers
+from turbochickens.settings import OUTPUT_MAX_BYTES
 from turbochickens.spec.model import JobSpec
 
 ADAPTER_WEIGHTS: dict[str, float] = {"mistral-api": 0.25, "vibe-cli": 1.0}
@@ -113,13 +114,19 @@ class PreparedRun:
 
 @dataclass
 class HarnessResult:
-    """Raw, untrusted harness output plus usage telemetry and exit status."""
+    """Raw, untrusted harness output plus usage telemetry and exit status.
+
+    Spec 32 (G20): `raw_output` is capped at OUTPUT_MAX_BYTES — when the
+    harness produced more, `truncated` is True and only the first
+    OUTPUT_MAX_BYTES are kept (the Clutch is stored truncated, never
+    unbounded in memory/DB/disk)."""
 
     exit_code: int | None
     raw_output: str
     usage: dict[str, Any]
     timed_out: bool = False
     error: str | None = None
+    truncated: bool = False
 
 
 @dataclass
@@ -326,15 +333,29 @@ class VibeCLIAdapter:
             return HarnessResult(exit_code=None, raw_output="", usage={}, error=f"cannot spawn {self.bin}: {e}")
         run.proc = proc
         stdout_chunks: list[str] = []
+        collected = 0
+        truncated = False
 
         async def _pump(stream: asyncio.StreamReader, level: str, collect: bool) -> None:
+            nonlocal collected, truncated
             while True:
                 line = await stream.readline()
                 if not line:
                     break
                 text = line.decode("utf-8", "replace")
                 if collect:
-                    stdout_chunks.append(text)
+                    # spec 32 (G20): the collected output (the clutch) is
+                    # capped at OUTPUT_MAX_BYTES — the pipe is still drained,
+                    # but nothing past the cap is kept in memory
+                    if collected < OUTPUT_MAX_BYTES:
+                        chunk = text
+                        if collected + len(chunk) > OUTPUT_MAX_BYTES:
+                            chunk = chunk[: OUTPUT_MAX_BYTES - collected]
+                            truncated = True
+                        stdout_chunks.append(chunk)
+                        collected += len(chunk)
+                    else:
+                        truncated = True
                 await event_sink("harness", level, sanitize_log_line(text.rstrip("\r\n")))
 
         pump_out = asyncio.create_task(_pump(proc.stdout, "stdout", True))  # type: ignore[arg-type]
@@ -356,6 +377,7 @@ class VibeCLIAdapter:
             raw_output=raw_output,
             usage=usage,
             timed_out=timed_out,
+            truncated=truncated,
         )
 
     def _read_usage(self, export_dir: Path) -> dict[str, Any]:
@@ -623,7 +645,14 @@ class MistralAPIAdapter:
         await event_sink(
             "harness", "info", f"provider http 200: tokens_in={tokens_in} tokens_out={tokens_out}"
         )
-        return HarnessResult(exit_code=0, raw_output=content or "", usage=usage)
+        content = content or ""
+        truncated = False
+        if len(content) > OUTPUT_MAX_BYTES:
+            # spec 32 (G20): a hostile/huge provider response is capped, not
+            # buffered whole — the clutch is stored truncated
+            content = content[:OUTPUT_MAX_BYTES]
+            truncated = True
+        return HarnessResult(exit_code=0, raw_output=content, usage=usage, truncated=truncated)
 
     async def teardown(self, run: RunContext) -> TeardownReport:
         """No subprocess to reap for a pure HTTP adapter; workspace gone + env

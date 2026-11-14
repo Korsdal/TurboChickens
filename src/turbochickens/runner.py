@@ -81,7 +81,12 @@ from turbochickens.chaining import (
 )
 from turbochickens.providers import ProvidersConfig, ProvidersError, load_providers
 from turbochickens.seat import SeatBroker
-from turbochickens.settings import Settings
+from turbochickens.settings import (
+    MAX_RUN_EVENTS,
+    OUTPUT_MAX_BYTES,
+    RUN_EVENT_LINE_MAX_LEN,
+    Settings,
+)
 from turbochickens.spec.loader import load_spec
 from turbochickens.spec.model import JobSpec
 from turbochickens.stats import rollup_usage
@@ -163,13 +168,23 @@ class RunPipeline:
     # --- db helpers -------------------------------------------------------
 
     async def _event(self, run_id: str, source: str, level: str, line: str) -> None:
+        # spec 32 (G20, the Fence): every stored event line is length-capped,
+        # and the per-chicken run-event log itself is capped at MAX_RUN_EVENTS
+        # rows (the table is append-only, so the cap is enforced here at
+        # insert — a spamming chicken cannot grow the DB without bound;
+        # `runs_logs` reports `capped=true` and serves the bounded tail)
+        if len(line) > RUN_EVENT_LINE_MAX_LEN:
+            line = sanitize_log_line(line, RUN_EVENT_LINE_MAX_LEN)
         async with self._db_lock:
             row = self.db.execute(
-                "SELECT COALESCE(MAX(seq), -1) + 1 FROM run_events WHERE run_id = ?", (run_id,)
+                "SELECT COALESCE(MAX(seq), -1) + 1, COUNT(*) FROM run_events WHERE run_id = ?", (run_id,)
             ).fetchone()
+            seq, count = row[0], row[1]
+            if count >= MAX_RUN_EVENTS:
+                return
             self.db.execute(
                 "INSERT INTO run_events (run_id, seq, ts, level, source, line) VALUES (?, ?, ?, ?, ?, ?)",
-                (run_id, row[0], utcnow_iso(), level, source, line),
+                (run_id, seq, utcnow_iso(), level, source, line),
             )
             self.db.commit()
 
@@ -556,6 +571,23 @@ class RunPipeline:
                     result, stopped_reason = await self._execute_harness(
                         adapter, prepared, ctx, stop_event, hard_timeout
                     )
+            # spec 32 (G20, the Fence): the output (Clutch) cap is enforced here
+            # as well as at collection in the adapter — defense in depth, so no
+            # path can store unbounded raw output in memory, the DB, or on disk;
+            # the manifest budget records `truncated`
+            if result is not None and len(result.raw_output) > OUTPUT_MAX_BYTES:
+                result.raw_output = result.raw_output[:OUTPUT_MAX_BYTES]
+                result.truncated = True
+            if result is not None and result.truncated:
+                budget["output_truncated"] = True
+                budget["output_cap_bytes"] = OUTPUT_MAX_BYTES
+                await self._event(
+                    run_id,
+                    "supervisor",
+                    "warn",
+                    f"harness output hit the {OUTPUT_MAX_BYTES}-byte fence —"
+                    " the clutch is stored truncated (truncated=true)",
+                )
             if stopped_reason is not None:
                 status, reason = "stopped", stopped_reason
             elif result is not None and result.timed_out:
