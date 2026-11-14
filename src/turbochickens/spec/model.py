@@ -5,6 +5,8 @@ There is deliberately no ``max_tokens`` knob anywhere — token usage is
 measured telemetry, not a declared budget. The only cost control is the
 optional USD cap ``resources.max_cost_usd`` (spec 24), enforced at finalize.
 Any extra key (including ``max_tokens``) is rejected with a field-named error.
+Spec 25 (chaining) adds ``nestbox://<run_id>/output.json`` URIs as valid
+``[input].attachments`` entries — shape-checked here, resolved at provisioning.
 """
 
 from __future__ import annotations
@@ -13,6 +15,8 @@ from typing import Literal
 
 from croniter import croniter
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+
+from turbochickens.chaining import looks_like_uri, parse_nestbox_uri
 
 ADAPTERS = ("mistral-api", "vibe-cli")
 TRIGGER_TYPES = ("manual", "cron")
@@ -78,6 +82,23 @@ class ResourcesSection(_StrictModel):
 class InputSection(_StrictModel):
     prompt_file: str = Field(min_length=1)
     attachments: list[str] = Field(default_factory=list)
+
+    @field_validator("attachments")
+    @classmethod
+    def _check_attachments(cls, v: list[str]) -> list[str]:
+        # spec 25 (chaining): an attachment may be a `nestbox://<run_id>/output.json`
+        # URI — resolved from the Nest Box at provisioning — instead of a
+        # spec-relative file. Anything URI-shaped that is not exactly that
+        # shape (wrong scheme, missing run id, extra path segments, …) is a
+        # field-named error here, at spec load. Whether the referenced clutch
+        # exists and is valid is only known at provisioning, not here.
+        for i, att in enumerate(v):
+            if looks_like_uri(att) and parse_nestbox_uri(att) is None:
+                raise ValueError(
+                    f"attachments[{i}]: malformed nestbox URI {att!r} —"
+                    f" expected nestbox://<run_id>/output.json (or a spec-relative file path)"
+                )
+        return v
 
 
 class OutputSection(_StrictModel):

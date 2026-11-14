@@ -4,11 +4,11 @@
 
 **Blocked by:** None — specs 04 (validation results/quarantine) and 07 (run budgets / context cap) are landed. Can start immediately.
 
-**Status:** ready-for-agent (split from spec 21 via to-tickets, 2026-11-14)
+**Status:** done (2026-11-14)
 
-- [ ] Spec load: `nestbox://<run_id>/output.json` entries in `[input].attachments` validate; malformed URIs (wrong scheme, missing run id, extra path segments) → field-named validation error; `extra = "forbid"` intact
-- [ ] E2E: run A produces a valid clutch; run B with `attachments = ["nestbox://<A>/output.json"]` provisions with A's clutch bytes injected; manifest records the resolved source (run id + artifact path); run B succeeds
-- [ ] Fail closed: referencing a quarantined clutch, an expired (composted) clutch, or a nonexistent run id → provisioning failure before `running` (no harness events), attested teardown (1,1,1), no results row, workspace gone
-- [ ] Context cap: resolved attachment bytes count toward `max_context_mb` — an over-cap chain fails at provisioning with `budget.outcome = "context_cap"` exactly like spec 07
-- [ ] Tests: pure seam for the resolver (valid / quarantined / expired / missing / wrong-shape); e2e for the happy path and the quarantined refusal (real clutch as attachment via fake vibe binary); full suite green
-- [ ] `STATUS.md` updated at the slice boundary
+- [x] Spec load: `nestbox://<run_id>/output.json` entries in `[input].attachments` validate; malformed URIs (wrong scheme, missing run id, extra path segments) → field-named validation error; `extra = "forbid"` intact
+- [x] E2E: run A produces a valid clutch; run B with `attachments = ["nestbox://<A>/output.json"]` provisions with A's clutch bytes injected; manifest records the resolved source (run id + artifact path); run B succeeds
+- [x] Fail closed: referencing a quarantined clutch, an expired (composted) clutch, or a nonexistent run id → provisioning failure before `running` (no harness events), attested teardown (1,1,1), no results row, workspace gone
+- [x] Context cap: resolved attachment bytes count toward `max_context_mb` — an over-cap chain fails at provisioning with `budget.outcome = "context_cap"` exactly like spec 07
+- [x] Tests: pure seam for the resolver (valid / quarantined / expired / missing / wrong-shape); e2e for the happy path and the quarantined refusal (real clutch as attachment via fake vibe binary); full suite green
+- [x] `STATUS.md` updated at the slice boundary

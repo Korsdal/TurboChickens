@@ -87,6 +87,7 @@ from turbochickens.adapter import (
     run_weight,
 )
 from turbochickens.audit import AuditLog
+from turbochickens.chaining import is_nestbox_uri
 from turbochickens.providers import ProvidersConfig, load_providers
 from turbochickens.retention import sweep_expired_results
 from turbochickens.runner import TERMINAL_STATES, RunPipeline
@@ -1197,7 +1198,9 @@ class Daemon:
         Validation reuses the existing spec loader, so errors come back
         field-named exactly like ``tc jobs validate`` (``trigger.schedule: …``);
         the bundle must additionally contain the files the spec references
-        (prompt, attachments — the loader itself checks the schema file). The
+        (prompt, plain attachments — the loader itself checks the schema file;
+        spec 25 `nestbox://` attachments are resolved from the nest box at
+        provisioning, not shipped in the bundle). The
         total decoded size is capped at ``UPLOAD_MAX_BYTES``. Invalid bundles
         are never stored and never register a job; staging paths never leave
         the daemon (messages are rewritten to ``<bundle>``)."""
@@ -1303,6 +1306,10 @@ class Daemon:
                     }
                 )
             for att in spec.input.attachments:
+                # spec 25: a nestbox:// attachment is resolved from the nest
+                # box at provisioning, not shipped inside the bundle
+                if is_nestbox_uri(att):
+                    continue
                 if att not in decoded:
                     errors.append(
                         {

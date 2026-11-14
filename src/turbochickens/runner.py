@@ -17,6 +17,14 @@ off by default): enforced finalize-only — a chicken whose measured
 `usage.cost_usd` exceeds the egg's cap fails with `budget.outcome = "cost_cap"`
 (no clutch stored, telemetry still recorded, teardown attested as usual).
 
+Spec 25 (chaining) lets an egg consume an earlier clutch:
+`attachments = ["nestbox://<run_id>/output.json"]` is resolved at provisioning
+from the Nest Box — valid clutches only; quarantined, composted, or missing →
+the run fails at provisioning before `running` (attested teardown as usual).
+Resolved clutch bytes count toward `max_context_mb` like any injected context,
+and the manifest records the resolved sources (`chaining`) plus a
+`clutch.consumed` Headcount row.
+
 The pipeline owns all SQLite writes for a chicken: status transitions on
 `runs`, streamed `run_events`, the manifest, the `results` row (spec 04: a
 valid clutch is stored in the nest box, an invalid one quarantined), and the
@@ -42,6 +50,12 @@ from turbochickens.adapter import (
     sanitize_log_line,
 )
 from turbochickens.audit import AuditLog
+from turbochickens.chaining import (
+    NestboxError,
+    attachment_workspace_name,
+    parse_nestbox_uri,
+    resolve_nestbox_clutch,
+)
 from turbochickens.providers import ProvidersConfig, ProvidersError, load_providers
 from turbochickens.seat import SeatBroker
 from turbochickens.settings import Settings
@@ -134,23 +148,49 @@ class RunPipeline:
 
     # --- provisioning -----------------------------------------------------
 
-    def _provision(self, ctx: RunContext) -> int:
+    def _provision(self, ctx: RunContext) -> tuple[int, list[dict[str, Any]]]:
         """Fresh per-run workspace with the job inputs copied in. Nothing is
         shared between runs; nothing from the ambient environment either.
-        Returns the injected-context size in bytes (prompt + attachments;
-        injected trajectory state is post-MVP) so the spec-07 context cap can
-        be enforced at provisioning time."""
+
+        Spec 25 (chaining): a `nestbox://<run_id>/output.json` attachment is
+        resolved here from the Nest Box — valid clutches only; quarantined,
+        composted, or missing clutches raise NestboxError and the run fails
+        at provisioning. Returns the injected-context size in bytes (prompt +
+        attachments, chained clutch bytes included — the spec-07 context cap
+        cannot be bypassed by chaining) and the resolved chaining sources for
+        the manifest (injected trajectory state is post-MVP)."""
         ws = ctx.workspace
         ws.mkdir(parents=True, exist_ok=True)
         spec_dir = ctx.spec_path.parent
         prompt_src = spec_dir / ctx.spec.input.prompt_file
         shutil.copyfile(prompt_src, ws / "prompt.txt")
         injected = prompt_src.stat().st_size
-        for att in ctx.spec.input.attachments:
-            src = spec_dir / att
-            shutil.copyfile(src, ws / Path(att).name)
-            injected += src.stat().st_size
-        return injected
+        chaining: list[dict[str, Any]] = []
+        try:
+            for att in ctx.spec.input.attachments:
+                if parse_nestbox_uri(att) is not None:
+                    # spec 25: fetch the referenced chicken's clutch from the
+                    # nest box and inject its bytes into the workspace
+                    clutch = resolve_nestbox_clutch(att, self.db)
+                    name = attachment_workspace_name(att)
+                    (ws / name).write_bytes(clutch.data)
+                    injected += len(clutch.data)
+                    chaining.append(
+                        {
+                            "attachment": att,
+                            "run_id": clutch.run_id,
+                            "artifact_path": clutch.artifact_path,
+                            "size_bytes": len(clutch.data),
+                        }
+                    )
+                else:
+                    src = spec_dir / att
+                    shutil.copyfile(src, ws / attachment_workspace_name(att))
+                    injected += src.stat().st_size
+        except NestboxError as e:
+            e.injected_bytes = injected
+            raise
+        return injected, chaining
 
     # --- result store + quarantine (spec 04) --------------------------------
 
@@ -267,6 +307,7 @@ class RunPipeline:
         reason: str,
         budget: dict[str, Any],
         auth: dict[str, Any],
+        chaining: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         spec = ctx.spec
         manifest: dict[str, Any] = {
@@ -302,6 +343,10 @@ class RunPipeline:
             # (`max_cost_usd`), enforced finalize-only.
             "budget": budget,
         }
+        # spec 25: chaining lineage — the nestbox:// sources this chicken
+        # consumed at provisioning (run id + artifact path + bytes)
+        if chaining:
+            manifest["chaining"] = chaining
         # spec 22: re-run lineage — this chicken was enqueued by `run_rerun`
         # from another run of the same egg
         if item.get("rerun_of"):
@@ -351,6 +396,8 @@ class RunPipeline:
         stop_event = asyncio.Event()
         self._active[run_id] = stop_event
         stopped_reason: str | None = None
+        # spec 25: resolved nestbox:// chaining sources, recorded in the manifest
+        chaining: list[dict[str, Any]] = []
         try:
             await self._set_status(run_id, "provisioning")
             # spec 20: the Hatchery starts turning the Egg into a Chicken
@@ -363,10 +410,41 @@ class RunPipeline:
                     "trigger": ctx.trigger,
                 }
             )
-            injected_bytes = self._provision(ctx)
-            budget["injected_context_bytes"] = injected_bytes
+            provision_error: str | None = None
+            try:
+                injected_bytes, chaining = self._provision(ctx)
+                budget["injected_context_bytes"] = injected_bytes
+                # spec 25: lineage in the Headcount + run log — this chicken
+                # consumed an earlier clutch from the nest box
+                for c in chaining:
+                    self.audit.append(
+                        {
+                            "event": "clutch.consumed",
+                            "run_id": run_id,
+                            "source_run_id": c["run_id"],
+                            "attachment": c["attachment"],
+                            "artifact": c["artifact_path"],
+                        }
+                    )
+                    await self._event(
+                        run_id,
+                        "supervisor",
+                        "info",
+                        f"chained clutch from chicken {c['run_id']}: {c['attachment']}"
+                        f" → {attachment_workspace_name(c['attachment'])} ({c['size_bytes']} bytes)",
+                    )
+            except NestboxError as e:
+                # spec 25 fail-closed: a quarantined / composted / missing /
+                # malformed clutch fails the run at provisioning, before any
+                # harness work — attested teardown as usual
+                provision_error = str(e)
+                budget["injected_context_bytes"] = e.injected_bytes
+                status, reason = "failed", f"provisioning failed: {e}"
+                await self._event(run_id, "supervisor", "error", sanitize_log_line(reason))
             cap_bytes = spec.resources.max_context_mb * 1024 * 1024
-            if injected_bytes > cap_bytes:
+            if provision_error is not None:
+                pass  # chaining resolution failed — status/reason set above
+            elif injected_bytes > cap_bytes:
                 # spec 07: hard cap on injected context, enforced at
                 # provisioning — the run fails before any harness work
                 budget["context_exceeded"] = True
@@ -411,7 +489,7 @@ class RunPipeline:
             elif result is not None and result.error:
                 status, reason = "failed", result.error
             elif result is None:
-                pass  # context-cap failure at provisioning; status/reason already set
+                pass  # provisioning failure (context cap or chained clutch) — status/reason already set
             elif result.exit_code != 0:
                 status, reason = "failed", f"harness exited rc={result.exit_code}"
             else:
@@ -458,7 +536,7 @@ class RunPipeline:
                 await self._event(run_id, "supervisor", "error", sanitize_log_line(str(e)))
         finally:
             self._active.pop(run_id, None)
-            await self._finalize(item, ctx, harness, result, status, reason, adapter, budget, auth)
+            await self._finalize(item, ctx, harness, result, status, reason, adapter, budget, auth, chaining)
 
     async def _execute_harness(
         self,
@@ -609,11 +687,12 @@ class RunPipeline:
         adapter: Any,
         budget: dict[str, Any],
         auth: dict[str, Any],
+        chaining: list[dict[str, Any]] | None = None,
     ) -> None:
         """Manifest + terminal status + teardown attestation + audit rows.
         Runs for every path out of `execute`, including exceptions."""
         run_id = ctx.run_id
-        manifest = self._manifest(item, ctx, harness, result, status, reason, budget, auth)
+        manifest = self._manifest(item, ctx, harness, result, status, reason, budget, auth, chaining)
         # teardown first: destruction is verified, not assumed
         try:
             report: TeardownReport = await adapter.teardown(ctx)

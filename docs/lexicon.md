@@ -28,6 +28,7 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 | **Cancelled** | An Egg pulled from the Pecking Order before it hatches — terminal, never hatches, still abattoir-attested | `cancelled` run state / `run_stop` on a queued egg / `egg.cancelled` |
 | **Stopped** | A Chicken ended deliberately by the operator — SIGTERM, then hard kill, with the Abattoir's attested teardown | `stopped` run state / `run_stop` on a running chicken / `chicken.stopped` |
 | **Re-run** | Hatching the same Egg again as a fresh Chicken, new run ID, lineage recorded | `run_rerun` / manifest `rerun_of` |
+| **Chaining** | An Egg consuming an earlier Chicken's Clutch via a `nestbox://<run_id>/output.json` attachment — resolved from the Nest Box at provisioning, valid clutches only | `chaining.py`, manifest `chaining`, Headcount `clutch.consumed` |
 
 ## Support Cast
 

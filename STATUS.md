@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-14, after spec 24 landed (Feed Budget cost cap — optional per-egg `resources.max_cost_usd` in USD, off by default, enforced finalize-only: over cap → run failed with `budget.outcome = "cost_cap"` in the existing manifest budget block, cost/token telemetry still recorded, teardown attested as usual; pure seam `cost_cap_exceeded`; full suite green, 307 passed). Same day earlier: spec 22 landed (lifecycle ops — socket ops `run_stop`/`run_rerun`, CLI `tc runs stop`/`tc runs rerun`, terminal states `cancelled`/`stopped` with attested teardown on every stop path, `egg.cancelled`/`chicken.stopped` Headcount rows, `rerun_of` lineage, lexicon terms added first; full suite green, 298 passed). Same day earlier: spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier then: 22, 24, 25); still no code changed.
+**Last updated:** 2026-11-14, after spec 25 landed (chaining — `attachments = ["nestbox://<run_id>/output.json"]` in `[input]`: URI shape validated at spec load with field-named errors (`input.attachments`), resolved at provisioning from the Nest Box via the new `chaining.py` seam — valid clutches only, quarantined/composted/missing/malformed → fail-closed provisioning failure before `running` with attested teardown (1,1,1) and no results row; resolved clutch bytes count toward `max_context_mb` (over-cap chain → `budget.outcome = "context_cap"` exactly like spec 07); lineage in the manifest `chaining` block (run id + artifact path + bytes) + `clutch.consumed` Headcount rows + a run-log line; `jobs_upload` bundles no longer need nestbox attachments shipped in them; lexicon gained Chaining; full suite green, 340 passed). Same day earlier: spec 24 landed (Feed Budget cost cap — optional per-egg `resources.max_cost_usd` in USD, off by default, enforced finalize-only: over cap → run failed with `budget.outcome = "cost_cap"` in the existing manifest budget block, cost/token telemetry still recorded, teardown attested as usual; pure seam `cost_cap_exceeded`; full suite green, 307 passed). Same day earlier: spec 22 landed (lifecycle ops — socket ops `run_stop`/`run_rerun`, CLI `tc runs stop`/`tc runs rerun`, terminal states `cancelled`/`stopped` with attested teardown on every stop path, `egg.cancelled`/`chicken.stopped` Headcount rows, `rerun_of` lineage, lexicon terms added first; full suite green, 298 passed). Same day earlier: spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier then: 22, 24, 25); still no code changed.
 
 ---
 
@@ -27,7 +27,7 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10, specs 12–20, and specs 22 and 24 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, the spec-20 commit, the spec-22 commit, and the spec-24 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
+**Spec 01 through spec 10, specs 12–20, and specs 22, 24, and 25 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, the spec-20 commit, the spec-22 commit, the spec-24 commit, and the spec-25 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
 
 Spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality. Spec 19 gave seat auth a GUI surface (see below).
 Verified this session:
@@ -259,6 +259,25 @@ Verified this session:
 #   → tc jobs validate examples/weekly-incidents-digest/job.toml → sha256:18efbd8c… (unchanged,
 #     None excluded from the spec hash); tc daemon stop → rc 0
 #   → full suite: 307 passed (298 + 9 new tests/test_cost_cap.py)
+# spec-25 smoke (subprocess daemon, temp data_dir, fake vibe binary via $TURBOCHICKENS_VIBE_BIN):
+#   → tc run <producer job> --wait → succeeded; tc results get <A> → rc 0 (valid clutch in the nest box)
+#   → tc run <consumer job attachments=["nestbox://<A>/output.json"]> --wait → succeeded; tc runs show <B>
+#     prints manifest chaining=[{attachment, run_id=<A>, artifact_path=…/results/<A>/output.json,
+#     size_bytes=63}] + budget.injected_context_bytes=73 (prompt 10 + clutch 63); audit clutch.consumed
+#     (source_run_id=<A>); tc runs logs <B> shows "chained clutch from chicken <A>: nestbox://… →
+#     nestbox-<A>-output.json (63 bytes)"; tc results get <B> → rc 0
+#   → chain a quarantined clutch (invalid-output job) → rc 1 "failed (provisioning failed: clutch of
+#     chicken '…' is quarantined — it failed candling; only valid clutches can be chained)"; never reached
+#     running (no harness events); budget.outcome=ok; attestation (1,1,1); no results row; workspace gone
+#   → chain a nonexistent chicken → rc 1 "provisioning failed: no clutch in the nest box for chicken …";
+#     same fail-closed shape (attested (1,1,1), no results row)
+#   → over-cap chain (max_context_mb=1, 1 MiB-10 prompt + 63-byte clutch) → rc 1 failed
+#     "budget exceeded at provisioning: injected context 1048629 bytes (1.000 MB) > max_context_mb=1";
+#     budget.outcome=context_cap, injected_context_bytes=1048629, attested (1,1,1), no results row
+#   → tc jobs validate <attachments=["nestbox://run-1/extra/output.json"] job> → rc 1
+#     "error input.attachments: … malformed nestbox URI …"; well-formed nestbox:// URI → OK rc 0
+#   → alerts: 0; tc daemon stop → rc 0
+#   → full suite: 340 passed (307 + 33 new tests/test_chaining.py)
 ```
 
 What exists:
@@ -342,6 +361,13 @@ src/turbochickens/
 │                          # spec 20: LEGACY_EVENT_ALIASES maps pre-20 event names to lexicon names on
 │                          # read/display only (tail() normalizes + matches old and new names; read_all()
 │                          # and the raw file stay untouched)
+├── chaining.py            # spec 25: chaining — `nestbox://<run_id>/output.json` attachments: the URI-shape
+│                          # seams (parse_nestbox_uri / is_nestbox_uri / looks_like_uri — exactly
+│                          # nestbox://<run_id>/output.json, anything else URI-shaped is a spec-load error),
+│                          # attachment_workspace_name (nestbox-<run_id>-output.json in the workspace), and
+│                          # the Nest-Box resolver resolve_nestbox_clutch — valid clutches only;
+│                          # quarantined / composted (retention-swept) / missing / wrong-shape →
+│                          # NestboxError(kind=…) — fail closed, never serves those bytes
 ├── stats.py               # spec 08 pure seam: percentile (linear interpolation) + rollup_usage
 │                          # (n, mean/p50/p95 tokens in/out/total over a job's finished runs)
 ├── retention.py           # spec 08: sweep_expired_results — deletes on-disk result/quarantine
@@ -363,7 +389,9 @@ src/turbochickens/
 │                          # OpenAI-compatible HTTP via httpx, JSON mode, exp backoff on 429/5xx)
 │                          # + adapter weights (API 0.25 / CLI 1.0); PreparedRun carries non-secret
 │                          # auth telemetry (spec 09); seat runs report cost_usd=0.0 billed_via=seat;
-│                          # module-level resolve_vibe_bin/vibe_version helpers (spec 10 probe)
+│                          # module-level resolve_vibe_bin/vibe_version helpers (spec 10 probe);
+│                          # spec 25: _messages reads each attachment from the workspace under
+│                          # attachment_workspace_name (chained clutches land there at provisioning)
 ├── providers.py           # spec 05: providers.toml registry — provider/model presets, base_url,
 │                          # credential env var, context_window, per-token pricing; resolution:
 │                          # settings.providers_path > $TURBOCHICKENS_PROVIDERS > <data_dir>/providers.toml
@@ -386,7 +414,14 @@ src/turbochickens/
 │                          # via the pure seam `cost_cap_exceeded` — over cap → failed with
 │                          # budget.outcome="cost_cap" (budget block gains max_cost_usd/cost_exceeded,
 │                          # resources mirror gains max_cost_usd), no clutch stored, telemetry +
-│                          # attestation as usual; at cap exactly succeeds; seat runs (cost 0.0) never trip
+│                          # attestation as usual; at cap exactly succeeds; seat runs (cost 0.0) never trip;
+│                          # spec 25 (chaining): `_provision` resolves `nestbox://<run_id>/output.json`
+│                          # attachments from the Nest Box via chaining.resolve_nestbox_clutch — valid
+│                          # clutches only; quarantined/composted/missing/malformed → NestboxError →
+│                          # the run fails at provisioning before `running` (attested teardown as usual,
+│                          # no results row); resolved clutch bytes count toward the spec-07 context cap;
+│                          # the manifest gains a `chaining` block (attachment URI + run id + artifact
+│                          # path + size_bytes) and the Headcount gains `clutch.consumed` rows
 ├── scheduler.py           # spec 06: CronScheduler over APScheduler AsyncIOScheduler; standard
 │                          # POSIX cron semantics (aps_trigger resolves the day-of-week field via
 │                          # croniter because APScheduler numbers 0=Monday); schedules re-registered
@@ -407,6 +442,8 @@ src/turbochickens/
 │                          # store valid bundles under uploads/<job>-<spec_hash>/ (audit job.uploaded /
 │                          # job.upload_rejected, never file contents); socket streams raised to
 │                          # SOCKET_STREAM_LIMIT so one request line can carry a bundle;
+│                          # spec 25: jobs_upload no longer requires `nestbox://` attachments to be
+│                          # shipped in the bundle (they resolve from the nest box at provisioning)
 │                          # admission-control scheduler (over-budget
 │                          # backlogs, never rejects); a firing cron submits enqueue trigger=cron over
 │                          # the daemon's own socket; retention sweep at startup + hourly (spec 08);
@@ -447,6 +484,8 @@ src/turbochickens/
 │   ├── model.py           # Pydantic v2 model, all 6 sections, extra="forbid"
 │   │                      # (spec 24: resources.max_cost_usd — optional USD cost cap,
 │   │                      #  positive-only, default None = off; still no max_tokens)
+│   │                      # (spec 25: [input].attachments entries that are URI-shaped must be
+│   │                      #  exactly nestbox://<run_id>/output.json — field-named error otherwise)
 │   └── loader.py          # load_spec(), SpecValidationError (field-named issues), spec_hash()
 │                          # (spec_hash excludes None optionals, so pre-24 spec hashes are unchanged)
 └── cli/main.py            # Typer app `tc`: run [--wait] | runs list/show/logs/stop/rerun (spec 22:
@@ -569,11 +608,22 @@ tests/
                            # tc runs show; at-cap run → succeeded; no-cap run → telemetry + stats;
                            # vibe-cli over/at cap via the fake vibe binary; seat run with a tiny cap →
                            # succeeded (cost_usd 0.0)
+└── test_chaining.py        # spec 25: the nestbox:// URI parse seam (valid / 13 malformed shapes), the
+                           # spec-load validator (field-named input.attachments errors via load_spec +
+                           # tc jobs validate, extra=forbid intact), the pure Nest-Box resolver seam
+                           # (valid / quarantined / composted / missing / wrong-shape), and e2e over a
+                           # thread daemon with the fake vibe binary: producer run lays a clutch, consumer
+                           # chains it → succeeded with manifest chaining lineage + clutch.consumed audit +
+                           # run-log line + injected_context_bytes counting the clutch bytes; quarantined /
+                           # missing / composted references → fail-closed provisioning failure (never
+                           # running, attested (1,1,1), no results row, workspace gone); over-cap chain →
+                           # budget.outcome=context_cap; jobs_upload accepts a nestbox:// attachment
+                           # without shipping it in the bundle and the uploaded job runs chained
 examples/weekly-incidents-digest/   # baseline-format example job (job.toml, prompt, schema, csv; mistral-api)
 examples/hello-vibe-cli/            # manual vibe-cli example job (job.toml, prompt, schema)
 examples/providers.toml             # spec 05 reference provider registry (mistral presets + pricing,
                            # commented other-provider example) — copy to ~/.turbochickens/providers.toml
-pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.15, deps: pydantic, typer, rich, croniter,
+pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.16, deps: pydantic, typer, rich, croniter,
                            # jsonschema (+ rfc3339-validator for format checks), httpx, apscheduler (spec 06),
                            # aiohttp (spec 12, coop web server); dev: pytest
 Dockerfile                 # spec 18: the coop image — python:3.12-slim, pip install . (the wheel ships
@@ -1076,6 +1126,7 @@ Spec-18 deliverables, concretely:
 | 21 | Hatchery & Farmhand overview v0.1 — lifecycle ops (stop/re-run), Free-Range, cost cap (off by default), chaining, Farmhand MCP (stdio/https/both), ChickenSubs, connectors registry, GUI for everything | overview v0.1 — **not ready-for-agent**; split into slices 22+ via to-tickets before implementation | 01–20 |
 | 22 | Lifecycle ops — `run_stop` (queued → `cancelled`, running → SIGTERM/hard kill → `stopped`, attested) + `run_rerun` (lineage) over socket, CLI, and audit | **done** (2026-11-14) | 02–04 |
 | 24 | Feed Budget cost cap — `resources.max_cost_usd` (USD, off by default, finalize-only `budget.outcome = "cost_cap"`, telemetry always recorded) | **done** (2026-11-14) | 05, 08 |
+| 25 | Chaining — `nestbox://<run_id>/output.json` attachments resolved from the Nest Box at provisioning (valid clutches only), counted toward the context cap, lineage in manifest/audit | **done** (2026-11-14) | 04, 07 |
 
 ## 5. Non-negotiable invariants (baseline v0.2 — do not regress these)
 
@@ -1142,7 +1193,7 @@ tables deliberately excluded).
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 - **Version management is a human responsibility.** Coding agents can bump the
   last part of a version number (`0.0.X`) — every other bump (minor, major) is
-  human initiated. Current version: `0.0.15`.
+  human initiated. Current version: `0.0.16`.
 - **No agent as a contributor on GitHub.** See the commits bullet above: the
   `Co-Authored-By` agent trailer is what made GitHub list `mistral-vibe` as a
   contributor — it is banned from commits; humans only in the contributor
@@ -1288,6 +1339,25 @@ finalize: measured cost_usd=… > max_cost_usd=…"); the machine value `cost_ca
 joins the budget outcomes. Verified e2e against a hermetic loopback fake priced
 provider and the fake vibe binary (over / at / no cap, plus a seat run with a
 tiny cap), full suite 307 passed.
+
+Spec 25 (chaining) landed: `[input].attachments` entries may now be
+`nestbox://<run_id>/output.json` URIs. The shape is validated at spec load by
+the new `chaining.py` seam (`parse_nestbox_uri` — anything URI-shaped that is
+not exactly that form is a field-named `input.attachments` error; `extra =
+"forbid"` intact), and resolution happens at provisioning in the Hatchery via
+`resolve_nestbox_clutch` — valid clutches only: a quarantined, composted
+(retention-swept), or missing clutch raises `NestboxError` and the run fails at
+provisioning before `running` (no harness events, attested teardown (1,1,1), no
+results row, workspace gone). Resolved clutch bytes are written into the
+workspace as `nestbox-<run_id>-output.json` (the API adapter injects them like
+any attachment) and count toward `max_context_mb`, so an over-cap chain fails
+with `budget.outcome = "context_cap"` exactly like spec 07. Lineage is recorded
+in the manifest (`chaining`: attachment URI + source run id + artifact path +
+size_bytes), the Headcount (`clutch.consumed` with `source_run_id`), and the run
+log ("chained clutch from chicken …"). `jobs_upload` bundles no longer need
+`nestbox://` attachments shipped in them. Lexicon gained **Chaining** first.
+Verified e2e with the fake vibe binary (happy path + quarantined/missing/
+composted refusals + over-cap chain + upload-and-run), full suite 340 passed.
 
 The MVP spec pipeline (01–10) and the GUI spec 11 slices (12–20) are
 complete; what remains is the post-MVP roadmap in baseline §13.

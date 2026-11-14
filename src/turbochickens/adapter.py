@@ -25,6 +25,7 @@ from typing import Any, Awaitable, Callable, Protocol
 
 import httpx
 
+from turbochickens.chaining import attachment_workspace_name
 from turbochickens.providers import ProvidersConfig, ProvidersError, load_providers
 from turbochickens.spec.model import JobSpec
 
@@ -419,11 +420,13 @@ class MistralAPIAdapter:
         )
 
     def _messages(self, run: RunContext) -> list[dict[str, str]]:
-        """Injected context: prompt + attachments from the workspace, nothing else."""
+        """Injected context: prompt + attachments from the workspace, nothing else.
+        Spec 25: a `nestbox://` attachment was resolved into the workspace at
+        provisioning under its `attachment_workspace_name`."""
         prompt = (run.workspace / "prompt.txt").read_text(encoding="utf-8")
         parts = [prompt]
         for att in run.spec.input.attachments:
-            p = run.workspace / Path(att).name
+            p = run.workspace / attachment_workspace_name(att)
             if p.is_file():
                 parts.append(f"--- attachment: {att} ---\n{p.read_text(encoding='utf-8')}")
         return [{"role": "user", "content": "\n\n".join(parts)}]
