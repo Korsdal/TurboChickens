@@ -28,6 +28,8 @@ packages = ["src/turbochickens"]
 
 [dependency-groups]
 dev = [
+    "packaging>=24",
+    "pyyaml>=6",
     "pytest>=8.3",
 ]
 
