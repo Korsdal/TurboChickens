@@ -18,7 +18,6 @@ import json
 import os
 import shutil
 import subprocess
-import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
@@ -28,6 +27,7 @@ import httpx
 from turbochickens.chaining import attachment_workspace_name
 from turbochickens.providers import ProvidersConfig, ProvidersError, load_providers
 from turbochickens.spec.model import JobSpec
+from turbochickens.util import http_error_detail, sanitize_log_line  # sanitize_log_line re-exported for callers
 
 ADAPTER_WEIGHTS: dict[str, float] = {"mistral-api": 0.25, "vibe-cli": 1.0}
 
@@ -65,18 +65,6 @@ class ProviderConfigError(Exception):
 def run_weight(adapter_name: str) -> float:
     """Resource weight of a run by adapter (baseline v0.2, decision 2)."""
     return ADAPTER_WEIGHTS[adapter_name]
-
-
-def sanitize_log_line(line: str, max_len: int = 4000) -> str:
-    """Make a streamed log line safe to store: strip control/format characters
-    (anything in Unicode category C*, except tab/newline) and cap the length.
-    Logs are data, never instructions."""
-    cleaned = "".join(
-        ch for ch in line if ch in ("\t", "\n") or not unicodedata.category(ch).startswith("C")
-    )
-    if len(cleaned) > max_len:
-        cleaned = cleaned[:max_len] + "…[truncated]"
-    return cleaned
 
 
 @dataclass
@@ -587,16 +575,12 @@ class MistralAPIAdapter:
 
     @staticmethod
     def _error_detail(resp: httpx.Response | None) -> str:
+        # G10: a Feeder's error response is untrusted bytes — only the parsed
+        # `error` field (sanitized) may surface; never the raw `resp.text`,
+        # which could echo credentials or carry terminal escape sequences.
         if resp is None:
             return "no response"
-        try:
-            data = resp.json()
-            msg = data.get("error", {}).get("message") if isinstance(data.get("error"), dict) else None
-            if msg:
-                return str(msg)
-        except ValueError:
-            pass
-        return resp.text[:200]
+        return http_error_detail(resp)
 
     async def _on_success(self, resp: httpx.Response, event_sink: Callable[[str, str, str], Awaitable[None]]) -> HarnessResult:
         try:
