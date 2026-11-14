@@ -1,0 +1,38 @@
+# Platform-level connectors registry (spec 28) — external MCP connectors
+# ("gates") a chicken can opt into via [harness] connectors = ["name", ...].
+#
+# Copy to ~/.turbochickens/connectors.toml (or point $TURBOCHICKENS_CONNECTORS /
+# settings `connectors_path` at a file). Resolution is exactly like
+# providers.toml: settings.connectors_path > $TURBOCHICKENS_CONNECTORS >
+# <data_dir>/connectors.toml. There are no built-in gates.
+#
+# The platform REGISTERS connectors, it never provisions or pays for the
+# third-party service — keys/seats are the operator's own.
+#
+# A stdio gate is spawned by the chicken's harness runtime:
+#   [connectors.NAME]
+#   transport = "stdio"
+#   command = "/path/to/server"
+#   args = ["--flag"]                      # optional
+#   env = { KEY = "value", TOKEN = "$ENV_VAR" }   # optional; $VAR = env ref
+#
+# An https gate is a streamable-HTTP MCP endpoint:
+#   [connectors.NAME]
+#   transport = "https"
+#   url = "https://mcp.example.com/mcp"
+#   headers = { Authorization = "Bearer $ENV_VAR" }  # optional; refs stay refs
+#
+# env/header values may be $ENV_VAR refs — resolved against the daemon
+# environment only at injection into the chicken's workspace config; they are
+# never served in any response, audit row, or manifest.
+
+# [connectors.example-stdio]
+# transport = "stdio"
+# command = "/usr/local/bin/example-mcp"
+# args = ["--serve"]
+# env = { EXAMPLE_TOKEN = "$EXAMPLE_MCP_TOKEN" }
+
+# [connectors.example-https]
+# transport = "https"
+# url = "https://mcp.example.com/mcp"
+# headers = { Authorization = "Bearer $EXAMPLE_MCP_TOKEN" }

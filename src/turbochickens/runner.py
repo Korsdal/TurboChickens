@@ -39,6 +39,15 @@ ordinary queue items: the daemon records `parent_run_id` on the run (schema
 v5), in the manifest, and in the `egg.queued` Headcount row; depth is capped
 at 1 at enqueue.
 
+Spec 28 (connectors registry) adds `harness.connectors`: a list of gate names
+from `connectors.toml` the chicken opts into. The daemon refuses unknown names
+at enqueue (field-named `harness.connectors` error) and the vibe-cli adapter
+injects the chosen gates into the run's vibe config (`[mcp_servers.NAME]`
+entries, merged with a Farmhand entry when both are present) — env/header refs
+are resolved against the daemon environment only into the ephemeral workspace
+config, never into any payload, log, audit row, or manifest (the manifest
+carries names only).
+
 The pipeline owns all SQLite writes for a chicken: status transitions on
 `runs`, streamed `run_events`, the manifest, the `results` row (spec 04: a
 valid clutch is stored in the nest box, an invalid one quarantined), and the
@@ -413,6 +422,8 @@ class RunPipeline:
             "temperature": spec.harness.temperature,
             # spec 27: mirrored in the manifest
             "spawn_subs": spec.harness.spawn_subs,
+            # spec 28: gate names mirrored in the manifest (names only)
+            "connectors": list(spec.harness.connectors),
         }
         budget: dict[str, Any] = {
             # spec 23: a Free-Range chicken has no fence — timeout_sec is the
@@ -514,6 +525,16 @@ class RunPipeline:
                         "info",
                         f"farmhand attached to the harness runtime over stdio"
                         f" (spawn_subs=true, config={harness['farmhand'].get('config')})",
+                    )
+                if harness.get("connectors"):
+                    # spec 28: the opted-in gates were injected into the run's
+                    # vibe config (names only — never env/header material)
+                    await self._event(
+                        run_id,
+                        "supervisor",
+                        "info",
+                        f"gates attached to the harness runtime MCP config: {', '.join(harness['connectors'])}"
+                        " (config=.vibe/config.toml)",
                     )
                 # audit the mode per chicken (non-secret: mode + expiry only)
                 self.audit.append(
@@ -674,6 +695,8 @@ class RunPipeline:
                 "temperature": spec.harness.temperature,
                 # spec 27: mirrored in the manifest
                 "spawn_subs": spec.harness.spawn_subs,
+                # spec 28: gate names mirrored in the manifest (names only)
+                "connectors": list(spec.harness.connectors),
             },
             "started_at": item.get("started_at"),
             "finished_at": now,

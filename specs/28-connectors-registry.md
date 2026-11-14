@@ -4,12 +4,12 @@
 
 **Blocked by:** 26 (builds on the Farmhand's MCP injection pattern); spec 19's access-scope placeholders are the UI home this fills
 
-**Status:** ready-for-agent (split from spec 21 via to-tickets, 2026-11-14)
+**Status:** done (2026-11-14)
 
-- [ ] `connectors.toml` parser: resolution order as above, strict schema (field-named errors), stdio entries need `command`, https entries need `url`, unknown keys forbidden; pure-seam tests
-- [ ] Socket ops `connectors_list` / `connectors_add` / `connectors_rm` mutate the registry file and append audit rows (names per lexicon); list never exposes env secret values — header env refs stay as references
-- [ ] Spec model: `HarnessSection` gains `connectors: list[str] = []`; unknown connector names in the list → field-named error at spec load or enqueue
-- [ ] E2E: a chicken with `[harness] connectors = ["x"]` gets connector "x" injected into its harness runtime MCP config (fake vibe binary asserts the entry); a chicken without the key gets none
-- [ ] Secrecy: no connector env/header secret material in any response, audit row, or manifest
-- [ ] Tests: pure seam for the parser + spec field; e2e for injection; full suite green
-- [ ] `STATUS.md` updated at the slice boundary
+- [x] `connectors.toml` parser: resolution order as above, strict schema (field-named errors), stdio entries need `command`, https entries need `url`, unknown keys forbidden; pure-seam tests (`tests/test_connectors.py`: resolution order explicit > `$TURBOCHICKENS_CONNECTORS` > `<data_dir>/connectors.toml` > empty registry, missing explicit/env file errors, strict-schema cases incl. unknown keys / bad transport / non-http(s) url / empty command, discriminated-union tag stripped from field names)
+- [x] Socket ops `connectors_list` / `connectors_add` / `connectors_rm` mutate the registry file (atomic write, always 0600, replace-on-re-add) and append audit rows (`gate.registered` / `gate.removed` / `gate.rejected` — name + transport + field names only, per lexicon's new Gate term); list never exposes env secret values (stdio `env` served as `env_keys` only) — header env refs stay as references; CLI parity `tc connectors list/add/rm`
+- [x] Spec model: `HarnessSection` gains `connectors: list[str] = []` (`extra="forbid"` intact, `connectors = []` dropped from `spec_hash` so the shipped example stays `sha256:18efbd8c…80b959`); unknown connector names → field-named `harness.connectors` error at enqueue (nothing queued); non-vibe-cli adapters refused the list at enqueue (no harness runtime to inject into)
+- [x] E2E: a chicken with `[harness] connectors = ["toolx", "webx"]` gets both gates injected into its harness runtime MCP config (`[mcp_servers.NAME]` entries in `<workspace>/.vibe/config.toml`, merged with the spec-27 Farmhand entry when `spawn_subs` is also set — fake vibe binary asserts the entries, side-copied raw config asserts resolved refs); a chicken without the key gets no config; unresolvable `$VAR` refs fail closed at provisioning (attested (1,1,1), no results row)
+- [x] Secrecy: no connector env/header secret material in any response, audit row, manifest, run log, or result — `$VAR` refs resolved against the daemon env only into the ephemeral workspace config (asserted with a configured secret over socket + CLI + audit + results)
+- [x] Tests: pure seams for the parser + spec field + payload validation; socket CRUD + enqueue refusals + `auth_access` gate names over a thread daemon; e2e injection over the fake vibe binary; CLI round-trip; full suite green — 391 passed (374 + 17 new `tests/test_connectors.py`)
+- [x] `STATUS.md` updated at the slice boundary

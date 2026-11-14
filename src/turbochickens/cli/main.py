@@ -40,6 +40,10 @@ farmhand_app = typer.Typer(
     help="Farmhand — the MCP server over the farm's own socket ops (spec 26): stdio and/or HTTPS.",
     no_args_is_help=True,
 )
+connectors_app = typer.Typer(
+    help="Gates — the connectors registry (connectors.toml); chickens opt in via [harness] connectors (spec 28).",
+    no_args_is_help=True,
+)
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(runs_app, name="runs")
@@ -50,6 +54,7 @@ app.add_typer(auth_app, name="auth")
 app.add_typer(models_app, name="models")
 app.add_typer(coop_app, name="coop")
 app.add_typer(farmhand_app, name="farmhand")
+app.add_typer(connectors_app, name="connectors")
 
 err_console = Console(stderr=True)
 console = Console()
@@ -705,6 +710,89 @@ def farmhand_serve(
     except OSError as e:
         err_console.print(f"[bold red]error[/bold red] cannot serve the farmhand https listener: {e}")
         raise typer.Exit(code=1) from None
+
+
+def _parse_kv_pairs(pairs: list[str] | None, flag: str) -> dict[str, str]:
+    """Parse repeatable `--env KEY=VALUE` / `--header NAME=REF` options."""
+    out: dict[str, str] = {}
+    for p in pairs or []:
+        if "=" not in p:
+            err_console.print(f"[bold red]error[/bold red] {flag} entries must be KEY=VALUE, got {p!r}")
+            raise typer.Exit(code=1)
+        k, v = p.split("=", 1)
+        if not k or not v:
+            err_console.print(f"[bold red]error[/bold red] {flag} entries need a non-empty key and value, got {p!r}")
+            raise typer.Exit(code=1)
+        out[k] = v
+    return out
+
+
+@connectors_app.command("list")
+def connectors_list(
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """List the registered gates (connectors) with non-secret summaries — never env values."""
+    resp = _request_or_exit(settings_path, "connectors_list")
+    if not resp["connectors"]:
+        typer.echo("no gates registered")
+        return
+    for c in resp["connectors"]:
+        if c["transport"] == "stdio":
+            typer.echo(
+                f"gate={c['name']}  transport=stdio  command={c['command']}  args={c['args']}"
+                f"  env_keys={c['env_keys']}"
+            )
+        else:
+            typer.echo(f"gate={c['name']}  transport=https  url={c['url']}  headers={c['headers']}")
+
+
+@connectors_app.command("add")
+def connectors_add(
+    name: str = typer.Argument(..., help="Gate name, e.g. 'toolx'."),
+    transport: str = typer.Option(..., "--transport", help="'stdio' (command/args/env) or 'https' (url/headers)."),
+    command: str | None = typer.Option(None, "--command", help="stdio: the command to spawn."),
+    args: list[str] | None = typer.Option(None, "--arg", help="stdio: one command argument (repeatable)."),
+    env: list[str] | None = typer.Option(None, "--env", help="stdio: KEY=VALUE (repeatable); values may be $ENV refs."),
+    url: str | None = typer.Option(None, "--url", help="https: the MCP endpoint URL."),
+    headers: list[str] | None = typer.Option(
+        None, "--header", help="https: NAME=REF (repeatable), e.g. --header 'Authorization=Bearer $TOKEN'."
+    ),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Register (or replace) a gate in connectors.toml. Env/header values may be
+    $ENV refs — they stay references everywhere the platform serves them."""
+    payload: dict = {"transport": transport}
+    if command is not None:
+        payload["command"] = command
+    if args:
+        payload["args"] = list(args)
+    kv_env = _parse_kv_pairs(env, "--env")
+    if kv_env:
+        payload["env"] = kv_env
+    if url is not None:
+        payload["url"] = url
+    kv_headers = _parse_kv_pairs(headers, "--header")
+    if kv_headers:
+        payload["headers"] = kv_headers
+    resp = _daemon_request(settings_path, "connectors_add", timeout=10.0, name=name, **payload)
+    if not resp.get("ok"):
+        if resp.get("errors"):
+            for e in resp["errors"]:
+                err_console.print(f"[bold red]error[/bold red] {e['field']}: {e['message']}")
+        else:
+            err_console.print(f"[bold red]error[/bold red] {resp.get('error', 'unknown error')}")
+        raise typer.Exit(code=1)
+    typer.echo(f"registered gate '{resp['name']}' (transport={resp['transport']}) — registry: {resp['source']}")
+
+
+@connectors_app.command("rm")
+def connectors_rm(
+    name: str = typer.Argument(..., help="Gate name to remove."),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Remove a gate from connectors.toml."""
+    resp = _request_or_exit(settings_path, "connectors_rm", name=name)
+    typer.echo(f"removed gate '{resp['name']}' (transport={resp['transport']})")
 
 
 @app.callback()

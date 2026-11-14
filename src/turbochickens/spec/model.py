@@ -14,6 +14,11 @@ the pairing is validated here (``free_range = false`` requires
 Spec 27 (ChickenSubs) adds ``harness.spawn_subs``: a chicken with
 ``spawn_subs = true`` gets the Farmhand attached to its harness runtime over
 stdio, so it can enqueue sub-eggs (lineage ``parent_run_id``, depth cap 1).
+Spec 28 (connectors registry) adds ``harness.connectors``: a list of gate
+names from ``connectors.toml`` that this chicken opts into — the adapter
+injects them into the harness runtime's MCP config. Unknown names are
+refused at enqueue (field-named ``harness.connectors`` error), and the list
+is only supported with the vibe-cli adapter (the only one with a runtime).
 """
 
 from __future__ import annotations
@@ -82,6 +87,11 @@ class HarnessSection(_StrictModel):
     # farm's own contract. Only the vibe-cli harness has a runtime to attach
     # to; the daemon refuses spawn_subs = true for other adapters at enqueue.
     spawn_subs: bool = False
+    # spec 28 (connectors registry): gate names from connectors.toml this
+    # chicken opts into — injected into the harness runtime's MCP config at
+    # provisioning. Unknown names are refused at enqueue (field-named
+    # `harness.connectors` error); only vibe-cli has a runtime to inject into.
+    connectors: list[str] = Field(default_factory=list)
 
 
 class ResourcesSection(_StrictModel):

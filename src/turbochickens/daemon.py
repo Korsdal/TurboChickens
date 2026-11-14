@@ -78,6 +78,20 @@ is capped at 1 — enqueue refuses a ``spawn_subs = true`` egg when the
 enqueuing run is itself a sub (field-named ``harness.spawn_subs`` error) —
 and ``run_stop`` with a ``caller_run_id`` refuses targets that are the caller's
 ancestors. ``runs_show``/``runs_list`` rows carry ``parent_run_id``.
+
+Spec 28 (connectors registry) adds the ops ``connectors_list`` /
+``connectors_add`` / ``connectors_rm`` — CRUD over the ``connectors.toml``
+registry (resolved exactly like ``providers.toml``: ``settings.connectors_path``
+> ``$TURBOCHICKENS_CONNECTORS`` > ``<data_dir>/connectors.toml``), audit-logged
+as ``gate.registered`` / ``gate.removed`` / ``gate.rejected`` with name +
+transport only — never env/header material. ``connectors_list`` serves
+non-secret summaries only (stdio env as key names, https headers as refs).
+``enqueue`` refuses ``harness.connectors`` names that are not registered
+(field-named ``harness.connectors`` error) and refuses the list for
+non-vibe-cli adapters (no harness runtime to inject into); the vibe-cli
+adapter injects the chosen gates into the run's vibe config at provisioning.
+``auth_access`` now fills its ``connectors`` scope entry with the registered
+gate names.
 """
 
 from __future__ import annotations
@@ -97,6 +111,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from turbochickens import __version__
 from turbochickens.adapter import (
     BASE_ENV_KEYS,
@@ -107,6 +123,18 @@ from turbochickens.adapter import (
 )
 from turbochickens.audit import AuditLog
 from turbochickens.chaining import is_nestbox_uri
+from turbochickens.connectors import (
+    ConnectorsConfig,
+    ConnectorsError,
+    entry_to_dict,
+    fmt_error_loc,
+    load_connectors,
+    public_entry,
+    read_registry_raw,
+    resolve_connectors_path,
+    save_registry,
+    validate_connector_payload,
+)
 from turbochickens.providers import ProvidersConfig, load_providers
 from turbochickens.retention import sweep_expired_results
 from turbochickens.runner import TERMINAL_STATES, RunPipeline
@@ -403,6 +431,13 @@ class Daemon:
             return self._auth_login_poll(req)
         if op == "auth_logout":
             return self._auth_logout(req)
+        # spec 28: connectors registry CRUD (gates)
+        if op == "connectors_list":
+            return self._connectors_list()
+        if op == "connectors_add":
+            return self._connectors_add(req)
+        if op == "connectors_rm":
+            return self._connectors_rm(req)
         if op == "shutdown":
             self.request_stop()
             return {"ok": True, "op": "shutdown", "protocol": PROTOCOL_VERSION, "message": "shutting down"}
@@ -514,6 +549,39 @@ class Daemon:
                 "error": msg,
                 "errors": [{"field": "harness.spawn_subs", "message": msg}],
             }
+        connector_names = list(spec.harness.connectors)
+        if connector_names:
+            # spec 28: gates are injected into the harness runtime's MCP
+            # config — only vibe-cli has one; unknown gate names fail closed
+            if spec.harness.adapter != "vibe-cli":
+                msg = (
+                    f"harness.connectors: adapter {spec.harness.adapter!r} has no harness runtime MCP"
+                    " config to inject connectors into — connectors are only supported with"
+                    " adapter 'vibe-cli'"
+                )
+                return {
+                    "ok": False,
+                    "protocol": PROTOCOL_VERSION,
+                    "error": msg,
+                    "errors": [{"field": "harness.connectors", "message": msg}],
+                }
+            try:
+                registry = load_connectors(self.settings.connectors_path, self.settings.data_dir)
+            except ConnectorsError as e:
+                return {"ok": False, "protocol": PROTOCOL_VERSION, "error": str(e)}
+            unknown = [n for n in connector_names if n not in registry.connectors]
+            if unknown:
+                msg = (
+                    f"harness.connectors: unknown connector {', '.join(repr(n) for n in unknown)} —"
+                    f" known connectors: {', '.join(sorted(registry.connectors)) or '(none)'};"
+                    " register gates in connectors.toml (connectors_add)"
+                )
+                return {
+                    "ok": False,
+                    "protocol": PROTOCOL_VERSION,
+                    "error": msg,
+                    "errors": [{"field": "harness.connectors", "message": msg}],
+                }
         from turbochickens.adapter import make_adapter
 
         try:
@@ -1182,11 +1250,32 @@ class Daemon:
     def _auth_access(self) -> dict[str, Any]:
         """The declared access scope (spec 19, read-only groundwork): the
         per-run env allowlist the pipeline actually enforces, the declared
-        network policy, and placeholders for tools / data / MCP / connectors
-        so a future host-broker access layer (baseline v0.2 §7) has a home.
-        No enforcement beyond what specs 02–09 already enforce."""
+        network policy, and placeholders for tools / data / MCP so a future
+        host-broker access layer (baseline v0.2 §7) has a home. The
+        ``connectors`` entry (spec 28) is no longer a placeholder: it lists
+        the registered gate names from connectors.toml — names only, never
+        env/header material. No enforcement beyond what specs 02–09 already
+        enforce."""
         placeholder = (
             "declared: none — placeholder for the host broker deciding what a job may touch (baseline v0.2 §7)"
+        )
+        try:
+            gate_names = sorted(load_connectors(self.settings.connectors_path, self.settings.data_dir).connectors)
+        except ConnectorsError:
+            gate_names = []  # an unreadable registry never breaks the Auth view
+        scope = [
+            {"kind": kind, "declared": None, "note": placeholder} for kind in ("tools", "data", "mcp_servers")
+        ]
+        scope.append(
+            {
+                "kind": "connectors",
+                "declared": gate_names,
+                "note": (
+                    "registered gates (connectors.toml); a chicken opts in via harness.connectors and gets"
+                    " the gates injected into its harness runtime MCP config — names only, never env/header"
+                    " material"
+                ),
+            }
         )
         return {
             "ok": True,
@@ -1200,10 +1289,7 @@ class Daemon:
                 "network_allowed": list(NETWORK_POLICIES),
                 "network_enforced": False,
                 "network_note": "declared in resources.network; enforcement is post-MVP",
-                "scope": [
-                    {"kind": kind, "declared": None, "note": placeholder}
-                    for kind in ("tools", "data", "mcp_servers", "connectors")
-                ],
+                "scope": scope,
             },
         }
 
@@ -1301,6 +1387,103 @@ class Daemon:
         assert self.audit is not None
         self.audit.append({"event": "perch.released", "provider": provider, "mode": "seat"})
         return {"ok": True, "op": "auth_logout", "protocol": PROTOCOL_VERSION, "provider": provider}
+
+    # --- spec 28: connectors registry CRUD (gates) ------------------------------
+
+    def _connectors_list(self) -> dict[str, Any]:
+        """The registered gates with non-secret summaries only: stdio gates
+        expose command/args and the *names* of env keys; https gates expose the
+        url and the header refs as references. Env values and resolved headers
+        are never served. Audit is untouched (read-only)."""
+        try:
+            path = resolve_connectors_path(self.settings.connectors_path, self.settings.data_dir)
+            config = load_connectors(self.settings.connectors_path, self.settings.data_dir)
+        except ConnectorsError as e:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": str(e)}
+        return {
+            "ok": True,
+            "op": "connectors_list",
+            "protocol": PROTOCOL_VERSION,
+            "source": str(path) if path is not None else None,
+            "connectors": [public_entry(n, e) for n, e in sorted(config.connectors.items())],
+        }
+
+    def _connectors_add(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Register (or replace) one gate in the registry file. The payload is
+        `{name, transport, ...}` validated strictly (field-named errors); the
+        file is rewritten atomically (created 0600) and the change is audited
+        as `gate.registered` — name + transport only, never env/header
+        material. Re-adding an existing name replaces its entry."""
+        name = str(req.get("name", ""))
+        payload = {k: v for k, v in req.items() if k not in ("op", "protocol", "name")}
+        entry, errors = validate_connector_payload(name, payload)
+        if entry is None:
+            assert self.audit is not None
+            self.audit.append(
+                {"event": "gate.rejected", "name": name or None, "fields": [e["field"] for e in errors]}
+            )
+            return {"ok": False, "valid": False, "protocol": PROTOCOL_VERSION, "errors": errors}
+        try:
+            path = resolve_connectors_path(self.settings.connectors_path, self.settings.data_dir)
+            config = load_connectors(self.settings.connectors_path, self.settings.data_dir)
+            raw = read_registry_raw(path)
+        except ConnectorsError as e:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": str(e)}
+        raw.setdefault("connectors", {})[name] = entry_to_dict(entry)
+        # the whole file must still validate before it is written
+        try:
+            ConnectorsConfig.model_validate(raw)
+        except ValidationError as e:
+            return {
+                "ok": False,
+                "valid": False,
+                "protocol": PROTOCOL_VERSION,
+                "errors": [
+                    {"field": fmt_error_loc(err["loc"]), "message": err["msg"]}
+                    for err in e.errors()
+                ],
+            }
+        source = save_registry(path, raw, self.settings.data_dir)
+        assert self.audit is not None
+        self.audit.append({"event": "gate.registered", "name": name, "transport": entry.transport})
+        return {
+            "ok": True,
+            "op": "connectors_add",
+            "protocol": PROTOCOL_VERSION,
+            "name": name,
+            "transport": entry.transport,
+            "entry": public_entry(name, entry),
+            "source": str(source),
+        }
+
+    def _connectors_rm(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Remove one gate from the registry file (audit `gate.removed`, name
+        + transport only). Unknown names are a clean error."""
+        name = str(req.get("name", ""))
+        if not name:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "connectors_rm requires name"}
+        try:
+            path = resolve_connectors_path(self.settings.connectors_path, self.settings.data_dir)
+            config = load_connectors(self.settings.connectors_path, self.settings.data_dir)
+        except ConnectorsError as e:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": str(e)}
+        entry = config.connectors.get(name)
+        if entry is None:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": (
+                    f"unknown gate: no connector named {name!r} registered —"
+                    f" known connectors: {', '.join(sorted(config.connectors)) or '(none)'}"
+                ),
+            }
+        raw = read_registry_raw(path)
+        raw.get("connectors", {}).pop(name, None)
+        if path is not None:
+            save_registry(path, raw, self.settings.data_dir)
+        assert self.audit is not None
+        self.audit.append({"event": "gate.removed", "name": name, "transport": entry.transport})
+        return {"ok": True, "op": "connectors_rm", "protocol": PROTOCOL_VERSION, "name": name, "transport": entry.transport}
 
     # --- spec 15: upload + validate job-spec bundles from the GUI -------------
 

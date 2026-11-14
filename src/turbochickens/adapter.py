@@ -258,6 +258,9 @@ class VibeCLIAdapter:
             "temperature": run.spec.harness.temperature,
             # spec 27 (ChickenSubs): mirrored in the manifest
             "spawn_subs": run.spec.harness.spawn_subs,
+            # spec 28 (connectors): gate names opted into via harness.connectors
+            # — mirrored in the manifest as names only, never env/header material
+            "connectors": list(run.spec.harness.connectors),
         }
         if run.spec.harness.spawn_subs and self.settings is not None:
             # spec 27: attach the Farmhand to this chicken's harness runtime
@@ -267,6 +270,15 @@ class VibeCLIAdapter:
             from turbochickens.farmhand import attach_farmhand_to_run
 
             harness["farmhand"] = attach_farmhand_to_run(run, self.settings)
+        if run.spec.harness.connectors and self.settings is not None:
+            # spec 28: inject the opted-in gates into the run's vibe config
+            # (same file as the Farmhand entry) as [mcp_servers.NAME] entries
+            # — env/header refs are resolved against the daemon environment
+            # here, landing only in the ephemeral workspace config; unknown
+            # gates / unresolvable refs raise and the run fails closed
+            from turbochickens.connectors import attach_connectors_to_run
+
+            attach_connectors_to_run(run, self.settings)
         return PreparedRun(
             context=run,
             harness=harness,
@@ -440,6 +452,9 @@ class MistralAPIAdapter:
                 # HTTP adapter has no harness runtime to attach to; enqueue
                 # refuses spawn_subs = true for this adapter)
                 "spawn_subs": run.spec.harness.spawn_subs,
+                # spec 28: mirrored in the manifest (enqueue refuses a
+                # non-empty list for this adapter — no runtime to inject into)
+                "connectors": list(run.spec.harness.connectors),
             },
             # spec 09: "seat" providers inject the broker's access token under
             # api_key_env (same var), so the bearer header below is unchanged

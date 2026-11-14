@@ -4,7 +4,7 @@
 
 ## The Story
 
-A **Egg** (job spec) is **Candled** (validated) and waits in the **Pecking Order** (queue). The **Hatchery** hatches it into a **Chicken** (a running agent) — optionally **Free-Range** (no max TTL) — fed by the **Feeders** (model providers) within its **Feed Budget**. When the Chicken finishes, it lays a **Clutch** (its output artifacts) in the **Nest Box** (results store). Then the **Abattoir** performs the attested teardown of the Chicken, and old Clutches eventually rot away in the **Compost** (retention). The **Rooster** keeps time (schedules), the **Fox** watches the fence (security), the **Perch** is where seats are claimed (auth), and the **Headcount** (audit log) records everything. The **Coop** is the management interface, run by **Coopd**; outsiders ask the **Farmhand** (MCP) for chores.
+A **Egg** (job spec) is **Candled** (validated) and waits in the **Pecking Order** (queue). The **Hatchery** hatches it into a **Chicken** (a running agent) — optionally **Free-Range** (no max TTL) — fed by the **Feeders** (model providers) within its **Feed Budget**. When the Chicken finishes, it lays a **Clutch** (its output artifacts) in the **Nest Box** (results store). Then the **Abattoir** performs the attested teardown of the Chicken, and old Clutches eventually rot away in the **Compost** (retention). The **Rooster** keeps time (schedules), the **Fox** watches the fence (security), the **Perch** is where seats are claimed (auth), and the **Headcount** (audit log) records everything. The **Coop** is the management interface, run by **Coopd**; outsiders ask the **Farmhand** (MCP) for chores, and registered **Gates** are the openings in the fence to outside tool services.
 
 The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget results, results feed future jobs.
 
@@ -30,6 +30,7 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 | **Re-run** | Hatching the same Egg again as a fresh Chicken, new run ID, lineage recorded | `run_rerun` / manifest `rerun_of` |
 | **Chaining** | An Egg consuming an earlier Chicken's Clutch via a `nestbox://<run_id>/output.json` attachment — resolved from the Nest Box at provisioning, valid clutches only | `chaining.py`, manifest `chaining`, Headcount `clutch.consumed` |
 | **ChickenSub** | A sub-chicken — a Chicken spawned by another Chicken through its attached Farmhand (stdio), enqueued as an ordinary Egg in the same Pecking Order with lineage `parent_run_id`, depth capped at 1, and a narrower Farmhand tool set (enqueue + read only; it cannot stop its ancestors) | `harness.spawn_subs`, `runs.parent_run_id`, `farmhand.py` |
+| **Gate** | A registered external MCP connector — an opening in the fence to an outside tool service. The platform only *registers* gates (connectors.toml, CRUD via `connectors_*` ops, Headcount `gate.registered`/`gate.removed`/`gate.rejected`); it never provisions or pays for the third party. A Chicken opts in per egg via `[harness] connectors = ["name", …]` and gets the chosen gates injected into its harness runtime's MCP config. Env/header values are secrets: refs (`$VAR`) stay refs in every served payload, values never appear in any response, audit row, or manifest | `connectors.toml`, `connectors.py`, `harness.connectors` |
 
 ## Support Cast
 

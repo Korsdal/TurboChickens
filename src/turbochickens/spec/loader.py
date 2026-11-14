@@ -92,6 +92,10 @@ def spec_hash(spec: JobSpec) -> str:
     harness = data.get("harness")
     if isinstance(harness, dict) and harness.get("spawn_subs") is False:
         del harness["spawn_subs"]
+    # spec 28: `connectors = []` is the pre-28 default — same treatment, so
+    # existing egg hashes are unchanged
+    if isinstance(harness, dict) and harness.get("connectors") == []:
+        del harness["connectors"]
     canonical = json.dumps(
         data,
         sort_keys=True,

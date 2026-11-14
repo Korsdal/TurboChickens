@@ -51,6 +51,14 @@ class Settings(BaseModel):
         description="Explicit providers.toml path (spec 05); else $TURBOCHICKENS_PROVIDERS, "
         "else <data_dir>/providers.toml, else built-in defaults.",
     )
+    # spec 28 (connectors registry): explicit connectors.toml path; else
+    # $TURBOCHICKENS_CONNECTORS, else <data_dir>/connectors.toml (no file = an
+    # empty registry — there are no built-in gates)
+    connectors_path: Path | None = Field(
+        default=None,
+        description="Explicit connectors.toml path (spec 28); else $TURBOCHICKENS_CONNECTORS, "
+        "else <data_dir>/connectors.toml, else an empty registry.",
+    )
     # spec 12 (coop): the daemon serves the TurboChickens GUI over HTTP in its
     # own event loop when enabled — `tc coop start`, or `tc daemon start` with
     # coop_enabled = true (the coop container's CMD)
@@ -141,6 +149,7 @@ class Settings(BaseModel):
             "seats_dir": str(self.seats_dir),
             "uploads_dir": str(self.uploads_dir),
             "providers_path": str(self.providers_path) if self.providers_path else None,
+            "connectors_path": str(self.connectors_path) if self.connectors_path else None,
             "weight_budget_override": self.weight_budget_override,
             "weight_budget": self.weight_budget,
             "audit_retention": self.audit_retention,

@@ -338,7 +338,13 @@ def test_auth_access_declared_scope_with_socket_parity(seat_coop_daemon) -> None
     assert access["network_allowed"] == ["none"]
     assert access["network_enforced"] is False
     assert [s["kind"] for s in access["scope"]] == ["tools", "data", "mcp_servers", "connectors"]
-    assert all(s["declared"] is None and s["note"] for s in access["scope"])
+    by_kind = {s["kind"]: s for s in access["scope"]}
+    # spec 19 placeholders stay placeholders for tools/data/mcp_servers…
+    assert all(by_kind[k]["declared"] is None and by_kind[k]["note"] for k in ("tools", "data", "mcp_servers"))
+    # …but spec 28 filled the connectors entry: the registered gate names
+    # (this fixture registers none, so the list is empty) — names only
+    assert by_kind["connectors"]["declared"] == []
+    assert by_kind["connectors"]["note"]
     for marker in SECRET_MARKERS:
         assert marker not in r.text
 

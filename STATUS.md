@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-14, after spec 27 landed (ChickenSubs — `harness.spawn_subs = true` attaches the Farmhand to the chicken's vibe-cli runtime over stdio: `attach_farmhand_to_run` writes an MCP server entry into the run's vibe config (project-local `.vibe/config.toml` in the workspace) spawning the farmhand serve command (the venv-sibling `tc`, else `python -m turbochickens`) plus a token-free settings file the per-run env points at via `TURBOCHICKENS_SETTINGS`, so the spawned Farmhand finds this daemon's socket; `RunContext`/`make_adapter` carry `parent_run_id` + settings, and the manifest harness block gains `spawn_subs` + `farmhand`); subs are ordinary eggs through the same socket/queue/admission (weight unchanged) with lineage `parent_run_id` recorded on the new `runs.parent_run_id` column (schema v5, in-place ALTER migration, old rows NULL), in the manifest, in the `egg.queued` Headcount row, and in `runs_show`/`runs_list` rows; `enqueue` accepts `parent_run_id` (unknown parent refused; depth capped at 1 — a sub enqueueing a `spawn_subs = true` egg is refused with a field-named `harness.spawn_subs` error; `spawn_subs` refused for non-vibe-cli adapters at enqueue); `run_stop` with `caller_run_id` refuses targets that are the caller's ancestors; `build_server` reads `TURBOCHICKENS_RUN_ID`/`TURBOCHICKENS_PARENT_RUN_ID` from the per-run env so a Farmhand inside a chicken tags `enqueue` with `parent_run_id` and `run_stop` with `caller_run_id`, and a sub-chicken's Farmhand serves the narrowed tool set (enqueue + read tools + the guarded `run_stop` — no jobs_validate/run_rerun/schedule_*/settings_get); `spec_hash` drops `spawn_subs=false` so the shipped example stays `sha256:18efbd8c…80b959`; version bumped 0.0.18 → 0.0.19; lexicon gained ChickenSub; full suite green, 374 passed (362 + 12 new tests/test_chickensubs.py)). Earlier same day: spec 26 landed (the Farmhand — new module `farmhand.py`: an MCP server on the official `mcp` Python SDK (new dependency, version bumped 0.0.17 → 0.0.18) whose 17 tools are thin wrappers over the daemon's existing socket ops via `client.request_async` — `status`, `jobs_list`, `jobs_validate` (wraps `jobs_upload`: candle a files bundle or a local `spec_path`), `enqueue`, `runs_list`, `runs_show`, `runs_logs`, `results_get`, `run_stop`, `run_rerun`, `schedule_add`/`schedule_list`/`schedule_rm`, `stats_list`/`stats_show`, `audit_tail`, `settings_get` — served over stdio (`tc farmhand serve --transport stdio|https|both`, informational output on stderr only so the protocol channel stays clean) and/or HTTPS (streamable-HTTP at `farmhand_https_path`, default `/mcp`, mounted into the coop's aiohttp listener via a small ASGI bridge `asgi_request` + the SDK's Starlette app with its lifespan run — no second port — behind the same bearer middleware as `/api/*`, loopback-open rule included, ephemeral token printed once like coop); settings gained `farmhand_transport` (`"stdio"|"https"|"both"`, default `"both"`) and `farmhand_https_path` (single absolute path segment, default `/mcp`) with `extra="forbid"` intact and both exposed in `public_dict()`; MCP scope is narrower than the GUI bearer — no `auth_*` ops, no `retention_sweep`, no `shutdown`/`ping`/raw `jobs_upload`, settings read-only; no tool payload ever contains token material (asserted with a configured token over both transports, and against the audit log); `"both"` serves stdio and HTTPS simultaneously in one `tc farmhand serve` process (when the stdio client hangs up the process exits); coopd binds its unix socket only after the coop (and the Farmhand endpoint) is up, so a ping OK implies the HTTP surface is up and its `coop.started` row is already audited; the coop/standalone aiohttp runners got `shutdown_timeout=15` so a hung MCP SSE stream can never wedge shutdown; full suite green, 362 passed (353 + 9 new tests/test_farmhand.py)). Same day earlier: spec 23 landed (Free-Range chickens — `resources.free_range = true` removes the hard wall-clock kill: `timeout_sec` becomes optional (`int | None`, `gt=0`, `validate_default=True`) with the pairing enforced at spec load (`free_range = false` — the default — requires `timeout_sec > 0`, field-named `resources.timeout_sec` error; `free_range = true` allows it absent and never hard-kills even if present; `extra="forbid"` intact; `spec_hash` drops `free_range=false` so pre-23 egg hashes are unchanged, the shipped example still `sha256:18efbd8c…80b959`); adapters take `timeout_sec: int | None` (`None` = no hard kill — `wait_for(..., None)` waits forever, the API adapter keeps only its 10s connect timeout); the Hatchery enforces `hard_timeout = None if free_range else timeout_sec` and the manifest `resources` + `budget` blocks gain `free_range`; a Free-Range chicken dies only via `run_stop` (spec 22) or daemon shutdown — on shutdown the daemon calls `pipeline.request_stop_free_range()` before the bounded drain, so an in-flight free-range chicken ends `stopped` via the SIGTERM/hard-kill path with attestation (1,1,1) + `chicken.stopped`/`abattoir.attested` audit rows before exit; decision-log amendment for baseline invariants 1/2 recorded in `specs/23-free-range-chickens.md` + §5 below; full suite green, 353 passed (340 + 13 new tests/test_free_range.py)). Same day: spec 25 landed (chaining — `attachments = ["nestbox://<run_id>/output.json"]` in `[input]`: URI shape validated at spec load with field-named errors (`input.attachments`), resolved at provisioning from the Nest Box via the new `chaining.py` seam — valid clutches only, quarantined/composted/missing/malformed → fail-closed provisioning failure before `running` with attested teardown (1,1,1) and no results row; resolved clutch bytes count toward `max_context_mb` (over-cap chain → `budget.outcome = "context_cap"` exactly like spec 07); lineage in the manifest `chaining` block (run id + artifact path + bytes) + `clutch.consumed` Headcount rows + a run-log line; `jobs_upload` bundles no longer need nestbox attachments shipped in them; lexicon gained Chaining; full suite green, 340 passed). Same day earlier: spec 24 landed (Feed Budget cost cap — optional per-egg `resources.max_cost_usd` in USD, off by default, enforced finalize-only: over cap → run failed with `budget.outcome = "cost_cap"` in the existing manifest budget block, cost/token telemetry still recorded, teardown attested as usual; pure seam `cost_cap_exceeded`; full suite green, 307 passed). Same day earlier: spec 22 landed (lifecycle ops — socket ops `run_stop`/`run_rerun`, CLI `tc runs stop`/`tc runs rerun`, terminal states `cancelled`/`stopped` with attested teardown on every stop path, `egg.cancelled`/`chicken.stopped` Headcount rows, `rerun_of` lineage, lexicon terms added first; full suite green, 298 passed). Same day earlier: spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier then: 22, 24, 25); still no code changed.
+**Last updated:** 2026-11-14, after spec 28 landed (connectors registry — new module `connectors.py`: a `connectors.toml` registry resolved exactly like `providers.toml` (`settings.connectors_path` > `$TURBOCHICKENS_CONNECTORS` > `<data_dir>/connectors.toml`, no built-in gates) with `[connectors.NAME]` entries — `transport = "stdio"` (command/args/env) or `transport = "https"` (url + header env refs), strict schema with field-named errors (discriminated union on `transport`, tag stripped from error paths), `extra="forbid"` intact; new socket ops `connectors_list`/`connectors_add`/`connectors_rm` (CRUD over the registry file — atomic rewrite, always 0600, replace-on-re-add) audit-logged as `gate.registered`/`gate.removed`/`gate.rejected` with name+transport+field names only, plus `tc connectors list/add/rm`; `connectors_list` serves non-secret summaries only (stdio `env` as `env_keys`, https `headers` as refs) and `auth_access` now fills its `connectors` scope entry with the registered gate names; `HarnessSection` gains `connectors: list[str] = []` (`extra="forbid"` intact, `connectors = []` dropped from `spec_hash` so the shipped example stays `sha256:18efbd8c…80b959`); enqueue refuses unknown names with a field-named `harness.connectors` error (nothing queued) and refuses the list for non-vibe-cli adapters; the vibe-cli adapter injects the opted-in gates into the run's vibe config (`[mcp_servers.NAME]` entries appended to `<workspace>/.vibe/config.toml`, merged with the spec-27 Farmhand entry when both are present) — `$VAR`/`${VAR}` env/header refs are resolved against the daemon environment only into the ephemeral workspace config, and an unresolvable ref fails the run closed at provisioning (attested (1,1,1), no results row); the manifest mirrors `harness.connectors` as names only; lexicon gained Gate; version bumped 0.0.19 → 0.0.20; full suite green, 391 passed (374 + 17 new tests/test_connectors.py)). Earlier the same day, spec 27 landed (ChickenSubs — `harness.spawn_subs = true` attaches the Farmhand to the chicken's vibe-cli runtime over stdio: `attach_farmhand_to_run` writes an MCP server entry into the run's vibe config (project-local `.vibe/config.toml` in the workspace) spawning the farmhand serve command (the venv-sibling `tc`, else `python -m turbochickens`) plus a token-free settings file the per-run env points at via `TURBOCHICKENS_SETTINGS`, so the spawned Farmhand finds this daemon's socket; `RunContext`/`make_adapter` carry `parent_run_id` + settings, and the manifest harness block gains `spawn_subs` + `farmhand`); subs are ordinary eggs through the same socket/queue/admission (weight unchanged) with lineage `parent_run_id` recorded on the new `runs.parent_run_id` column (schema v5, in-place ALTER migration, old rows NULL), in the manifest, in the `egg.queued` Headcount row, and in `runs_show`/`runs_list` rows; `enqueue` accepts `parent_run_id` (unknown parent refused; depth capped at 1 — a sub enqueueing a `spawn_subs = true` egg is refused with a field-named `harness.spawn_subs` error; `spawn_subs` refused for non-vibe-cli adapters at enqueue); `run_stop` with `caller_run_id` refuses targets that are the caller's ancestors; `build_server` reads `TURBOCHICKENS_RUN_ID`/`TURBOCHICKENS_PARENT_RUN_ID` from the per-run env so a Farmhand inside a chicken tags `enqueue` with `parent_run_id` and `run_stop` with `caller_run_id`, and a sub-chicken's Farmhand serves the narrowed tool set (enqueue + read tools + the guarded `run_stop` — no jobs_validate/run_rerun/schedule_*/settings_get); `spec_hash` drops `spawn_subs=false` so the shipped example stays `sha256:18efbd8c…80b959`; version bumped 0.0.18 → 0.0.19; lexicon gained ChickenSub; full suite green, 374 passed (362 + 12 new tests/test_chickensubs.py)). Earlier same day: spec 26 landed (the Farmhand — new module `farmhand.py`: an MCP server on the official `mcp` Python SDK (new dependency, version bumped 0.0.17 → 0.0.18) whose 17 tools are thin wrappers over the daemon's existing socket ops via `client.request_async` — `status`, `jobs_list`, `jobs_validate` (wraps `jobs_upload`: candle a files bundle or a local `spec_path`), `enqueue`, `runs_list`, `runs_show`, `runs_logs`, `results_get`, `run_stop`, `run_rerun`, `schedule_add`/`schedule_list`/`schedule_rm`, `stats_list`/`stats_show`, `audit_tail`, `settings_get` — served over stdio (`tc farmhand serve --transport stdio|https|both`, informational output on stderr only so the protocol channel stays clean) and/or HTTPS (streamable-HTTP at `farmhand_https_path`, default `/mcp`, mounted into the coop's aiohttp listener via a small ASGI bridge `asgi_request` + the SDK's Starlette app with its lifespan run — no second port — behind the same bearer middleware as `/api/*`, loopback-open rule included, ephemeral token printed once like coop); settings gained `farmhand_transport` (`"stdio"|"https"|"both"`, default `"both"`) and `farmhand_https_path` (single absolute path segment, default `/mcp`) with `extra="forbid"` intact and both exposed in `public_dict()`; MCP scope is narrower than the GUI bearer — no `auth_*` ops, no `retention_sweep`, no `shutdown`/`ping`/raw `jobs_upload`, settings read-only; no tool payload ever contains token material (asserted with a configured token over both transports, and against the audit log); `"both"` serves stdio and HTTPS simultaneously in one `tc farmhand serve` process (when the stdio client hangs up the process exits); coopd binds its unix socket only after the coop (and the Farmhand endpoint) is up, so a ping OK implies the HTTP surface is up and its `coop.started` row is already audited; the coop/standalone aiohttp runners got `shutdown_timeout=15` so a hung MCP SSE stream can never wedge shutdown; full suite green, 362 passed (353 + 9 new tests/test_farmhand.py)). Same day earlier: spec 23 landed (Free-Range chickens — `resources.free_range = true` removes the hard wall-clock kill: `timeout_sec` becomes optional (`int | None`, `gt=0`, `validate_default=True`) with the pairing enforced at spec load (`free_range = false` — the default — requires `timeout_sec > 0`, field-named `resources.timeout_sec` error; `free_range = true` allows it absent and never hard-kills even if present; `extra="forbid"` intact; `spec_hash` drops `free_range=false` so pre-23 egg hashes are unchanged, the shipped example still `sha256:18efbd8c…80b959`); adapters take `timeout_sec: int | None` (`None` = no hard kill — `wait_for(..., None)` waits forever, the API adapter keeps only its 10s connect timeout); the Hatchery enforces `hard_timeout = None if free_range else timeout_sec` and the manifest `resources` + `budget` blocks gain `free_range`; a Free-Range chicken dies only via `run_stop` (spec 22) or daemon shutdown — on shutdown the daemon calls `pipeline.request_stop_free_range()` before the bounded drain, so an in-flight free-range chicken ends `stopped` via the SIGTERM/hard-kill path with attestation (1,1,1) + `chicken.stopped`/`abattoir.attested` audit rows before exit; decision-log amendment for baseline invariants 1/2 recorded in `specs/23-free-range-chickens.md` + §5 below; full suite green, 353 passed (340 + 13 new tests/test_free_range.py)). Same day: spec 25 landed (chaining — `attachments = ["nestbox://<run_id>/output.json"]` in `[input]`: URI shape validated at spec load with field-named errors (`input.attachments`), resolved at provisioning from the Nest Box via the new `chaining.py` seam — valid clutches only, quarantined/composted/missing/malformed → fail-closed provisioning failure before `running` with attested teardown (1,1,1) and no results row; resolved clutch bytes count toward `max_context_mb` (over-cap chain → `budget.outcome = "context_cap"` exactly like spec 07); lineage in the manifest `chaining` block (run id + artifact path + bytes) + `clutch.consumed` Headcount rows + a run-log line; `jobs_upload` bundles no longer need nestbox attachments shipped in them; lexicon gained Chaining; full suite green, 340 passed). Same day earlier: spec 24 landed (Feed Budget cost cap — optional per-egg `resources.max_cost_usd` in USD, off by default, enforced finalize-only: over cap → run failed with `budget.outcome = "cost_cap"` in the existing manifest budget block, cost/token telemetry still recorded, teardown attested as usual; pure seam `cost_cap_exceeded`; full suite green, 307 passed). Same day earlier: spec 22 landed (lifecycle ops — socket ops `run_stop`/`run_rerun`, CLI `tc runs stop`/`tc runs rerun`, terminal states `cancelled`/`stopped` with attested teardown on every stop path, `egg.cancelled`/`chicken.stopped` Headcount rows, `rerun_of` lineage, lexicon terms added first; full suite green, 298 passed). Same day earlier: spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier then: 22, 24, 25); still no code changed.
 
 ---
 
@@ -27,7 +27,7 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10, specs 12–20, and specs 22–27 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, the spec-20 commit, the spec-22 commit, the spec-23 commit, the spec-24 commit, the spec-25 commit, and the spec-26 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
+**Spec 01 through spec 10, specs 12–20, and specs 22–28 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, the spec-20 commit, the spec-22 commit, the spec-23 commit, the spec-24 commit, the spec-25 commit, the spec-26 commit, and the spec-28 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
 
 Spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality. Spec 19 gave seat auth a GUI surface (see below).
 Verified this session:
@@ -330,6 +330,24 @@ Verified this session:
 #   → tc jobs validate examples/weekly-incidents-digest/job.toml → sha256:18efbd8c…80b959 (unchanged);
 #     tc status → alerts: 0; tc daemon stop → rc 0
 #   → full suite: 374 passed (362 + 12 new tests/test_chickensubs.py)
+# spec-28 smoke (subprocess daemon, temp data_dir, fake vibe binary via $TURBOCHICKENS_VIBE_BIN,
+#   TC_GATE_SECRET=<secret> in the daemon env):
+#   → tc connectors list → "no gates registered"
+#   → tc connectors add toolx --transport stdio --command /bin/toolx --arg --serve --env GATE_TOKEN=$TC_GATE_SECRET
+#     → "registered gate 'toolx' (transport=stdio) — registry: <data_dir>/connectors.toml" (file 0600,
+#     secret at rest only); tc connectors add webx --transport https --url https://mcp.example.com/mcp
+#     --header 'Authorization=Bearer $TC_GATE_SECRET' → registered
+#   → tc connectors list → gate=toolx … env_keys=['GATE_TOKEN', 'LOG'] + gate=webx … headers={'Authorization':
+#     'Bearer $TC_GATE_SECRET'} — the secret value appears in neither line
+#   → tc run <job with harness.connectors = ["toolx", "webx"], prompt GATES> --wait → rc 0 succeeded;
+#     tc results get <run> → the fake vibe's sanitized probe shows mcp_servers toolx (command/args/env_keys,
+#     env_resolved=true) + webx (url/header_keys, header_resolved=true) — both gates injected into the run's
+#     .vibe/config.toml with refs resolved; tc runs show → manifest harness.connectors=["toolx","webx"]
+#   → tc run <connectors = ["nope"] job> → rc 1 "error harness.connectors: unknown connector 'nope' — …"
+#   → audit.jsonl: gate.registered rows {name, transport} only; the secret is absent from audit.jsonl and
+#     daemon.log; tc status → alerts: 0; tc jobs validate examples/… → sha256:18efbd8c…80b959 (unchanged)
+#   → tc connectors rm webx → removed; list shows toolx only; tc daemon stop → rc 0
+#   → full suite: 391 passed (374 + 17 new tests/test_connectors.py)
 ```
 
 What exists:
@@ -346,7 +364,10 @@ src/turbochickens/
 │                          # SOCKET_STREAM_LIMIT (one JSON-lines request may carry a whole bundle);
 │                          # spec 26: farmhand_transport ("stdio"|"https"|"both", default "both") +
 │                          # farmhand_https_path (single absolute path segment, default "/mcp"),
-│                          # both exposed in public_dict()
+│                          # both exposed in public_dict();
+│                          # spec 28: connectors_path — explicit connectors.toml path (else
+│                          # $TURBOCHICKENS_CONNECTORS, else <data_dir>/connectors.toml, else an
+│                          # empty registry), exposed in public_dict()
 ├── coop.py                # spec 12: CoopServer — aiohttp HTTP server inside the daemon's event loop;
 │                          # /api/ping (unauthenticated healthcheck) + /api/status (bearer unless loopback+
 │                          # no token; ephemeral token minted+printed once when non-loopback and none
@@ -454,6 +475,18 @@ src/turbochickens/
 │                          # the Nest-Box resolver resolve_nestbox_clutch — valid clutches only;
 │                          # quarantined / composted (retention-swept) / missing / wrong-shape →
 │                          # NestboxError(kind=…) — fail closed, never serves those bytes
+├── connectors.py          # spec 28: the connectors registry (gates) — connectors.toml resolved exactly
+│                          # like providers.toml (settings.connectors_path > $TURBOCHICKENS_CONNECTORS >
+│                          # <data_dir>/connectors.toml; no built-in gates): StdioConnector (command/args/env)
+│                          # / HttpsConnector (url + header env refs) discriminated on `transport`,
+│                          # extra="forbid", field-named errors; load_connectors/resolve_connectors_path;
+│                          # validate_connector_payload + entry_to_dict for `connectors_add`; save_registry
+│                          # (atomic write, always 0600) + dump_registry_toml; public_entry (non-secret
+│                          # summary: stdio env as key names, https headers as refs); mcp_config_entry +
+│                          # attach_connectors_to_run — inject the opted-in gates as [mcp_servers.NAME]
+│                          # entries into the run's vibe config, resolving $VAR refs against the daemon env
+│                          # only into the ephemeral workspace config (unresolvable ref → ConnectorsError,
+│                          # fail closed)
 ├── stats.py               # spec 08 pure seam: percentile (linear interpolation) + rollup_usage
 │                          # (n, mean/p50/p95 tokens in/out/total over a job's finished runs)
 ├── retention.py           # spec 08: sweep_expired_results — deletes on-disk result/quarantine
@@ -483,7 +516,11 @@ src/turbochickens/
 │                          # only its 10s connect timeout; spec 27: RunContext.parent_run_id;
 │                          # VibeCLIAdapter takes `settings` and, when harness.spawn_subs, attaches the
 │                          # Farmhand to the run's vibe-cli runtime over stdio (see farmhand.py) — the
-│                          # manifest harness block gains spawn_subs + farmhand; make_adapter passes settings
+│                          # manifest harness block gains spawn_subs + farmhand; make_adapter passes settings;
+│                          # spec 28: when harness.connectors is non-empty, VibeCLIAdapter also injects the
+│                          # opted-in gates into the run's vibe config via connectors.attach_connectors_to_run
+│                          # (merged with the Farmhand entry); the manifest harness block gains
+│                          # connectors (names only) on both adapters
 ├── providers.py           # spec 05: providers.toml registry — provider/model presets, base_url,
 │                          # credential env var, context_window, per-token pricing; resolution:
 │                          # settings.providers_path > $TURBOCHICKENS_PROVIDERS > <data_dir>/providers.toml
@@ -580,7 +617,15 @@ src/turbochickens/
 │                          # harness.spawn_subs error; spawn_subs refused for non-vibe-cli adapters) and
 │                          # records lineage on the runs row + queue item + egg.queued row + response;
 │                          # run_stop with caller_run_id refuses ancestor targets (_ancestor_run_ids);
-│                          # runs_show/runs_list rows carry parent_run_id
+│                          # runs_show/runs_list rows carry parent_run_id;
+│                          # spec 28 (connectors registry): ops connectors_list/connectors_add/connectors_rm
+│                          # — CRUD over connectors.toml (atomic 0600 rewrite, replace-on-re-add), audit
+│                          # gate.registered/gate.removed/gate.rejected (name+transport+fields only, never
+│                          # env/header material), list serves non-secret summaries (stdio env_keys,
+│                          # https header refs); enqueue refuses unknown harness.connectors names
+│                          # (field-named harness.connectors error, nothing queued) and refuses the list
+│                          # for non-vibe-cli adapters; auth_access fills its connectors scope entry with
+│                          # the registered gate names
 ├── client.py              # request(socket, op, **payload) → parsed response; DaemonUnreachable;
 │                          # spec 12: request_async(...) — the same exchange awaitable inside a running
 │                          # loop (used by the coop web layer's SocketTransport); spec 15: the stream
@@ -605,6 +650,9 @@ src/turbochickens/
 │   │                      #  exactly nestbox://<run_id>/output.json — field-named error otherwise);
 │   │                      # (spec 27: harness.spawn_subs — bool, default false; spec_hash drops
 │   │                      #  spawn_subs=false so pre-27 egg hashes are unchanged)
+│   │                      # (spec 28: harness.connectors — list[str] of gate names from
+│   │                      #  connectors.toml, default []; spec_hash drops the empty list so
+│   │                      #  pre-28 egg hashes are unchanged; unknown names refused at enqueue)
 │   └── loader.py          # load_spec(), SpecValidationError (field-named issues), spec_hash()
 │                          # (spec_hash excludes None optionals and free_range=false, so pre-23
 │                          #  spec hashes are unchanged)
@@ -618,7 +666,9 @@ src/turbochickens/
                            # coop start (spec 12: daemon with the GUI forced on; status prints coop:) |
                            # farmhand serve --transport stdio|https|both (spec 26: the Farmhand MCP
                            # server; --transport defaults to the farmhand_transport setting; stdio is a
-                           # protocol channel so informational output goes to stderr only)
+                           # protocol channel so informational output goes to stderr only) |
+                           # connectors list/add/rm (spec 28: gates CRUD over connectors.toml over the
+                           # socket, non-secret summaries only)
 tests/
 ├── test_spec_model.py     # pure-function seam: parser/model/hash
 ├── test_cli_validate.py   # CLI seam: tc jobs validate behavior
@@ -764,6 +814,14 @@ tests/
                            # mounted when farmhand_transport="stdio", non-loopback ephemeral token
                            # gating /mcp and never appearing in any tool payload or the audit log), and
                            # `--transport both` serving stdio and HTTPS simultaneously in one process
+├── test_connectors.py     # spec 28: connectors registry — parser/resolution/strict-schema pure seams,
+│                          # non-secret public_entry + payload validation + save/0600 round-trip + ref
+│                          # resolution (incl. fail-closed), the harness.connectors spec field + hash
+│                          # stability (example hash unchanged), socket CRUD with audit rows + secrecy,
+│                          # $TURBOCHICKENS_CONNECTORS source, auth_access gate names, enqueue refusals
+│                          # (unknown gate, non-vibe-cli adapter), e2e injection into the run's vibe config
+│                          # via the fake vibe binary (stdio + https, merged with a Farmhand entry, no-key →
+│                          # no config, unresolvable ref → fail-closed attested), CLI round-trip
 └── test_chickensubs.py     # spec 27: ChickenSubs — spawn_subs field/hash pure seams, schema v5 migration
                            # (v4 DB gains runs.parent_run_id, old rows NULL), the attach seam (vibe config
                            # entry + token-free settings file + per-run env), socket-level lineage/depth-cap/
@@ -777,7 +835,10 @@ examples/weekly-incidents-digest/   # baseline-format example job (job.toml, pro
 examples/hello-vibe-cli/            # manual vibe-cli example job (job.toml, prompt, schema)
 examples/providers.toml             # spec 05 reference provider registry (mistral presets + pricing,
                            # commented other-provider example) — copy to ~/.turbochickens/providers.toml
-pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.19, deps: pydantic, typer, rich, croniter,
+examples/connectors.toml            # spec 28 reference connectors registry (stdio command/args/env and
+                           # https url/headers examples, $ENV ref semantics documented) — copy to
+                           # ~/.turbochickens/connectors.toml
+pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.20, deps: pydantic, typer, rich, croniter,
                            # jsonschema (+ rfc3339-validator for format checks), httpx, apscheduler (spec 06),
                            # aiohttp (spec 12, coop web server), mcp (spec 26, the Farmhand MCP server);
                            # dev: pytest
@@ -1285,6 +1346,7 @@ Spec-18 deliverables, concretely:
 | 25 | Chaining — `nestbox://<run_id>/output.json` attachments resolved from the Nest Box at provisioning (valid clutches only), counted toward the context cap, lineage in manifest/audit | **done** (2026-11-14) | 04, 07 |
 | 26 | The Farmhand — MCP server over the farm's own socket ops (stdio + HTTPS on the coop listener, bearer-gated; `tc farmhand serve --transport stdio|https|both`; `farmhand_transport`/`farmhand_https_path` settings) | **done** (2026-11-14) | 22, 12–19 |
 | 27 | ChickenSubs — `harness.spawn_subs = true` attaches the Farmhand to the chicken's vibe-cli runtime over stdio (MCP entry in the run's vibe config); subs are ordinary eggs in the same queue/admission with `parent_run_id` lineage (schema v5) in store/manifest/audit, depth capped at 1 (field-named `harness.spawn_subs` refusal), sub tool scope narrowed (enqueue + reads + guarded `run_stop`; ancestors refused; no schedule/auth/settings tools) | **done** (2026-11-14) | 22, 26 |
+| 28 | Connectors registry — `connectors.toml` (resolved like `providers.toml`) with stdio/https gate entries; socket ops `connectors_list`/`connectors_add`/`connectors_rm` (CRUD, audit `gate.*`, non-secret summaries only) + `tc connectors list/add/rm`; chickens opt in via `harness.connectors = […]` (unknown names refused at enqueue, field-named); the vibe-cli adapter injects the gates into the run's vibe config with `$VAR` refs resolved only into the ephemeral workspace; `auth_access` connectors entry filled with gate names | **done** (2026-11-14) | 26 |
 
 ## 5. Non-negotiable invariants (baseline v0.2 — do not regress these)
 
@@ -1363,7 +1425,7 @@ terminal state still requires the teardown attestation. Full text:
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 - **Version management is a human responsibility.** Coding agents can bump the
   last part of a version number (`0.0.X`) — every other bump (minor, major) is
-  human initiated. Current version: `0.0.18`.
+  human initiated. Current version: `0.0.20`.
 - **No agent as a contributor on GitHub.** See the commits bullet above: the
   `Co-Authored-By` agent trailer is what made GitHub list `mistral-vibe` as a
   contributor — it is banned from commits; humans only in the contributor
@@ -1591,6 +1653,29 @@ gained **ChickenSub**; version 0.0.19. Verified e2e with a fake vibe binary that
 attached Farmhand over stdio (SDK MCP client) through the `tc` CLI against a subprocess daemon
 (lineage recorded everywhere, depth-1 and ancestor refusals, 11-tool sub scope, secrecy with a
 configured token), full suite 374 passed.
+
+Spec 28 (connectors registry) landed: new module `connectors.py` — a `connectors.toml` registry resolved
+exactly like `providers.toml` (`settings.connectors_path` > `$TURBOCHICKENS_CONNECTORS` >
+`<data_dir>/connectors.toml`, no built-in gates) with `[connectors.NAME]` entries: `transport = "stdio"`
+(command/args/env) or `transport = "https"` (url + optional header env refs), strict schema with
+field-named errors and `extra="forbid"`. New socket ops `connectors_list` / `connectors_add` /
+`connectors_rm` (CRUD over the registry file — atomic rewrite always 0600, replace-on-re-add) plus
+`tc connectors list/add/rm`, audit-logged as `gate.registered` / `gate.removed` / `gate.rejected`
+(name + transport + field names only). `connectors_list` serves non-secret summaries only — stdio `env`
+as key names, https `headers` as the refs themselves — and the spec-19 `auth_access` op now fills its
+`connectors` scope entry with the registered gate names (tools/data/mcp_servers stay placeholders).
+`HarnessSection` gained `connectors: list[str] = []` (`extra="forbid"` intact; the empty list stays out of
+`spec_hash`, so the shipped example is still `sha256:18efbd8c…80b959`). Enqueue refuses unknown gate
+names with a field-named `harness.connectors` error (nothing queued) and refuses the list for
+non-vibe-cli adapters. The vibe-cli adapter injects the opted-in gates into the run's vibe config
+(`[mcp_servers.NAME]` entries in `<workspace>/.vibe/config.toml`, merged with the spec-27 Farmhand entry
+when both are present); `$VAR`/`${VAR}` env/header refs are resolved against the daemon environment only
+into the ephemeral (attested) workspace config — never into any response, audit row, run log, or manifest
+(the manifest carries names only) — and an unresolvable ref fails the run closed at provisioning
+(attested (1,1,1), no results row). Lexicon gained **Gate**; `examples/connectors.toml` is the reference
+registry; version 0.0.20. Verified e2e with the fake vibe binary (both transports injected and asserted,
+merged farmhand+gate config, no-key → no config, fail-closed ref) and a subprocess-daemon CLI smoke,
+full suite 391 passed.
 
 The MVP spec pipeline (01–10) and the GUI spec 11 slices (12–20) are
 complete; what remains is the post-MVP roadmap in baseline §13.
