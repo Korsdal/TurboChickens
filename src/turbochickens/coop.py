@@ -40,6 +40,20 @@ structured daemon-down payload (200) when the socket is dead. They sit behind
 the bearer middleware like every other ``/api/*`` op, so auth-mutating ops
 require the coop token whenever the server is bound non-loopback.
 
+Spec 30 (GUI lifecycle controls & hatchery knobs) adds the lifecycle mirrors
+``POST /api/runs/{run_id}/stop`` and ``POST /api/runs/{run_id}/rerun`` (the
+spec-22 socket ops ``run_stop`` / ``run_rerun`` — the run id comes from the
+path, an optional JSON object body is forwarded, e.g. ``caller_run_id``; 200
+with the socket payload, 422 on a refusal such as an unknown or already
+terminal chicken, 400 on a malformed body, and the structured daemon-down
+payload (200, never a 500) when the socket is dead — POSTs included) and the
+connectors mirrors ``GET /api/connectors`` (the ``connectors_list`` op —
+non-secret gate summaries only), ``POST /api/connectors/add`` (a JSON object
+with ``name`` plus the gate fields; 200 registered / 422 with the field-named
+``connectors.<name>.*`` errors / 400 malformed / daemon-down 200) and
+``POST /api/connectors/rm`` (``{"name": …}``; 200 / 422 unknown gate / 400 /
+daemon-down 200).
+
 Transport seam: every API handler is a thin client of the existing Unix-socket
 protocol — it calls ``request(op, **payload)`` over the socket (spec 12) and
 never opens the SQLite DB or artifact files directly, so the GUI cannot bypass
@@ -205,6 +219,12 @@ class CoopServer:
         # spec 29: the Beak — live workspace view of a running chicken
         app.router.add_get("/api/runs/{run_id}/workspace", self._api_run_workspace)
         app.router.add_get("/api/results/{run_id}", self._api_result_get)
+        # spec 30: lifecycle controls + the connectors (gates) registry
+        app.router.add_post("/api/runs/{run_id}/stop", self._api_run_stop)
+        app.router.add_post("/api/runs/{run_id}/rerun", self._api_run_rerun)
+        app.router.add_get("/api/connectors", self._api_connectors_list)
+        app.router.add_post("/api/connectors/add", self._api_connectors_add)
+        app.router.add_post("/api/connectors/rm", self._api_connectors_rm)
         # spec 16: schedules from the GUI
         app.router.add_get("/api/schedule", self._api_schedule_list)
         app.router.add_post("/api/schedule", self._api_schedule_add)
@@ -478,6 +498,89 @@ class CoopServer:
 
     async def _api_result_get(self, request: web.Request) -> web.Response:
         return await self._mirror_resource("results_get", run_id=request.match_info["run_id"])
+
+    # --- spec 30: lifecycle controls + connectors (gates) from the GUI ----------
+
+    async def _post_with_body(self, request: web.Request, op: str, **path_payload: Any) -> web.Response:
+        """One POST mirror of a socket op: the path params are always sent, an
+        optional JSON object body is forwarded verbatim on top of them (e.g.
+        ``caller_run_id`` for run_stop). 200 with the socket payload when ok,
+        422 carrying the refusal (unknown / already-terminal chicken, invalid
+        gate payload with its field-named errors, unknown gate), 400 on a
+        malformed body, and the structured daemon-down payload (200, never a
+        500) when the socket is dead — POSTs included."""
+        payload: dict[str, Any] = dict(path_payload)
+        if request.can_read_body:
+            body, err = await self._json_body(request)
+            if err is not None:
+                return err
+            if not isinstance(body, dict):
+                return web.json_response(
+                    {"ok": False, "op": op, "error": f"POST {request.path} needs a JSON object body"},
+                    status=400,
+                )
+            for k, v in body.items():
+                if k not in ("op", "protocol"):
+                    payload[k] = v
+        resp, down = await self._call(op, **payload)
+        if down is not None:
+            return down
+        assert resp is not None
+        return web.json_response(resp, status=200 if resp.get("ok") else 422)
+
+    async def _api_run_stop(self, request: web.Request) -> web.Response:
+        """POST /api/runs/{run_id}/stop — end a chicken deliberately (spec 22):
+        a queued egg is cancelled (never hatches), a running chicken gets
+        SIGTERM then a hard kill → terminal `stopped`. Thin mirror of the
+        ``run_stop`` socket op: 200 with its payload, 422 on a refusal, 400 on
+        a malformed body, daemon-down payload (200) when the socket is dead."""
+        return await self._post_with_body(request, "run_stop", run_id=request.match_info["run_id"])
+
+    async def _api_run_rerun(self, request: web.Request) -> web.Response:
+        """POST /api/runs/{run_id}/rerun — hatch the same egg again as a fresh
+        chicken (trigger=rerun, lineage `rerun_of`). Thin mirror of the
+        ``run_rerun`` socket op with the same status mapping as stop."""
+        return await self._post_with_body(request, "run_rerun", run_id=request.match_info["run_id"])
+
+    async def _api_connectors_list(self, request: web.Request) -> web.Response:
+        """GET /api/connectors — the registered gates with non-secret summaries
+        only (stdio env as key names, https headers as refs; never env/header
+        values): the connectors_list socket op mirrored. Daemon-down payload
+        (200) when the socket is dead."""
+        return await self._mirror("connectors_list")
+
+    async def _api_connectors_add(self, request: web.Request) -> web.Response:
+        """POST /api/connectors/add — register (or replace) one gate; the body
+        is a JSON object with ``name`` plus the gate fields (``transport``,
+        ``command``/``args``/``env`` for stdio, ``url``/``headers`` for https).
+        200 registered, 422 with the field-named ``connectors.<name>.*``
+        errors when invalid, 400 on a malformed body, daemon-down payload (200)
+        when the socket is dead. Env/header material is never echoed back."""
+        body, err = await self._json_body(request)
+        if err is not None:
+            return err
+        if not isinstance(body, dict) or not isinstance(body.get("name"), str) or not body["name"].strip():
+            return web.json_response(
+                {
+                    "ok": False,
+                    "op": "connectors_add",
+                    "error": "POST /api/connectors/add needs a JSON body with a name string plus the gate fields",
+                },
+                status=400,
+            )
+        payload = {k: v for k, v in body.items() if k not in ("op", "protocol")}
+        payload["name"] = body["name"].strip()
+        resp, down = await self._call("connectors_add", **payload)
+        if down is not None:
+            return down
+        assert resp is not None
+        return web.json_response(resp, status=200 if resp.get("ok") else 422)
+
+    async def _api_connectors_rm(self, request: web.Request) -> web.Response:
+        """POST /api/connectors/rm {"name": …} — remove one gate; 200 with the
+        socket payload, 422 on an unknown gate, 400 on a malformed body,
+        daemon-down payload (200) when the socket is dead."""
+        return await self._post_with_body(request, "connectors_rm")
 
     # --- spec 16: schedules from the GUI ----------------------------------------
 

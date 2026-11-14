@@ -60,6 +60,10 @@ Headcount rows ``egg.cancelled`` / ``chicken.stopped``) and ``run_rerun``
 gains ``cancelled``/``stopped``, so a missing attestation on them stays an
 alert condition. ``runs_list`` rows also carry ``status_reason``.
 
+Spec 30 (GUI lifecycle controls) extends ``runs_list`` rows with the
+feed-budget telemetry from the manifest — ``cost_usd``, ``max_cost_usd``,
+``budget_outcome`` — so the coop can show measured cost against the egg's cap.
+
 Spec 23 (Free-Range) removes the hard wall-clock kill for eggs with
 ``resources.free_range = true`` (``timeout_sec`` optional there): such a
 chicken dies only via ``run_stop`` or daemon shutdown — on shutdown the
@@ -799,7 +803,11 @@ class Daemon:
         `job` matches the job id or name, `status` is an exact status match.
         Each row also carries `result_valid` (None when the run never reached
         collecting) so the runs table can show the quarantined state, and
-        `auth_mode` (spec 19) from the run manifest's spec-09 auth block."""
+        `auth_mode` (spec 19) from the run manifest's spec-09 auth block.
+        Spec 30 (GUI lifecycle): rows also carry the feed-budget telemetry —
+        `cost_usd` (measured usage), `max_cost_usd` (the egg's cap, None when
+        unset) and `budget_outcome` — from the manifest, so the coop can show
+        measured cost against the cap without opening the manifest."""
         if self.db is None:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "db not ready"}
         req = req or {}
@@ -829,6 +837,9 @@ class Daemon:
             # spec 22: surface the terminal status reason (stopped/cancelled/…)
             auth_mode = None
             status_reason = None
+            cost_usd = None
+            max_cost_usd = None
+            budget_outcome = None
             if r[9]:
                 try:
                     manifest = json.loads(r[9])
@@ -837,6 +848,14 @@ class Daemon:
                         if isinstance(auth, dict):
                             auth_mode = auth.get("mode")
                         status_reason = manifest.get("status_reason")
+                        # spec 30: feed-budget telemetry for the coop table
+                        usage = manifest.get("usage")
+                        if isinstance(usage, dict) and usage.get("cost_usd") is not None:
+                            cost_usd = usage.get("cost_usd")
+                        budget = manifest.get("budget")
+                        if isinstance(budget, dict):
+                            max_cost_usd = budget.get("max_cost_usd")
+                            budget_outcome = budget.get("outcome")
                 except (ValueError, TypeError):
                     auth_mode = None
             runs.append(
@@ -852,6 +871,10 @@ class Daemon:
                     "result_valid": None if r[8] is None else bool(r[8]),
                     "auth_mode": auth_mode,
                     "status_reason": status_reason,
+                    # spec 30: measured cost vs the egg's feed-budget cap
+                    "cost_usd": cost_usd,
+                    "max_cost_usd": max_cost_usd,
+                    "budget_outcome": budget_outcome,
                     # spec 27: sub-chicken lineage (None for ordinary chickens)
                     "parent_run_id": r[10],
                 }

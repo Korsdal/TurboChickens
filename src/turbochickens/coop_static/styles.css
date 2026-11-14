@@ -422,6 +422,23 @@ html, body {
   cursor: pointer;
 }
 .upload-field input:focus-visible { outline: 2px solid var(--p-action); outline-offset: 1px; }
+/* spec 30: hatchery-knob fields (checkboxes + text) in the upload form */
+.knob-grid {
+  border: none;
+  margin: 18px 0 0;
+  padding: 16px 0 0;
+  border-top: 1px solid var(--hairline);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px 24px;
+}
+.knob-grid legend { font-size: 13px; font-weight: 500; color: var(--p-muted); padding: 0 8px 0 0; }
+.knob-field input[type="checkbox"] {
+  width: 22px;
+  height: 22px;
+  accent-color: var(--p-action);
+  cursor: pointer;
+}
 .upload-error { margin: 12px 0 0; white-space: pre-line; }
 .upload-actions { display: flex; align-items: center; gap: 14px; margin-top: 18px; flex-wrap: wrap; }
 #upload-result { font-size: 13px; }
@@ -478,12 +495,21 @@ html, body {
 .run-row { cursor: pointer; }
 .run-row.selected td { background: rgba(200, 127, 10, 0.08); }
 .run-row .run-open { font-size: 13px; }
+.lineage-note { font-size: 12px; margin-top: 2px; }
+.status-reason { font-size: 12px; margin-top: 2px; max-width: 260px; overflow-wrap: anywhere; }
+.run-actions { white-space: nowrap; }
+.run-actions .linklike { font-size: 13px; }
+.run-actions .linklike + .linklike { margin-left: 10px; }
+.run-actions .linklike:disabled { opacity: 0.38; cursor: not-allowed; }
+.feed-cell.cost-cap, .cost-cap { color: var(--p-action); font-weight: 500; }
 
 .status-cell { display: inline-flex; align-items: center; gap: 8px; }
 .status-label { font-size: 13px; font-weight: 500; }
 
 .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
 .dot-queued { border: 1.5px solid var(--p-muted); background: transparent; }
+.dot-cancelled { border: 1.5px solid var(--p-muted); background: transparent; } /* spec 30: hollow, terminal */
+.dot-stopped { border: 1.5px solid var(--p-ink); background: transparent; } /* spec 30: hollow ink, terminal */
 .dot-running { background: var(--p-action); animation: dotpulse 1.2s ease-in-out infinite; }
 .dot-succeeded { background: var(--p-green); }
 .dot-failed { background: var(--p-red); }
@@ -494,9 +520,13 @@ html, body {
 }
 
 .detail-card { padding: 20px 24px; margin-top: 24px; }
-.detail-head { display: flex; align-items: center; gap: 10px; }
+.detail-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .detail-title { font-size: 16px; font-weight: 500; }
 #detail-close { margin-left: auto; }
+/* spec 30: lineage links + the feed-vs-cap line in the run detail head */
+#detail-lineage .lineage-link { font-size: 13px; }
+#detail-budget { font-size: 13px; }
+#detail-budget.cost-cap { color: var(--p-action); font-weight: 500; }
 
 .tab-row { display: flex; gap: 4px; border-bottom: 1px solid var(--hairline); margin-top: 16px; }
 .tab {
@@ -662,6 +692,15 @@ html, body {
 .stat-card .cost-line { font-size: 13px; color: var(--p-muted); }
 .stat-card .cost-line .mono { color: var(--p-ink); }
 .stats-detail { margin-bottom: 24px; }
+
+/* --- spec 30: the Feed view's feed-vs-budget card (measured cost per chicken vs its cap) --- */
+
+.cost-card { padding: 20px 24px; margin-bottom: 24px; }
+.cost-head h3 { margin: 0 0 4px; font-size: 20px; font-weight: 500; letter-spacing: -0.01em; }
+.cost-head p { margin: 0 0 12px; font-size: 14px; color: var(--p-muted); }
+.cost-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.cost-item { display: flex; align-items: baseline; gap: 4px; flex-wrap: wrap; }
+.cost-item .linklike { font-size: 13px; }
 
 /* --- settings: read-only rows --- */
 

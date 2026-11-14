@@ -4,13 +4,13 @@
 
 **Blocked by:** 22 (stop/re-run ops), 23 (free_range), 24 (cost cap), 25 (chaining knobs), 27 (spawn_subs + lineage), 28 (connectors CRUD ops)
 
-**Status:** ready-for-agent (split from spec 21 via to-tickets, 2026-11-14)
+**Status:** done (2026-11-14)
 
-- [ ] `/api/runs/{id}/stop` and `/api/runs/{id}/rerun` mirror `run_stop`/`run_rerun` exactly (payload parity, dead-socket 200 `{ok:false,...}`, bearer 401 when required); `/api/connectors`, `/api/connectors/add`, `/api/connectors/rm` mirror the slice-28 ops
-- [ ] Runs view: per-row Stop / Re-run with correct enabled states per run status; after stop/cancel the row shows terminal state + reason; re-run enqueues and the new run appears
-- [ ] Lineage: runs view shows parent/children indicator from `parent_run_id`; run detail shows the parent run link
-- [ ] Jobs upload form: fields for `free_range`, `max_cost_usd`, `timeout_sec`, `spawn_subs`, `connectors`; invalid combinations (e.g. `free_range=false` without `timeout_sec`) surface as inline field-named errors from the validator
-- [ ] Run detail + Feed Ledger: measured `usage.cost_usd` shown against `max_cost_usd` when set; `budget.outcome = "cost_cap"` visible on capped runs
-- [ ] GUI behavior identical to specs 12–19: 2 s polling with flash-on-change, empty states, daemon-down banner, bearer 401 handling, design-system shell; served-markup smoke tests, no browser automation
-- [ ] Secrecy: no token/seat material in any new payload
-- [ ] Tests: socket + HTTP parity for every new endpoint, CLI parity unaffected, full suite green; `STATUS.md` updated at the slice boundary
+- [x] `/api/runs/{id}/stop` and `/api/runs/{id}/rerun` mirror `run_stop`/`run_rerun` exactly (payload parity, dead-socket 200 `{ok:false,...}`, bearer 401 when required); `/api/connectors`, `/api/connectors/add`, `/api/connectors/rm` mirror the slice-28 ops
+- [x] Runs view: per-row Stop / Re-run with correct enabled states per run status; after stop/cancel the row shows terminal state + reason; re-run enqueues and the new run appears
+- [x] Lineage: runs view shows parent/children indicator from `parent_run_id`; run detail shows the parent run link
+- [x] Jobs upload form: fields for `free_range`, `max_cost_usd`, `timeout_sec`, `spawn_subs`, `connectors`; invalid combinations (e.g. `free_range=false` without `timeout_sec`) surface as inline field-named errors from the validator
+- [x] Run detail + Feed Ledger: measured `usage.cost_usd` shown against `max_cost_usd` when set; `budget.outcome = "cost_cap"` visible on capped runs
+- [x] GUI behavior identical to specs 12–19: 2 s polling with flash-on-change, empty states, daemon-down banner, bearer 401 handling, design-system shell; served-markup smoke tests, no browser automation
+- [x] Secrecy: no token/seat material in any new payload
+- [x] Tests: socket + HTTP parity for every new endpoint, CLI parity unaffected, full suite green; `STATUS.md` updated at the slice boundary

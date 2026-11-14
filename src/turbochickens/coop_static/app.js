@@ -9,7 +9,9 @@
   const VIEWS = ["dashboard", "runs", "jobs", "schedules", "stats", "audit", "settings", "auth"];
   const VIEW_LOADERS = { dashboard: loadStatus, runs: loadRuns, jobs: loadJobs, schedules: loadSchedules, stats: loadStats, audit: loadAudit, settings: loadSettings, auth: loadAuth };
 
-  const RUN_STATUSES = ["queued", "provisioning", "running", "collecting", "finalizing", "succeeded", "failed"];
+  const RUN_STATUSES = ["queued", "provisioning", "running", "collecting", "finalizing", "succeeded", "failed", "cancelled", "stopped"];
+  // spec 30: terminal states — a terminal chicken can be re-run, a live one stopped
+  const TERMINAL_RUN_STATES = ["succeeded", "failed", "cancelled", "stopped"];
 
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -423,6 +425,121 @@
     });
   }
 
+  function readFileText(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result));
+      r.onerror = () => reject(r.error);
+      r.readAsText(file);
+    });
+  }
+
+  function b64Utf8(text) {
+    const bytes = new TextEncoder().encode(text);
+    let bin = "";
+    const CH = 0x8000;
+    for (let i = 0; i < bytes.length; i += CH) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+    }
+    return btoa(bin);
+  }
+
+  /* --- spec 30: hatchery knobs — the upload form writes these into the egg's
+         job.toml ([resources] / [harness]) before the bundle is candled, so the
+         validator's field-named errors land under the matching field ---------- */
+
+  function tomlSectionOf(line) {
+    const m = line.match(/^\s*\[\s*([A-Za-z0-9_.-]+)\s*\]\s*(?:#.*)?$/);
+    return m ? m[1] : null;
+  }
+
+  function getTomlKey(text, section, key) {
+    let cur = null;
+    for (const line of text.split("\n")) {
+      const h = tomlSectionOf(line);
+      if (h) { cur = h; continue; }
+      if (cur === section) {
+        const m = line.match(new RegExp("^\\s*" + key + "\\s*=\\s*(.*?)\\s*(?:#.*)?$"));
+        if (m) return m[1];
+      }
+    }
+    return null;
+  }
+
+  function setTomlKey(text, section, key, valueLine) {
+    // valueLine === null removes the key from the section; a missing section is appended
+    const keyRe = new RegExp("^\\s*" + key + "\\s*=");
+    const out = [];
+    let cur = null;
+    let seen = false;
+    for (const line of text.split("\n")) {
+      const h = tomlSectionOf(line);
+      if (h) {
+        if (cur === section && !seen && valueLine !== null) {
+          out.push(valueLine);
+          seen = true;
+        }
+        cur = h;
+        out.push(line);
+        continue;
+      }
+      if (cur === section && keyRe.test(line)) {
+        if (valueLine !== null) out.push(valueLine);
+        seen = true;
+        continue;
+      }
+      out.push(line);
+    }
+    let result = out.join("\n");
+    if (!seen) {
+      if (valueLine === null) return result;
+      if (cur === section) {
+        result = result + (result.endsWith("\n") || result === "" ? "" : "\n") + valueLine + "\n";
+      } else {
+        result = result + (result.endsWith("\n") || result === "" ? "" : "\n") + "[" + section + "]\n" + valueLine + "\n";
+      }
+    }
+    return result;
+  }
+
+  function readKnobsFromToml(text) {
+    const conn = getTomlKey(text, "harness", "connectors");
+    let connectors = "";
+    if (conn) {
+      const inner = conn.trim().replace(/^\[/, "").replace(/\]$/, "");
+      connectors = inner.split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean).join(", ");
+    }
+    return {
+      freeRange: getTomlKey(text, "resources", "free_range") === "true",
+      timeout: getTomlKey(text, "resources", "timeout_sec") || "",
+      maxCost: getTomlKey(text, "resources", "max_cost_usd") || "",
+      spawnSubs: getTomlKey(text, "harness", "spawn_subs") === "true",
+      connectors,
+    };
+  }
+
+  function applyKnobs(text) {
+    const timeout = $("#up-timeout").value.trim();
+    const maxCost = $("#up-max-cost").value.trim();
+    const connectors = $("#up-connectors").value.split(",").map((s) => s.trim()).filter(Boolean);
+    let out = text;
+    out = setTomlKey(out, "resources", "free_range", "free_range = " + ($("#up-free-range").checked ? "true" : "false"));
+    out = setTomlKey(out, "resources", "timeout_sec", timeout ? "timeout_sec = " + timeout : null);
+    out = setTomlKey(out, "resources", "max_cost_usd", maxCost ? "max_cost_usd = " + maxCost : null);
+    out = setTomlKey(out, "harness", "spawn_subs", "spawn_subs = " + ($("#up-spawn-subs").checked ? "true" : "false"));
+    out = setTomlKey(out, "harness", "connectors", connectors.length ? "connectors = [" + connectors.map((c) => JSON.stringify(c)).join(", ") + "]" : null);
+    return out;
+  }
+
+  function knobSignature() {
+    return ["up-free-range", "up-timeout", "up-max-cost", "up-spawn-subs", "up-connectors"]
+      .map((id) => {
+        const n = $("#" + id);
+        return n.type === "checkbox" ? String(n.checked) : n.value;
+      })
+      .join("|");
+  }
+
   function bundlePath(pathInput, file) {
     // in-bundle path: the typed path when sane, else the file's own name
     const typed = (pathInput && pathInput.value || "").trim().replace(/^\/+/, "");
@@ -443,17 +560,20 @@
     }
     files[bundlePath($("#up-prompt-path"), promptFile)] = await readFileB64(promptFile);
     files[bundlePath($("#up-schema-path"), schemaFile)] = await readFileB64(schemaFile);
-    files["job.toml"] = await readFileB64(jobFile); // job.toml always wins the root key
+    // spec 30: the hatchery knobs are written into the egg before candling;
+    // job.toml always wins the root key
+    files["job.toml"] = b64Utf8(applyKnobs(await readFileText(jobFile)));
     return { files };
   }
 
   function bundleSignature() {
-    // names + sizes + mtimes of the chosen files + typed bundle paths
+    // names + sizes + mtimes of the chosen files + typed bundle paths + the knob fields
     const sig = [];
     for (const id of ["up-job", "up-prompt", "up-schema", "up-attachments"]) {
       for (const f of Array.from($(id).files)) sig.push(id + ":" + f.name + ":" + f.size + ":" + f.lastModified);
     }
     sig.push($("#up-prompt-path").value, $("#up-schema-path").value);
+    sig.push(knobSignature());
     return sig.join("|");
   }
 
@@ -461,11 +581,18 @@
     if (field.startsWith("input.prompt_file")) return "#up-prompt-error";
     if (field.startsWith("output.schema_file")) return "#up-schema-error";
     if (field.startsWith("input.attachments")) return "#up-attachments-error";
-    return "#up-job-error"; // job.toml and every spec-section error live under the spec field
+    // spec 30: hatchery-knob fields get their own inline errors
+    if (field.startsWith("resources.free_range")) return "#up-free-range-error";
+    if (field.startsWith("resources.timeout_sec")) return "#up-timeout-error";
+    if (field.startsWith("resources.max_cost_usd")) return "#up-max-cost-error";
+    if (field.startsWith("harness.spawn_subs")) return "#up-spawn-subs-error";
+    if (field.startsWith("harness.connectors")) return "#up-connectors-error";
+    return "#up-job-error"; // job.toml and every other spec-section error live under the spec field
   }
 
   function clearUploadErrors() {
-    for (const sel of ["#up-job-error", "#up-prompt-error", "#up-schema-error", "#up-attachments-error", "#upload-error"]) {
+    for (const sel of ["#up-job-error", "#up-prompt-error", "#up-schema-error", "#up-attachments-error",
+      "#up-free-range-error", "#up-timeout-error", "#up-max-cost-error", "#up-spawn-subs-error", "#up-connectors-error", "#upload-error"]) {
       const p = $(sel);
       p.hidden = true;
       p.textContent = "";
@@ -502,7 +629,8 @@
     res.textContent = "";
   }
 
-  for (const id of ["up-job", "up-prompt", "up-schema", "up-attachments", "up-prompt-path", "up-schema-path"]) {
+  for (const id of ["up-job", "up-prompt", "up-schema", "up-attachments", "up-prompt-path", "up-schema-path",
+    "up-free-range", "up-timeout", "up-max-cost", "up-spawn-subs", "up-connectors"]) {
     $("#" + id).addEventListener("change", () => {
       resetUploadState();
       clearUploadErrors();
@@ -512,6 +640,17 @@
       }
       if (id === "up-schema" && $("#up-schema").files[0] && !$("#up-schema-path").value) {
         $("#up-schema-path").value = $("#up-schema").files[0].webkitRelativePath || $("#up-schema").files[0].name;
+      }
+      // spec 30: choosing the egg initializes the hatchery-knob fields from its TOML
+      if (id === "up-job" && $("#up-job").files[0]) {
+        readFileText($("#up-job").files[0]).then((text) => {
+          const knobs = readKnobsFromToml(text);
+          $("#up-free-range").checked = knobs.freeRange;
+          $("#up-timeout").value = knobs.timeout;
+          $("#up-max-cost").value = knobs.maxCost;
+          $("#up-spawn-subs").checked = knobs.spawnSubs;
+          $("#up-connectors").value = knobs.connectors;
+        }).catch(() => { /* unreadable file — the knobs stay as typed */ });
       }
     });
   }
@@ -577,6 +716,8 @@
         ? { cls: "dot-quarantined", label: "quarantined" }
         : { cls: "dot-failed", label: "failed" };
     }
+    if (r.status === "cancelled") return { cls: "dot-cancelled", label: "cancelled" }; // spec 30
+    if (r.status === "stopped") return { cls: "dot-stopped", label: "stopped" }; // spec 30
     if (r.status === "queued") return { cls: "dot-queued", label: "queued" };
     return { cls: "dot-running", label: r.status }; // in flight: pulsing yolk
   }
@@ -598,6 +739,26 @@
     for (const it of items) mk(it, it);
   }
 
+  let childrenMap = {}; // spec 30: parent run id -> [sub-chicken ids], from the unfiltered runs list
+
+  function feedCellText(r) {
+    // spec 30: measured feed against the egg's cap — cost outliers visible at a glance
+    if (r.cost_usd == null) return "—";
+    let text = fmtCost(r.cost_usd);
+    if (r.max_cost_usd != null) text += " / cap " + fmtCost(r.max_cost_usd);
+    if (r.budget_outcome === "cost_cap") text += " · cost cap";
+    return text;
+  }
+
+  function lineageNote(r) {
+    // spec 30: parent/children indicator from parent_run_id
+    const bits = [];
+    if (r.parent_run_id) bits.push("sub of " + r.parent_run_id);
+    const kids = childrenMap[r.id] || [];
+    if (kids.length) bits.push("parent of " + kids.length);
+    return bits.join(" · ");
+  }
+
   function renderRunsTable(runs) {
     if (!runs.length) {
       const msg = runsJobFilter || runsStatusFilter
@@ -609,14 +770,14 @@
     }
     showCard("#runs-empty", "#runs-card");
     const tbody = $("#runs-tbody");
-    const sig = JSON.stringify(runs.map((r) => [r.id, r.status, r.result_valid, r.finished_at, r.attested, r.auth_mode]));
+    const sig = JSON.stringify(runs.map((r) => [r.id, r.status, r.result_valid, r.finished_at, r.attested, r.auth_mode, r.parent_run_id, r.status_reason, r.cost_usd, r.max_cost_usd, r.budget_outcome, JSON.stringify(childrenMap[r.id] || null)]));
     if (tbody.dataset.sig !== sig) {
       tbody.dataset.sig = sig;
       tbody.replaceChildren();
       const seen = new Set();
       for (const r of runs) {
         seen.add(r.id);
-        const rowSig = JSON.stringify([r.status, r.result_valid, r.finished_at, r.attested, r.auth_mode]);
+        const rowSig = JSON.stringify([r.status, r.result_valid, r.finished_at, r.attested, r.auth_mode, r.parent_run_id, r.status_reason, r.cost_usd, r.max_cost_usd, r.budget_outcome]);
         const changed = lastRunSigs[r.id] !== undefined && lastRunSigs[r.id] !== rowSig;
         lastRunSigs[r.id] = rowSig;
         const tr = el("tr", "run-row" + (r.id === selectedRunId ? " selected" : "") + (changed ? " flash" : ""));
@@ -627,6 +788,8 @@
         openBtn.setAttribute("aria-label", "Open chicken " + r.id);
         openBtn.addEventListener("click", () => selectRun(r.id));
         idTd.appendChild(openBtn);
+        const lin = lineageNote(r);
+        if (lin) idTd.appendChild(el("div", "muted lineage-note", lin));
         tr.appendChild(idTd);
         tr.appendChild(el("td", "mono job-name", r.job_name));
         const dot = statusDotInfo(r);
@@ -635,18 +798,83 @@
         st.appendChild(el("span", "dot " + dot.cls));
         st.appendChild(el("span", "status-label", dot.label));
         stTd.appendChild(st);
+        if (r.status_reason) stTd.appendChild(el("div", "muted status-reason", r.status_reason));
         tr.appendChild(stTd);
         tr.appendChild(el("td", "mono muted", r.trigger || "—"));
         tr.appendChild(el("td", "mono muted", r.auth_mode || "—")); // spec 19: per-run auth mode
+        const feedTd = el("td", "mono muted feed-cell", feedCellText(r)); // spec 30: measured feed vs cap
+        if (r.budget_outcome === "cost_cap") feedTd.classList.add("cost-cap");
+        tr.appendChild(feedTd);
         tr.appendChild(el("td", "mono muted", r.started_at || "—"));
         tr.appendChild(el("td", "mono muted", r.finished_at || "—"));
+        // spec 30: per-row lifecycle controls — stop a live chicken, re-run a terminal one
+        const actTd = el("td", "run-actions");
+        const terminal = TERMINAL_RUN_STATES.includes(r.status);
+        const stopBtn = el("button", "linklike run-stop", r.status === "queued" ? "Cancel" : "Stop");
+        stopBtn.type = "button";
+        stopBtn.disabled = terminal;
+        stopBtn.setAttribute("aria-label", (r.status === "queued" ? "Cancel queued egg " : "Stop chicken ") + r.id);
+        stopBtn.addEventListener("click", () => stopRun(r.id));
+        actTd.appendChild(stopBtn);
+        const rerunBtn = el("button", "linklike run-rerun", "Re-run");
+        rerunBtn.type = "button";
+        rerunBtn.disabled = !terminal;
+        rerunBtn.setAttribute("aria-label", "Re-run chicken " + r.id);
+        rerunBtn.addEventListener("click", () => rerunRun(r.id));
+        actTd.appendChild(rerunBtn);
+        tr.appendChild(actTd);
         tr.addEventListener("click", (ev) => {
-          if (ev.target.closest("button")) return; // the open button handles itself
+          if (ev.target.closest("button")) return; // the buttons handle themselves
           selectRun(r.id);
         });
         tbody.appendChild(tr);
       }
       for (const id of Object.keys(lastRunSigs)) if (!seen.has(id)) delete lastRunSigs[id];
+    }
+  }
+
+  function runActionError(msg) {
+    const p = $("#run-error");
+    if (!msg) {
+      p.hidden = true;
+      p.textContent = "";
+      return;
+    }
+    p.textContent = msg;
+    p.hidden = false;
+  }
+
+  async function postRunAction(runId, actionPath) {
+    runActionError("");
+    const resp = await apiPost("/api/runs/" + encodeURIComponent(runId) + actionPath, {});
+    if (resp === null) return null; /* 401 → login view shown */
+    if (resp.__networkError) {
+      runActionError("The GUI could not reach the coop server.");
+      return null;
+    }
+    if (resp.daemon && resp.daemon.up === false) {
+      runActionError("coopd is not reachable — " + (resp.error || "") + ".");
+      return null;
+    }
+    if (!resp.ok) {
+      runActionError(resp.error || (resp.errors && resp.errors.map((e) => e.field + ": " + e.message).join("\n")) || actionPath + " refused");
+      return null;
+    }
+    return resp;
+  }
+
+  async function stopRun(runId) {
+    const resp = await postRunAction(runId, "/stop");
+    if (resp) loadRuns(); // the row flips to cancelled/stopped and flashes on change
+  }
+
+  async function rerunRun(runId) {
+    const resp = await postRunAction(runId, "/rerun");
+    if (resp && resp.run_id) {
+      loadRuns();
+      selectRun(resp.run_id); // open the fresh chicken
+    } else if (resp) {
+      loadRuns();
     }
   }
 
@@ -682,6 +910,55 @@
     const authMode = run.manifest && run.manifest.auth && run.manifest.auth.mode;
     $("#detail-job").textContent = run.job_name + " · " + run.trigger + " · " + run.status + (authMode ? " · auth " + authMode : "");
     $("#tab-result").textContent = run.result && run.result.valid === false ? "Quarantine" : "Clutch";
+
+    // spec 30: lineage — the parent run link + any sub-chickens of this chicken
+    const lin = $("#detail-lineage");
+    lin.replaceChildren();
+    const linBits = [];
+    if (run.parent_run_id) {
+      const p = el("button", "linklike mono lineage-link", "sub of " + run.parent_run_id);
+      p.type = "button";
+      p.setAttribute("aria-label", "Open parent chicken " + run.parent_run_id);
+      p.addEventListener("click", () => selectRun(run.parent_run_id));
+      linBits.push(p);
+    }
+    const kids = childrenMap[run.id] || [];
+    if (kids.length) {
+      for (const kid of kids) {
+        const k = el("button", "linklike mono lineage-link", "sub " + kid);
+        k.type = "button";
+        k.setAttribute("aria-label", "Open sub-chicken " + kid);
+        k.addEventListener("click", () => selectRun(kid));
+        linBits.push(k);
+      }
+    }
+    if (linBits.length) {
+      lin.hidden = false;
+      for (const b of linBits) {
+        lin.appendChild(b);
+        lin.appendChild(document.createTextNode(" "));
+      }
+    } else {
+      lin.hidden = true;
+    }
+
+    // spec 30: measured feed against the egg's cap — cost_cap runs stay visible
+    const budgetEl = $("#detail-budget");
+    const usage = run.usage || (run.manifest && run.manifest.usage) || {};
+    const budget = (run.manifest && run.manifest.budget) || {};
+    const cost = usage.cost_usd != null ? usage.cost_usd : null;
+    const cap = budget.max_cost_usd != null ? budget.max_cost_usd : null;
+    if (cost != null) {
+      budgetEl.hidden = false;
+      let text = "feed " + fmtCost(cost) + (cap != null ? " / cap " + fmtCost(cap) : " · no cap");
+      budgetEl.textContent = text;
+      budgetEl.classList.toggle("cost-cap", budget.outcome === "cost_cap");
+      if (budget.outcome === "cost_cap") budgetEl.textContent = text + " · cost cap hit";
+    } else {
+      budgetEl.hidden = true;
+      budgetEl.textContent = "";
+      budgetEl.classList.remove("cost-cap");
+    }
 
     const manifestPre = $("#manifest-pre");
     const mSig = JSON.stringify(run);
@@ -914,6 +1191,16 @@
     if (payloadDown(data)) {
       showEmpty("#runs-empty", "#runs-card", "Chickens unavailable — " + (data.error || "coopd is not reachable") + ".");
       return;
+    }
+    // spec 30: lineage (parent/children) needs the unfiltered list — reuse the
+    // filtered response when no filter is active
+    const allData = qs.toString() ? await api("/api/runs") : data;
+    if (allData && !payloadDown(allData)) {
+      const map = {};
+      for (const r of allData.runs || []) {
+        if (r.parent_run_id) (map[r.parent_run_id] = map[r.parent_run_id] || []).push(r.id);
+      }
+      childrenMap = map;
     }
     renderRunsTable(data.runs || []);
     if (selectedRunId) await loadRunDetail(selectedRunId);
@@ -1223,14 +1510,60 @@
     }
   }
 
+  /* --- spec 30: feed vs budget card on the Feed view — per-chicken measured
+         cost against the egg's cap (cost outliers visible even without a cap) */
+
+  function renderCostCard(runs) {
+    const finished = (runs || []).filter((r) => TERMINAL_RUN_STATES.includes(r.status) && r.cost_usd != null);
+    const card = $("#cost-card");
+    const empty = $("#cost-empty");
+    if (!finished.length) {
+      card.hidden = true;
+      empty.hidden = false;
+      return;
+    }
+    empty.hidden = true;
+    card.hidden = false;
+    const top = finished.slice().sort((a, b) => (b.cost_usd || 0) - (a.cost_usd || 0)).slice(0, 10);
+    $("#cost-summary").textContent =
+      finished.length + " finished chicken" + (finished.length === 1 ? "" : "s") +
+      " · highest feed first — measured cost against the egg's cap.";
+    const list = $("#cost-list");
+    const sig = JSON.stringify(top.map((r) => [r.id, r.cost_usd, r.max_cost_usd, r.budget_outcome, r.status]));
+    if (list.dataset.sig === sig) return;
+    list.dataset.sig = sig;
+    list.replaceChildren();
+    for (const r of top) {
+      const li = el("li", "cost-item");
+      const openBtn = el("button", "linklike mono run-open", r.id);
+      openBtn.type = "button";
+      openBtn.setAttribute("aria-label", "Open chicken " + r.id);
+      openBtn.addEventListener("click", () => {
+        if (location.hash !== "#/runs") location.hash = "#/runs";
+        selectRun(r.id);
+      });
+      li.appendChild(openBtn);
+      li.appendChild(el("span", "muted", " " + r.status + " · "));
+      const feed = el("span", "mono", fmtCost(r.cost_usd) + (r.max_cost_usd != null ? " / cap " + fmtCost(r.max_cost_usd) : " · no cap"));
+      if (r.budget_outcome === "cost_cap") feed.classList.add("cost-cap");
+      li.appendChild(feed);
+      if (r.budget_outcome === "cost_cap") li.appendChild(el("span", "muted cost-cap", " · cost cap hit"));
+      list.appendChild(li);
+    }
+    flashCard(card);
+  }
+
   async function loadStats() {
     const data = await api("/api/stats");
     if (data === null) return; /* 401 → login view shown */
     if (payloadDown(data)) {
       showEmpty("#stats-empty", "#stats-grid", "Feed unavailable — " + (data.error || "coopd is not reachable") + ".");
-      return;
+    } else {
+      renderStatsCards(data.stats || []);
     }
-    renderStatsCards(data.stats || []);
+    // spec 30: the same cost-vs-cap picture per chicken, from the runs list
+    const runsData = await api("/api/runs");
+    if (runsData !== null && !payloadDown(runsData)) renderCostCard(runsData.runs || []);
     if (statsDetailJob) await loadStatsDetail();
   }
 

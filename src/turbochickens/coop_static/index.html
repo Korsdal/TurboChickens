@@ -147,7 +147,7 @@
           <div class="card table-card" id="runs-card" hidden>
             <table class="data-table">
               <thead>
-                <tr><th scope="col">Chicken</th><th scope="col">Egg</th><th scope="col">Status</th><th scope="col">Trigger</th><th scope="col">Auth</th><th scope="col">Started</th><th scope="col">Finished</th></tr>
+                <tr><th scope="col">Chicken</th><th scope="col">Egg</th><th scope="col">Status</th><th scope="col">Trigger</th><th scope="col">Auth</th><th scope="col">Feed</th><th scope="col">Started</th><th scope="col">Finished</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr>
               </thead>
               <tbody id="runs-tbody"></tbody>
             </table>
@@ -159,6 +159,8 @@
               <span class="dot dot-queued" id="detail-dot" aria-hidden="true"></span>
               <span class="mono detail-title" id="detail-title">run-…</span>
               <span class="mono muted" id="detail-job"></span>
+              <span class="mono muted" id="detail-lineage" hidden></span>
+              <span class="mono" id="detail-budget" hidden></span>
               <button type="button" class="linklike" id="detail-close">Close</button>
             </div>
             <div class="tab-row" role="tablist" aria-label="Chicken detail">
@@ -235,6 +237,34 @@
                   <p class="field-error" id="up-attachments-error" hidden></p>
                 </div>
               </div>
+              <fieldset class="knob-grid">
+                <legend>Hatchery knobs — written into the egg before candling</legend>
+                <div class="upload-field knob-field">
+                  <label for="up-free-range">Free-Range chicken (no hard TTL)</label>
+                  <input id="up-free-range" type="checkbox">
+                  <p class="field-error" id="up-free-range-error" hidden></p>
+                </div>
+                <div class="upload-field">
+                  <label for="up-timeout">timeout_sec (s, empty = absent)</label>
+                  <input id="up-timeout" class="mono" type="text" inputmode="numeric" autocomplete="off" spellcheck="false">
+                  <p class="field-error" id="up-timeout-error" hidden></p>
+                </div>
+                <div class="upload-field">
+                  <label for="up-max-cost">max_cost_usd (empty = no feed budget cap)</label>
+                  <input id="up-max-cost" class="mono" type="text" inputmode="decimal" autocomplete="off" spellcheck="false">
+                  <p class="field-error" id="up-max-cost-error" hidden></p>
+                </div>
+                <div class="upload-field knob-field">
+                  <label for="up-spawn-subs">spawn_subs (attach the Farmhand)</label>
+                  <input id="up-spawn-subs" type="checkbox">
+                  <p class="field-error" id="up-spawn-subs-error" hidden></p>
+                </div>
+                <div class="upload-field">
+                  <label for="up-connectors">Gates — harness.connectors (comma-separated)</label>
+                  <input id="up-connectors" class="mono" type="text" autocomplete="off" spellcheck="false" placeholder="toolx, webx">
+                  <p class="field-error" id="up-connectors-error" hidden></p>
+                </div>
+              </fieldset>
               <p class="field-error upload-error" id="upload-error" hidden></p>
               <div class="upload-actions">
                 <button type="submit" class="btn btn-primary" id="upload-submit">Validate</button>
@@ -287,6 +317,14 @@
           </header>
           <div class="stats-grid" id="stats-grid" hidden></div>
           <div class="card empty-state" id="stats-empty"><p>No feed recorded yet — let a chicken finish and its rollup lands here.</p></div>
+          <div class="card cost-card" id="cost-card" hidden>
+            <div class="cost-head">
+              <h3>Feed vs budget</h3>
+              <p class="muted" id="cost-summary">Measured feed per finished chicken against its egg's cap — polling every 2&nbsp;s.</p>
+            </div>
+            <ul class="mono cost-list" id="cost-list"></ul>
+          </div>
+          <div class="card empty-state" id="cost-empty" hidden><p>No finished chickens yet — their measured feed against the egg's cap lands here.</p></div>
           <div class="card detail-card stats-detail" id="stats-detail" hidden>
             <div class="detail-head">
               <span class="mono detail-title" id="stats-detail-title">job</span>
