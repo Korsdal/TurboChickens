@@ -25,6 +25,9 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 | **Nest Box** | Results store — where Clutches are found | `storage.py` (results) |
 | **Abattoir** | De-provisioning with attested, verifiable teardown | teardown / destruction |
 | **Compost** | Retention — old Clutches rot away; audit records stay forever | `retention.py` |
+| **Cancelled** | An Egg pulled from the Pecking Order before it hatches — terminal, never hatches, still abattoir-attested | `cancelled` run state / `run_stop` on a queued egg / `egg.cancelled` |
+| **Stopped** | A Chicken ended deliberately by the operator — SIGTERM, then hard kill, with the Abattoir's attested teardown | `stopped` run state / `run_stop` on a running chicken / `chicken.stopped` |
+| **Re-run** | Hatching the same Egg again as a fresh Chicken, new run ID, lineage recorded | `run_rerun` / manifest `rerun_of` |
 
 ## Support Cast
 

@@ -4,7 +4,7 @@
 > Update this file at every spec boundary. Future agents: read this first,
 > then the governing docs in §2, before touching code.
 
-**Last updated:** 2026-11-14, after spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier: 22, 24, 25 can start immediately); still no code changed.
+**Last updated:** 2026-11-14, after spec 22 landed (lifecycle ops — socket ops `run_stop`/`run_rerun`, CLI `tc runs stop`/`tc runs rerun`, terminal states `cancelled`/`stopped` with attested teardown on every stop path, `egg.cancelled`/`chicken.stopped` Headcount rows, `rerun_of` lineage, lexicon terms added first; full suite green, 298 passed). Same day earlier: spec 20 landed (lexicon adoption — every operator-facing surface speaks farm per `docs/lexicon.md`; machine interfaces byte-stable; full suite green, legacy Headcount rows aliased on read only). Same day: spec 21 overview v0.1 drafted (`specs/21-hatchery-farmhand-agent-lifecycle.md` — Hatchery deepening + Farmhand MCP + GUI-for-everything; parent spec to be split into slices 22+, not ready-for-agent; no code changed). Later same day: spec 21 split via to-tickets into slices 22–31 (`specs/22-*.md` … `specs/31-*.md`, all `Status: ready-for-agent`, blocking edges in each file's Blocked-by line; frontier then: 22, 24, 25); still no code changed.
 
 ---
 
@@ -27,7 +27,7 @@ durable thing; the agents are not.
 
 ## 3. Current state — verified 2026-11-12
 
-**Spec 01 through spec 10 and specs 12–20 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, and the spec-20 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
+**Spec 01 through spec 10, specs 12–20, and spec 22 are done** (commits `f8b8061`, the spec-02 commit, the spec-03 commit, the spec-04 commit, the spec-05 commit, the spec-06 commit, the spec-07 commit, the spec-08 commit, the spec-09 commit, the spec-10 commit, the spec-12 commit, the spec-13 commit, the spec-14 commit, the spec-15 commit, the spec-16 commit, the spec-17 commit, the spec-18 commit, the spec-19 commit, the spec-20 commit, and the spec-22 commit). Spec 11 is the parent GUI spec; its slices (spec 12, the skeleton; spec 13, Jobs/Audit/Settings views; spec 14, Runs; spec 15, upload/validate; spec 16, Schedules; spec 17, Stats + retention; spec 19, Auth & access) are landed, and its remaining container story landed via spec 18 (the coop Docker image).
 
 Spec 09 landed seat auth: `mistral-api` runs can now run with no API key via a seat provider (`auth = "seat"` in providers.toml + `tc auth login`), and vibe-cli picks up a browser-auth provider from `~/.vibe/config.toml` via HOME passthrough. Spec 10 landed model discovery: `tc models list` queries live provider catalogs (and the vibe binary's own model list), so a job's `model` field can be chosen against reality. Spec 19 gave seat auth a GUI surface (see below).
 Verified this session:
@@ -227,6 +227,23 @@ Verified this session:
 #   → full suite: 291 passed (286 + 5 new tests/test_lexicon.py: alias-on-read-only with raw-bytes
 #     assertion, quoted-string grep guard over src/, SPA lexicon markup, socket+HTTP old/new event
 #     filters, lifecycle Headcount order on a real run)
+# spec-22 smoke (subprocess daemon, temp data_dir, budget 1, fake vibe binary via
+#   $TURBOCHICKENS_VIBE_BIN, SLEEP-30 job enqueued twice so the 2nd backlogs):
+#   → tc runs stop <queued> → rc 0 "chicken run-… → cancelled (cancelled while queued — the egg never
+#     hatched)"; runs row terminal cancelled + attestation (1,1,1); audit egg.cancelled +
+#     abattoir.attested + chicken.finished(status=cancelled); no harness events, no egg.hatched
+#   → tc runs stop <running> → rc 0 "chicken run-… → stopped (stopped by operator: SIGTERM (reaped
+#     within 5s grace))"; audit chicken.stopped; attestation (1,1,1); workspace gone; no clutch;
+#     alerts: []
+#   → a SIGTERM-trapping fake vibe → reason "SIGTERM, then hard kill after Ns grace" + the harness's
+#     SIGTERM marker line in runs logs (thread-daemon test, grace monkeypatched to 1s)
+#   → tc runs rerun <stopped> → rc 0 "egg re-queued run-… — re-run of run-…, pecking order depth 1,
+#     weight 1.0"; new run trigger=rerun, manifest rerun_of=<old>, egg.queued row carries rerun_of;
+#     goes through queue/admission/pipeline to succeeded with a stored clutch
+#   → tc runs list shows status=cancelled / status=stopped with reasons; runs_list rows carry
+#     status_reason; audit_tail ?event=chicken.stopped / egg.cancelled filters work; stop on an
+#     unknown or already-terminal chicken → rc 1 "unknown chicken" / "already terminal"
+#   → full suite: 298 passed (291 + 7 new tests/test_lifecycle_ops.py)
 ```
 
 What exists:
@@ -343,7 +360,13 @@ src/turbochickens/
 │                          # `collecting`, spec-07 context cap at `provisioning`, teardown attestation
 │                          # + audit rows (incl. spec-09 auth.resolved + auth_mode), spec-08 per-job
 │                          # usage-stats rollup at finalize; spec 09: builds the SeatBroker and hands
-│                          # it to make_adapter as the CredentialProvider
+│                          # it to make_adapter as the CredentialProvider; spec 22: TERMINAL_STATES
+│                          # gains `cancelled`/`stopped` (a missing attestation on them stays an alert);
+│                          # request_stop()/stop-event race in execute — SIGTERM then hard kill after
+│                          # STOP_TERM_GRACE_SEC, terminal `stopped`, output never collected, audit
+│                          # chicken.stopped; cancel_queued() terminal-cancels a pecking-order egg
+│                          # (manifest + attestation + egg.cancelled, never hatches); manifests carry
+│                          # `rerun_of` lineage for run_rerun
 ├── scheduler.py           # spec 06: CronScheduler over APScheduler AsyncIOScheduler; standard
 │                          # POSIX cron semantics (aps_trigger resolves the day-of-week field via
 │                          # croniter because APScheduler numbers 0=Monday); schedules re-registered
@@ -377,7 +400,17 @@ src/turbochickens/
 │                          # auth_login_start / auth_login_poll (device flow via the same SeatBroker;
 │                          # grants held in daemon memory, sessions stored 0600, audit auth.login with
 │                          # provider+mode only), auth_logout (deletes the session, audit auth.logout);
-│                          # runs_list rows also carry auth_mode (spec 19) from the manifest auth block
+│                          # runs_list rows also carry auth_mode (spec 19) from the manifest auth block;
+│                          # spec 22 (lifecycle ops): run_stop (queued egg → terminal `cancelled` via the
+│                          # pipeline's cancel_queued — never hatches, still attested (1,1,1), audit
+│                          # egg.cancelled; running chicken → the pipeline's stop event → SIGTERM then hard
+│                          # kill after STOP_TERM_GRACE_SEC, terminal `stopped`, audit chicken.stopped —
+│                          # the op waits for the terminal state and returns it with its reason; clear
+│                          # errors for unknown/already-terminal runs) and run_rerun (re-enqueues the same
+│                          # egg from job_specs.spec_path as a fresh run, trigger=rerun, lineage
+│                          # `rerun_of` on the item → manifest + the egg.queued row); the scheduler checks
+│                          # the cancel set when popping/admitting so a cancelled egg is never hatched;
+│                          # runs_list rows also carry status_reason (spec 22)
 ├── client.py              # request(socket, op, **payload) → parsed response; DaemonUnreachable;
 │                          # spec 12: request_async(...) — the same exchange awaitable inside a running
 │                          # loop (used by the coop web layer's SocketTransport); spec 15: the stream
@@ -393,7 +426,10 @@ src/turbochickens/
 ├── spec/
 │   ├── model.py           # Pydantic v2 model, all 6 sections, extra="forbid"
 │   └── loader.py          # load_spec(), SpecValidationError (field-named issues), spec_hash()
-└── cli/main.py            # Typer app `tc`: run [--wait] | runs list/show/logs | results get |
+└── cli/main.py            # Typer app `tc`: run [--wait] | runs list/show/logs/stop/rerun (spec 22:
+                           # stop = run_stop — queued egg → cancelled, running chicken → SIGTERM then hard
+                           # kill → stopped, rc 0 / clear error for unknown or already-terminal; rerun =
+                           # run_rerun — same egg as a fresh run with lineage) | results get |
                            # jobs validate (spec 10: model checks) | daemon start/stop | status |
                            # schedule add/list/rm | stats list/show (spec 08) |
                            # auth login/status/logout (spec 09, local) | models list (spec 10, local) |
@@ -493,11 +529,20 @@ tests/
                            # JSON-mode shape, exp backoff on 429/5xx, no retry on 4xx, Retry-After,
                            # timeout, missing credential), e2e via daemon thread + subprocess against
                            # a hermetic loopback fake provider (result store, quarantine, weight 0.25)
+└── test_lifecycle_ops.py   # spec 22: run_stop on a queued egg (socket + CLI parity: cancelled, never
+                           # hatched, attestation (1,1,1), audit egg.cancelled, no harness events, list/
+                           # show/audit-tail surfaces, unknown + already-terminal errors), run_stop on a
+                           # running chicken (SIGTERM path + SIGTERM-ignoring hard-kill escalation with a
+                           # streamed marker, stopped, attestation (1,1,1), audit chicken.stopped, no
+                           # clutch, no alerts, no token material in the new rows), run_rerun (fresh run,
+                           # trigger=rerun, rerun_of in manifest + egg.queued, normal queue/admission/
+                           # pipeline to succeeded, rerun-after-cancel, CLI parity + errors), and a
+                           # subprocess-daemon e2e (fake vibe) doing cancel + stop + rerun end to end
 examples/weekly-incidents-digest/   # baseline-format example job (job.toml, prompt, schema, csv; mistral-api)
 examples/hello-vibe-cli/            # manual vibe-cli example job (job.toml, prompt, schema)
 examples/providers.toml             # spec 05 reference provider registry (mistral presets + pricing,
                            # commented other-provider example) — copy to ~/.turbochickens/providers.toml
-pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.12, deps: pydantic, typer, rich, croniter,
+pyproject.toml             # uv/hatchling, Python >=3.12, version 0.0.14, deps: pydantic, typer, rich, croniter,
                            # jsonschema (+ rfc3339-validator for format checks), httpx, apscheduler (spec 06),
                            # aiohttp (spec 12, coop web server); dev: pytest
 Dockerfile                 # spec 18: the coop image — python:3.12-slim, pip install . (the wheel ships
@@ -998,6 +1043,7 @@ Spec-18 deliverables, concretely:
 | 19 | Auth & access management UI (seat sessions, provider auth modes, access scope for tools/data/MCP/connectors) | **done** (2026-11-12) | 09, 12 |
 | 20 | Lexicon adoption — every surface speaks farm (`docs/lexicon.md` rolled out to Headcount events, GUI copy, CLI output, errors, docs; machine interfaces unchanged; legacy rows aliased on read) | **done** (2026-11-14) | 01–19 |
 | 21 | Hatchery & Farmhand overview v0.1 — lifecycle ops (stop/re-run), Free-Range, cost cap (off by default), chaining, Farmhand MCP (stdio/https/both), ChickenSubs, connectors registry, GUI for everything | overview v0.1 — **not ready-for-agent**; split into slices 22+ via to-tickets before implementation | 01–20 |
+| 22 | Lifecycle ops — `run_stop` (queued → `cancelled`, running → SIGTERM/hard kill → `stopped`, attested) + `run_rerun` (lineage) over socket, CLI, and audit | **done** (2026-11-14) | 02–04 |
 
 ## 5. Non-negotiable invariants (baseline v0.2 — do not regress these)
 
@@ -1064,7 +1110,7 @@ tables deliberately excluded).
 - **Adding dependencies:** edit `pyproject.toml`, then `uv lock` / `uv sync`.
 - **Version management is a human responsibility.** Coding agents can bump the
   last part of a version number (`0.0.X`) — every other bump (minor, major) is
-  human initiated. Current version: `0.0.13`.
+  human initiated. Current version: `0.0.14`.
 - **No agent as a contributor on GitHub.** See the commits bullet above: the
   `Co-Authored-By` agent trailer is what made GitHub list `mistral-vibe` as a
   contributor — it is banned from commits; humans only in the contributor
@@ -1172,6 +1218,26 @@ file names stay byte-stable. `audit.py` carries the legacy→lexicon alias map
 applied on read/display only (`tail()` normalizes, `?event=` accepts both old and
 new names; raw rows on disk are never rewritten), and the Hatchery now emits
 `egg.hatched` at provisioning start. `docs/lexicon.md` gained the Feed Ledger.
+
+Spec 22 (lifecycle ops) landed: new socket ops `run_stop` and `run_rerun`.
+`run_stop` on a queued egg pulls it from the pecking order → terminal
+`cancelled` (never hatches — no harness events — but still gets a manifest and
+the abattoir's (1,1,1) attestation, audit `egg.cancelled`); on a running
+chicken the pipeline's stop event races the harness call → SIGTERM, then a hard
+kill after `STOP_TERM_GRACE_SEC` (5s) → terminal `stopped`, output never
+collected, audit `chicken.stopped`, same attested teardown as any terminal
+state. `run_rerun` re-enqueues the same egg (from `job_specs.spec_path`) as a
+fresh run with `trigger=rerun` and `rerun_of` lineage in the manifest and the
+`egg.queued` row, through the normal queue/admission/pipeline. CLI parity:
+`tc runs stop <id>` / `tc runs rerun <id>` (rc 0, clear errors for unknown or
+already-terminal runs); `runs_list` rows carry `status_reason`, and the new
+terminal states show in `tc runs list` / `runs_show` / `audit_tail`.
+`TERMINAL_STATES` gains `cancelled`/`stopped`, so a missing attestation on a
+stopped/cancelled chicken stays an alert condition. Lexicon first: Cancelled /
+Stopped / Re-run + the `egg.cancelled` / `chicken.stopped` event names were
+added to `docs/lexicon.md` before use. Verified e2e through a thread daemon and
+a subprocess daemon with the fake vibe binary (incl. a SIGTERM-trapping fake
+forcing the hard-kill path); full suite 298 passed.
 
 The MVP spec pipeline (01–10) and the GUI spec 11 slices (12–20) are
 complete; what remains is the post-MVP roadmap in baseline §13.

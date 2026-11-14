@@ -29,7 +29,7 @@ app = typer.Typer(
 )
 jobs_app = typer.Typer(help="Egg (job spec) commands — candling.", no_args_is_help=True)
 daemon_app = typer.Typer(help="Coopd lifecycle commands (the supervisor daemon).", no_args_is_help=True)
-runs_app = typer.Typer(help="Inspect chickens (runs).", no_args_is_help=True)
+runs_app = typer.Typer(help="Inspect and steer chickens (runs) — list/show/logs/stop/rerun.", no_args_is_help=True)
 results_app = typer.Typer(help="Fetch clutches (validated results) from the nest box.", no_args_is_help=True)
 schedule_app = typer.Typer(help="Manage the rooster's crows (cron schedules).", no_args_is_help=True)
 stats_app = typer.Typer(help="Feed ledger — per-egg usage rollups (spec 08).", no_args_is_help=True)
@@ -363,10 +363,13 @@ def runs_list(
         attested = "yes" if r["attested"] else "no"
         if r["status"] in TERMINAL_STATES and not r["attested"]:
             status += " ALERT:no-attestation"
-        typer.echo(
+        line = (
             f"chicken={r['id']}  egg={r['job_name']}  status={status}  trigger={r['trigger']}  "
             f"started={r['started_at'] or '-'}  finished={r['finished_at'] or '-'}  attested={attested}"
         )
+        if r.get("status_reason"):
+            line += f"  reason={r['status_reason']}"
+        typer.echo(line)
 
 
 @runs_app.command("show")
@@ -412,6 +415,37 @@ def runs_logs(
     resp = _request_or_exit(settings_path, "runs_logs", run_id=run_id)
     for e in resp["events"]:
         typer.echo(f"{e['seq']:>4} {e['ts']} [{e['level']}] {e['source']}: {e['line']}")
+
+
+@runs_app.command("stop")
+def runs_stop(
+    run_id: str = typer.Argument(..., help="Chicken ID, e.g. run-0123abcd4567."),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Stop a chicken deliberately (spec 22): a queued egg is cancelled (it never hatches);
+    a running chicken gets SIGTERM, then a hard kill, with the abattoir's attested teardown.
+
+    Talks to the same `run_stop` socket op the GUI/Farmhand will use; waits for
+    the terminal state and exits 0, or exits 1 for an unknown or already-terminal chicken."""
+    resp = _request_or_exit(settings_path, "run_stop", timeout=60.0, run_id=run_id)
+    line = f"chicken {resp['run_id']} → {resp['status']}"
+    if resp.get("reason"):
+        line += f" ({resp['reason']})"
+    typer.echo(line)
+
+
+@runs_app.command("rerun")
+def runs_rerun(
+    run_id: str = typer.Argument(..., help="Chicken ID to re-run, e.g. run-0123abcd4567."),
+    settings_path: Path | None = _settings_opt(),
+) -> None:
+    """Re-queue the same egg as a fresh chicken (spec 22): new run ID, lineage recorded
+    (`rerun_of` in the manifest and the Headcount), through the normal queue/admission/pipeline."""
+    resp = _request_or_exit(settings_path, "run_rerun", timeout=10.0, run_id=run_id)
+    typer.echo(
+        f"egg re-queued {resp['run_id']} (job '{resp['job_id']}') — re-run of {run_id}, "
+        f"pecking order depth {resp['queue_depth']}, weight {resp['weight']}"
+    )
 
 
 @results_app.command("get")

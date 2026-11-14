@@ -50,6 +50,15 @@ device_code stays in daemon memory, sessions land 0600 under
 ``<data_dir>/seats/`` exactly as the CLI path, Headcount rows ``perch.claimed`` /
 ``perch.released`` carry provider + mode only), and ``auth_logout``.
 ``runs_list`` rows also carry ``auth_mode`` from the run manifest.
+
+Spec 22 (lifecycle ops) adds ``run_stop`` (a queued egg → terminal
+``cancelled``, never hatches; a running chicken → SIGTERM, then hard kill,
+terminal ``stopped`` — both paths with the abattoir's attested teardown and
+Headcount rows ``egg.cancelled`` / ``chicken.stopped``) and ``run_rerun``
+(enqueue the same egg as a fresh run with the lineage recorded as
+``rerun_of`` in the manifest and the ``egg.queued`` row). ``TERMINAL_STATES``
+gains ``cancelled``/``stopped``, so a missing attestation on them stays an
+alert condition. ``runs_list`` rows also carry ``status_reason``.
 """
 
 from __future__ import annotations
@@ -63,6 +72,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -154,6 +164,9 @@ class Daemon:
         self._retention_task: asyncio.Task | None = None
         self._last_retention: dict[str, Any] | None = None
         self._run_tasks: set[asyncio.Task] = set()
+        # spec 22: run_ids whose queued egg was pulled from the pecking order
+        # via `run_stop` — the scheduler cancels them instead of admitting
+        self._cancel_requested: set[str] = set()
         # spec 19: seat broker for the auth ops + in-flight device grants
         self._broker: SeatBroker | None = None
         self._device_grants: dict[str, DeviceGrant] = {}
@@ -324,6 +337,10 @@ class Daemon:
             return self._runs_show(req)
         if op == "runs_logs":
             return self._runs_logs(req)
+        if op == "run_stop":
+            return await self._run_stop(req)
+        if op == "run_rerun":
+            return await self._run_rerun(req)
         if op == "results_get":
             return self._results_get(req)
         if op == "stats_list":
@@ -433,6 +450,7 @@ class Daemon:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "enqueue requires spec_path"}
         spec_path = Path(str(spec_path_raw))
         trigger = str(req.get("trigger", "manual"))
+        rerun_of = req.get("rerun_of")  # spec 22: `run_rerun` lineage
         try:
             spec = load_spec(spec_path)
         except SpecValidationError as e:
@@ -484,19 +502,22 @@ class Daemon:
             "weight": weight,
             "started_at": started_at,
         }
+        if rerun_of:
+            item["rerun_of"] = str(rerun_of)
         await self.queue.put(item)
         assert self.audit is not None
-        self.audit.append(
-            {
-                "event": "egg.queued",
-                "run_id": run_id,
-                "job_id": job_id,
-                "spec_hash": f"sha256:{digest}",
-                "trigger": trigger,
-                "weight": weight,
-            }
-        )
-        return {
+        queued_row: dict[str, Any] = {
+            "event": "egg.queued",
+            "run_id": run_id,
+            "job_id": job_id,
+            "spec_hash": f"sha256:{digest}",
+            "trigger": trigger,
+            "weight": weight,
+        }
+        if rerun_of:
+            queued_row["rerun_of"] = str(rerun_of)
+        self.audit.append(queued_row)
+        resp: dict[str, Any] = {
             "ok": True,
             "op": "enqueue",
             "protocol": PROTOCOL_VERSION,
@@ -506,6 +527,9 @@ class Daemon:
             "weight": weight,
             "queue_depth": self._queue_depth(),
         }
+        if rerun_of:
+            resp["rerun_of"] = str(rerun_of)
+        return resp
 
     # --- admission control + scheduler -------------------------------------
 
@@ -515,19 +539,33 @@ class Daemon:
 
     async def _scheduler(self) -> None:
         """One queue, one admission path. Over-budget runs backlog in
-        `pending` (FIFO) — nothing is ever rejected."""
+        `pending` (FIFO) — nothing is ever rejected. A queued egg whose
+        `run_stop` arrived (spec 22) is cancelled instead of admitted."""
         while self._stop is None or not self._stop.is_set():
             while self.pending and self._admit(self.pending[0]["weight"]):
                 item = self.pending.pop(0)
+                if item["run_id"] in self._cancel_requested:
+                    await self._cancel_item(item)
+                    continue
                 self.in_flight[item["run_id"]] = item["weight"]
                 task = asyncio.create_task(self._run_item(item))
                 self._run_tasks.add(task)
                 task.add_done_callback(self._run_tasks.discard)
             try:
                 item = await asyncio.wait_for(self.queue.get(), timeout=0.2)
-                self.pending.append(item)
             except asyncio.TimeoutError:
-                pass
+                continue
+            if item["run_id"] in self._cancel_requested:
+                await self._cancel_item(item)
+            else:
+                self.pending.append(item)
+
+    async def _cancel_item(self, item: dict[str, Any]) -> None:
+        """Spec 22: cancel a queued egg pulled from the pecking order by
+        `run_stop` — terminal `cancelled`, never hatched, still attested."""
+        self._cancel_requested.discard(item["run_id"])
+        assert self.pipeline is not None
+        await self.pipeline.cancel_queued(item)
 
     async def _run_item(self, item: dict[str, Any]) -> None:
         run_id = item["run_id"]
@@ -628,14 +666,18 @@ class Daemon:
         runs = []
         for r in rows:
             # spec 19: surface the per-run auth mode (spec 09 manifest block)
-            # in the runs table — a mode string only, never token material
+            # in the runs table — a mode string only, never token material.
+            # spec 22: surface the terminal status reason (stopped/cancelled/…)
             auth_mode = None
+            status_reason = None
             if r[9]:
                 try:
                     manifest = json.loads(r[9])
-                    auth = manifest.get("auth") if isinstance(manifest, dict) else None
-                    if isinstance(auth, dict):
-                        auth_mode = auth.get("mode")
+                    if isinstance(manifest, dict):
+                        auth = manifest.get("auth")
+                        if isinstance(auth, dict):
+                            auth_mode = auth.get("mode")
+                        status_reason = manifest.get("status_reason")
                 except (ValueError, TypeError):
                     auth_mode = None
             runs.append(
@@ -650,6 +692,7 @@ class Daemon:
                     "attested": bool(r[7]),
                     "result_valid": None if r[8] is None else bool(r[8]),
                     "auth_mode": auth_mode,
+                    "status_reason": status_reason,
                 }
             )
         return {"ok": True, "op": "runs_list", "protocol": PROTOCOL_VERSION, "runs": runs}
@@ -678,6 +721,102 @@ class Daemon:
                 {"seq": e[0], "ts": e[1], "level": e[2], "source": e[3], "line": e[4]} for e in events
             ],
         }
+
+    # --- spec 22: lifecycle ops — stop & re-run a chicken --------------------
+
+    async def _run_stop(self, req: dict[str, Any]) -> dict[str, Any]:
+        """End a chicken deliberately. A queued egg is pulled from the pecking
+        order → terminal `cancelled` (it never hatches); a chicken already in
+        the Hatchery gets SIGTERM, then a hard kill → terminal `stopped`. Both
+        paths get the abattoir's attested teardown and Headcount rows. Waits
+        for the terminal state and returns it with its reason."""
+        run_id = str(req.get("run_id", ""))
+        if not run_id:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "run_stop requires run_id"}
+        if self.db is None or self.pipeline is None:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "db not ready"}
+        row = self.db.execute("SELECT status, job_id FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"unknown chicken: {run_id!r}"}
+        status, job_id = row
+        if status in TERMINAL_STATES:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": f"chicken {run_id!r} is already terminal ({status}) — nothing to stop",
+            }
+        # mark for cancellation in case the scheduler has not popped/admitted
+        # the egg yet, and cancel it right away when it is sitting in the backlog
+        self._cancel_requested.add(run_id)
+        for i, it in enumerate(self.pending):
+            if it["run_id"] == run_id:
+                del self.pending[i]
+                await self._cancel_item(it)
+                break
+        # wait for the terminal state, asking an active chicken to stop as soon
+        # as it is (covers the race where the scheduler admitted it just now)
+        deadline = time.monotonic() + 45.0
+        final: str | None = None
+        while time.monotonic() < deadline:
+            row = self.db.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if row is None:
+                break
+            if row[0] in TERMINAL_STATES:
+                final = row[0]
+                break
+            if row[0] != "queued":
+                self.pipeline.request_stop(run_id)
+            await asyncio.sleep(0.05)
+        self._cancel_requested.discard(run_id)
+        if final is None:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": f"chicken {run_id!r} did not reach a terminal state in time",
+            }
+        mrow = self.db.execute("SELECT manifest_json FROM runs WHERE id = ?", (run_id,)).fetchone()
+        reason = None
+        if mrow and mrow[0]:
+            with contextlib.suppress(ValueError, TypeError):
+                reason = json.loads(mrow[0]).get("status_reason")
+        return {
+            "ok": True,
+            "op": "run_stop",
+            "protocol": PROTOCOL_VERSION,
+            "run_id": run_id,
+            "job_id": job_id,
+            "status": final,
+            "reason": reason,
+        }
+
+    async def _run_rerun(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Spec 22: enqueue the same egg as a fresh run (new run_id), with the
+        lineage recorded (`rerun_of` on the queue item → manifest + the
+        `egg.queued` Headcount row). The new run goes through the normal
+        queue/admission/pipeline exactly like any enqueue."""
+        run_id = str(req.get("run_id", ""))
+        if not run_id:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "run_rerun requires run_id"}
+        if self.db is None:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "db not ready"}
+        row = self.db.execute(
+            "SELECT r.job_id, j.spec_path FROM runs r JOIN job_specs j ON j.id = r.job_id WHERE r.id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"unknown chicken: {run_id!r}"}
+        job_id, spec_path = row
+        if not spec_path:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": f"no spec path recorded for egg {job_id!r}; queue it again with `tc run <job.toml>`",
+            }
+        resp = await self._enqueue({"spec_path": spec_path, "trigger": "rerun", "rerun_of": run_id})
+        if resp.get("ok"):
+            resp["op"] = "run_rerun"
+            resp["rerun_of"] = run_id
+        return resp
 
     # --- validated results (spec 04) -----------------------------------------
 

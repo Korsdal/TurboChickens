@@ -5,6 +5,13 @@ with running → failed on harness error / timeout and collecting → failed on
 candling failure, and every terminal state closed by an abattoir attestation
 plus Headcount rows (baseline v0.2 §5, §10; spec 20 lexicon).
 
+Spec 22 (lifecycle ops) adds two terminal states: a queued Egg can be
+**cancelled** (`cancel_queued` — it never hatches, still attested) and a
+running Chicken can be **stopped** by the operator (`request_stop` — the
+harness process gets SIGTERM, then a hard kill after `STOP_TERM_GRACE_SEC`).
+Both stop paths end in the same teardown attestation as any terminal state, and
+`run_rerun` lineage lands in the manifest as `rerun_of`.
+
 The pipeline owns all SQLite writes for a chicken: status transitions on
 `runs`, streamed `run_events`, the manifest, the `results` row (spec 04: a
 valid clutch is stored in the nest box, an invalid one quarantined), and the
@@ -39,7 +46,13 @@ from turbochickens.stats import rollup_usage
 from turbochickens.util import utcnow_iso
 from turbochickens.validate import OutputValidation, validate_output
 
-TERMINAL_STATES = ("succeeded", "failed")
+#: terminal states — every one requires a teardown attestation (baseline §5).
+#: spec 22 adds `cancelled` (queued egg pulled from the pecking order) and
+#: `stopped` (running chicken ended by the operator via `run_stop`).
+TERMINAL_STATES = ("succeeded", "failed", "cancelled", "stopped")
+
+#: spec 22: grace between SIGTERM and the hard kill when stopping a chicken
+STOP_TERM_GRACE_SEC = 5.0
 
 OUTPUT_EVENT_MAX_LEN = 20_000
 
@@ -65,6 +78,20 @@ class RunPipeline:
         # env-allowlist behavior
         self.credential_provider = credential_provider or SeatBroker(settings, self.providers)
         self._db_lock = asyncio.Lock()
+        # spec 22: run_id → stop event for every chicken the pipeline is
+        # actively driving; `request_stop` sets the event and the run ends
+        # `stopped` (SIGTERM, then hard kill) instead of collecting output
+        self._active: dict[str, asyncio.Event] = {}
+
+    def request_stop(self, run_id: str) -> bool:
+        """Spec 22: ask an active chicken to stop. Returns True when the run
+        is in the pipeline right now (its stop event is set); False when the
+        run is not active (queued, already terminal, or not yet started)."""
+        event = self._active.get(run_id)
+        if event is None:
+            return False
+        event.set()
+        return True
 
     # --- db helpers -------------------------------------------------------
 
@@ -222,7 +249,7 @@ class RunPipeline:
         auth: dict[str, Any],
     ) -> dict[str, Any]:
         spec = ctx.spec
-        return {
+        manifest: dict[str, Any] = {
             "run_id": ctx.run_id,
             "job_id": ctx.job_id,
             "job_name": spec.job.name,
@@ -253,6 +280,11 @@ class RunPipeline:
             # never a budget.
             "budget": budget,
         }
+        # spec 22: re-run lineage — this chicken was enqueued by `run_rerun`
+        # from another run of the same egg
+        if item.get("rerun_of"):
+            manifest["rerun_of"] = item["rerun_of"]
+        return manifest
 
     # --- the lifecycle ----------------------------------------------------
 
@@ -290,6 +322,11 @@ class RunPipeline:
         # spec 09: auth telemetry for the manifest/audit — mode + token expiry,
         # never a token. Refreshed from the credential provider when available.
         auth: dict[str, Any] = auth_telemetry_of(self.credential_provider, ctx)
+        # spec 22: operator stop — `run_stop` sets this event; a running chicken
+        # then gets SIGTERM + hard kill and ends `stopped` instead of collecting
+        stop_event = asyncio.Event()
+        self._active[run_id] = stop_event
+        stopped_reason: str | None = None
         try:
             await self._set_status(run_id, "provisioning")
             # spec 20: the Hatchery starts turning the Egg into a Chicken
@@ -331,13 +368,19 @@ class RunPipeline:
                         "token_expires_at": auth.get("token_expires_at"),
                     }
                 )
-                await self._set_status(run_id, "running")
-                result = await adapter.execute(
-                    prepared,
-                    lambda source, level, line: self._event(run_id, source, level, line),
-                    timeout_sec=spec.resources.timeout_sec,
-                )
-            if result is not None and result.timed_out:
+                if stop_event.is_set():
+                    # spec 22: stopped while provisioning — the harness never starts
+                    stopped_reason = "stopped by operator before the harness started"
+                    result = None
+                    await self._event(run_id, "supervisor", "info", stopped_reason)
+                else:
+                    await self._set_status(run_id, "running")
+                    result, stopped_reason = await self._execute_harness(
+                        adapter, prepared, ctx, stop_event, spec.resources.timeout_sec
+                    )
+            if stopped_reason is not None:
+                status, reason = "stopped", stopped_reason
+            elif result is not None and result.timed_out:
                 budget["timed_out"] = True
                 budget["outcome"] = "timeout"
                 status, reason = "failed", f"timeout: hard-killed after {spec.resources.timeout_sec}s"
@@ -376,7 +419,146 @@ class RunPipeline:
             with contextlib.suppress(Exception):
                 await self._event(run_id, "supervisor", "error", sanitize_log_line(str(e)))
         finally:
+            self._active.pop(run_id, None)
             await self._finalize(item, ctx, harness, result, status, reason, adapter, budget, auth)
+
+    async def _execute_harness(
+        self,
+        adapter: Any,
+        prepared: PreparedRun,
+        ctx: RunContext,
+        stop_event: asyncio.Event,
+        timeout_sec: int,
+    ) -> tuple[HarnessResult, str | None]:
+        """Spec 22: run the harness to completion, racing an operator stop.
+        When `run_stop` fires mid-run, the harness process gets SIGTERM first
+        and a hard kill after `STOP_TERM_GRACE_SEC`; the run then ends
+        `stopped` and its output is never collected or candled. Returns
+        (harness result, stopped reason or None)."""
+        run_id = ctx.run_id
+
+        async def sink(source: str, level: str, line: str) -> None:
+            await self._event(run_id, source, level, line)
+
+        exec_task = asyncio.create_task(adapter.execute(prepared, sink, timeout_sec=timeout_sec))
+        stop_task = asyncio.create_task(stop_event.wait())
+        try:
+            await asyncio.wait({exec_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stop_task.cancel()
+        if stop_event.is_set() and not exec_task.done():
+            proc = ctx.proc
+            if proc is not None and proc.returncode is None:
+                # SIGTERM first, then the hard kill after the grace period
+                with contextlib.suppress(ProcessLookupError):
+                    proc.terminate()
+                hard_killed = False
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=STOP_TERM_GRACE_SEC)
+                except asyncio.TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    hard_killed = True
+                    with contextlib.suppress(Exception):
+                        await proc.wait()
+                reason = (
+                    f"stopped by operator: SIGTERM, then hard kill after {STOP_TERM_GRACE_SEC:g}s grace"
+                    if hard_killed
+                    else f"stopped by operator: SIGTERM (reaped within {STOP_TERM_GRACE_SEC:g}s grace)"
+                )
+                result = await exec_task  # completes now that the process is dead
+            else:
+                # no live subprocess to signal (e.g. an HTTP adapter) — cancel
+                # the in-flight call itself
+                exec_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await exec_task
+                result = HarnessResult(exit_code=None, raw_output="", usage={}, error="stopped by operator")
+                reason = "stopped by operator (in-flight harness call cancelled)"
+            return result, reason
+        result = await exec_task
+        return result, None
+
+    async def cancel_queued(self, item: dict[str, Any]) -> None:
+        """Spec 22: terminal-cancel an egg that was still in the pecking order.
+        It never hatches (no harness events, no `egg.hatched`), but it still
+        gets a manifest and the abattoir's attestation exactly like any
+        terminal state — nothing was spawned or provisioned, so the
+        attestation verifies that (1, 1, 1)."""
+        run_id = item["run_id"]
+        reason = "cancelled while queued — the egg never hatched"
+        now = utcnow_iso()
+        spec = load_spec(item["spec_path"])
+        manifest: dict[str, Any] = {
+            "run_id": run_id,
+            "job_id": item["job_id"],
+            "job_name": spec.job.name,
+            "spec_hash": f"sha256:{item['spec_hash']}",
+            "trigger": item["trigger"],
+            "harness": {
+                "adapter": spec.harness.adapter,
+                "model": spec.harness.model,
+                "temperature": spec.harness.temperature,
+            },
+            "started_at": item.get("started_at"),
+            "finished_at": now,
+            "usage": {"tokens_in": 0, "tokens_out": 0},
+            "status": "cancelled",
+            "status_reason": reason,
+            "timed_out": False,
+        }
+        if item.get("rerun_of"):
+            manifest["rerun_of"] = item["rerun_of"]
+        # nothing was provisioned for a queued egg — verify anyway and attest
+        ws = self.settings.data_dir / "workspaces" / run_id
+        workspace_removed = True
+        if ws.exists():
+            shutil.rmtree(ws, ignore_errors=True)
+            workspace_removed = not ws.exists()
+        async with self._db_lock:
+            row = self.db.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if row is None or row[0] in TERMINAL_STATES:
+                return  # lost a race with a real terminal state — never overwrite
+            self.db.execute(
+                "UPDATE runs SET status = 'cancelled', finished_at = ?, manifest_json = ?, usage_json = ? WHERE id = ?",
+                (now, json.dumps(manifest), json.dumps(manifest["usage"]), run_id),
+            )
+            self.db.execute(
+                "INSERT OR IGNORE INTO teardown_attestations"
+                " (run_id, process_reaped, workspace_removed, env_cleared, verified_at)"
+                " VALUES (?, 1, ?, 1, ?)",
+                (run_id, int(workspace_removed), now),
+            )
+            self.db.commit()
+        self.audit.append(
+            {
+                "event": "egg.cancelled",
+                "run_id": run_id,
+                "job_id": item["job_id"],
+                "spec_hash": f"sha256:{item['spec_hash']}",
+                "trigger": item["trigger"],
+                "reason": reason,
+            }
+        )
+        self.audit.append(
+            {
+                "event": "abattoir.attested",
+                "run_id": run_id,
+                "process_reaped": True,
+                "workspace_removed": workspace_removed,
+                "env_cleared": True,
+            }
+        )
+        self.audit.append(
+            {
+                "event": "chicken.finished",
+                "run_id": run_id,
+                "job_id": item["job_id"],
+                "status": "cancelled",
+                "reason": reason,
+            }
+        )
+        await self._event(run_id, "supervisor", "info", f"status → cancelled: {reason}")
 
     async def _finalize(
         self,
@@ -419,6 +601,17 @@ class RunPipeline:
                 ),
             )
             self.db.commit()
+        # spec 22: a chicken ended deliberately by the operator gets its own
+        # Headcount row on top of the usual attestation + terminal rows
+        if status == "stopped":
+            self.audit.append(
+                {
+                    "event": "chicken.stopped",
+                    "run_id": run_id,
+                    "job_id": ctx.job_id,
+                    "reason": reason,
+                }
+            )
         self.audit.append(
             {
                 "event": "abattoir.attested",
