@@ -17,6 +17,7 @@ import contextlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tomllib
 from dataclasses import dataclass, field
@@ -145,6 +146,39 @@ class TeardownReport:
     process_reaped: bool
     workspace_removed: bool
     env_cleared: bool
+
+
+#: spec 32 (review finding G15): the harness is spawned in its own session
+#: (``start_new_session=True``), so its process-group id is its own pid and
+#: every grandchild shares the group — stop/kill signals go to the whole
+#: group via `os.killpg`. After a group kill, both the reap and the pipe
+#: drains are bounded: a pipe-holding escapee can delay a run but can never
+#: wedge it in a non-terminal state forever.
+KILL_REAP_WAIT_SEC = 5.0
+PIPE_DRAIN_WAIT_SEC = 5.0
+
+
+def signal_process_group(proc: asyncio.subprocess.Process, sig: int) -> None:
+    """Signal the chicken's whole process group (pgid == the child's pid
+    thanks to ``start_new_session=True``); falls back to the direct child
+    only if the group is already gone."""
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        with contextlib.suppress(ProcessLookupError):
+            proc.send_signal(sig)
+
+
+async def reap_process_group(
+    proc: asyncio.subprocess.Process, wait_sec: float = KILL_REAP_WAIT_SEC
+) -> None:
+    """SIGKILL the whole process group, then reap the direct child with a
+    hard cap on the await — the post-kill wait is always bounded."""
+    signal_process_group(proc, signal.SIGKILL)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=wait_sec)
+    except (asyncio.TimeoutError, ProcessLookupError):
+        pass
 
 
 class CredentialProvider(Protocol):
@@ -454,6 +488,9 @@ class VibeCLIAdapter:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # spec 32 (G15): own session → own process group, so a stop
+                # or kill reaches the whole group, not just the direct child
+                start_new_session=True,
             )
         except OSError as e:
             return HarnessResult(exit_code=None, raw_output="", usage={}, error=f"cannot spawn {self.bin}: {e}")
@@ -483,11 +520,20 @@ class VibeCLIAdapter:
             await asyncio.wait_for(proc.wait(), timeout=timeout_sec)
         except asyncio.TimeoutError:
             timed_out = True
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            with contextlib.suppress(Exception):
-                await proc.wait()
-        await asyncio.gather(pump_out, pump_err)
+            # spec 32 (G15): hard kill goes to the whole process group, and
+            # the post-kill reap is bounded
+            await reap_process_group(proc)
+        # Drain the pipes. After a kill the drain is bounded too — a
+        # pipe-holding escapee must not wedge the run non-terminal.
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(pump_out, pump_err),
+                timeout=PIPE_DRAIN_WAIT_SEC if timed_out else None,
+            )
+        except asyncio.TimeoutError:
+            for pump in (pump_out, pump_err):
+                pump.cancel()
+            await asyncio.gather(pump_out, pump_err, return_exceptions=True)
         raw_output = "".join(stdout_chunks).strip()
         usage = self._read_usage(export_dir)
         return HarnessResult(
@@ -518,10 +564,8 @@ class VibeCLIAdapter:
     async def teardown(self, run: RunContext) -> TeardownReport:
         process_reaped = True
         if run.proc is not None and run.proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                run.proc.kill()
-            with contextlib.suppress(Exception):
-                await run.proc.wait()
+            # spec 32 (G15): kill the whole process group, reap bounded
+            await reap_process_group(run.proc)
             process_reaped = run.proc.returncode is not None
         workspace_removed = True
         if run.workspace.exists():
