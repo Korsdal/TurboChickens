@@ -71,6 +71,32 @@ def load_spec(path: str | Path) -> JobSpec:
     return spec
 
 
+def load_spec_text(raw: str | bytes, *, source: str = "stored spec") -> JobSpec:
+    """Parse and validate spec TOML held in memory (no egg directory).
+
+    Used to recover stale rows whose spec file may be gone (spec 32 ticket
+    20, G16): the stored ``spec_toml`` in ``job_specs`` was already candled
+    at enqueue, so model validation applies but file-ref containment does
+    not (there is no egg directory to contain against). Raises
+    SpecValidationError on any problem, exactly like ``load_spec``.
+    """
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise SpecValidationError([SpecIssue((), f"invalid {source} (not utf-8): {e}")])
+    try:
+        data = tomllib.loads(raw)
+    except tomllib.TOMLDecodeError as e:
+        raise SpecValidationError([SpecIssue((), f"invalid TOML in {source}: {e}")])
+    try:
+        return JobSpec.model_validate(data)
+    except ValidationError as e:
+        raise SpecValidationError(
+            [SpecIssue(tuple(str(x) for x in err["loc"]), err["msg"]) for err in e.errors()]
+        )
+
+
 def _check_file_refs(spec_path: Path, spec: JobSpec) -> list[SpecIssue]:
     """Candling-time containment (spec 32, G1): every file ref in the spec —
     ``input.prompt_file``, each non-nestbox ``input.attachments`` entry, and

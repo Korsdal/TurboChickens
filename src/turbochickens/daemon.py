@@ -141,6 +141,16 @@ spawn env: at startup coopd marks itself non-dumpable
 ``/proc/<coopd>/environ`` for ambient secrets, and every chicken's per-run env
 points HOME/TMPDIR/XDG_*/VIBE_HOME at its own Scratch (``.tc-home/`` inside
 its workspace) holding only a sanitized vibe profile — see ``adapter.py``.
+
+Spec 32 ticket 20 (review G16): eggs still in the Pecking Order when coopd
+shuts down are cancelled through the same attested path as ``run_stop`` on a
+queued egg (terminal ``cancelled``, Headcount rows ``egg.cancelled`` /
+``abattoir.attested`` / ``chicken.finished``, attestation (1,1,1)) — never
+stranded ``queued``. Rows left ``queued`` by a dead coopd (a crash or kill)
+are recovered at startup into that same cancelled-with-attestation state
+before the socket accepts (Headcount row ``coopd.recovered``), and the
+status alerts also surface any non-terminal row this coopd does not own, so
+no run is left non-terminal across restarts without being visible.
 """
 
 from __future__ import annotations
@@ -204,8 +214,8 @@ from turbochickens.settings import (
     UPLOAD_MAX_BYTES,
     Settings,
 )
-from turbochickens.spec.loader import SpecValidationError, load_spec, spec_hash
-from turbochickens.spec.model import NETWORK_POLICIES
+from turbochickens.spec.loader import SpecValidationError, load_spec, load_spec_text, spec_hash
+from turbochickens.spec.model import NETWORK_POLICIES, JobSpec
 from turbochickens.storage import init_db
 from turbochickens.util import display_relpath, redact_host_paths, utcnow, utcnow_iso
 
@@ -364,6 +374,11 @@ class Daemon:
         # spec 22: run_ids whose queued egg was pulled from the pecking order
         # via `run_stop` — the scheduler cancels them instead of admitting
         self._cancel_requested: set[str] = set()
+        # spec 32 ticket 20 (G16): run_ids of eggs sitting in the pecking
+        # order (asyncio queue or the pending backlog) that this coopd owns —
+        # used by the status alerts to tell a legitimately queued egg apart
+        # from a non-terminal row stranded by a dead coopd
+        self._in_queue: set[str] = set()
         # spec 19: seat broker for the auth ops + in-flight device grants
         self._broker: SeatBroker | None = None
         self._device_grants: dict[str, DeviceGrant] = {}
@@ -418,6 +433,10 @@ class Daemon:
         self.pipeline = RunPipeline(
             s, self.db, self.audit, providers=self.providers, pid_registry=self._chicken_pids
         )
+        # spec 32 ticket 20 (G16): recover stale queued rows left by a dead
+        # coopd into the cancelled-with-attestation state before the socket
+        # accepts — no run is left non-terminal across restarts
+        await self._recover_stale_queued()
         # spec 08: retention — sweep expired result artifacts once at startup
         # (the audit log itself is never TTL-deleted), then periodically
         self._last_retention = sweep_expired_results(s, self.db, self.audit)
@@ -478,6 +497,26 @@ class Daemon:
                 self._retention_task.cancel()
             if self.cron is not None:
                 self.cron.stop()
+            # spec 32 ticket 20 (G16): eggs still in the pecking order at
+            # shutdown are cancelled through the same attested path as
+            # `run_stop` on a queued egg — never stranded `queued` forever
+            if self.pipeline is not None and self._sched_task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._sched_task  # let the cancelled scheduler settle
+                drained = list(self.pending)
+                self.pending.clear()
+                while True:
+                    try:
+                        drained.append(self.queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                for item in drained:
+                    with contextlib.suppress(Exception):
+                        await self._cancel_item(
+                            item,
+                            reason="cancelled at coopd shutdown — the egg never hatched",
+                            spec=self._cancel_spec(item),
+                        )
             if self._run_tasks:  # graceful: let in-flight runs finish (bounded)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(
@@ -699,7 +738,10 @@ class Daemon:
         return self.queue.qsize() + len(self.pending)
 
     def _alerts(self) -> list[str]:
-        """Terminal runs without a teardown attestation — an alert condition."""
+        """Alert conditions: terminal runs without a complete teardown
+        attestation, and — spec 32 ticket 20 (G16) — non-terminal rows this
+        coopd does not own (stranded by a dead coopd; startup recovery
+        cancels the queued ones, anything else must stay visible here)."""
         if self.db is None:
             return []
         placeholders = ", ".join("?" for _ in TERMINAL_STATES)
@@ -709,7 +751,13 @@ class Daemon:
             " AND (t.run_id IS NULL OR t.process_reaped = 0 OR t.workspace_removed = 0 OR t.env_cleared = 0)",
             TERMINAL_STATES,
         ).fetchall()
-        return [r[0] for r in rows]
+        alerts = [r[0] for r in rows]
+        tracked = self._in_queue | set(self.in_flight)
+        stranded = self.db.execute(
+            f"SELECT id FROM runs WHERE status NOT IN ({placeholders})", TERMINAL_STATES
+        ).fetchall()
+        alerts.extend(r[0] for r in stranded if r[0] not in tracked and r[0] not in alerts)
+        return alerts
 
     def _status(self) -> dict[str, Any]:
         return {
@@ -877,6 +925,10 @@ class Daemon:
         started_at = utcnow_iso()
         async with self._db_lock:
             assert self.db is not None
+            # spec 32 ticket 20 (G16): the egg is owned by this coopd's
+            # pecking order from the moment its row exists, so the status
+            # alerts never mistake it for a stranded row
+            self._in_queue.add(run_id)
             self.db.execute(
                 "INSERT OR IGNORE INTO job_specs (id, name, spec_hash, spec_toml, created_at, spec_path)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
@@ -951,6 +1003,9 @@ class Daemon:
                 if item["run_id"] in self._cancel_requested:
                     await self._cancel_item(item)
                     continue
+                # spec 32 ticket 20 (G16): admitted into the hatchery — the
+                # egg leaves the pecking order, the chicken is in flight
+                self._in_queue.discard(item["run_id"])
                 self.in_flight[item["run_id"]] = item["weight"]
                 task = asyncio.create_task(self._run_item(item))
                 self._run_tasks.add(task)
@@ -964,13 +1019,89 @@ class Daemon:
             else:
                 self.pending.append(item)
 
-    async def _cancel_item(self, item: dict[str, Any]) -> None:
+    async def _cancel_item(
+        self, item: dict[str, Any], reason: str | None = None, spec: JobSpec | None = None
+    ) -> None:
         """Spec 22: cancel a queued egg pulled from the pecking order by
-        `run_stop` — terminal `cancelled`, never hatched, still attested."""
+        `run_stop` — terminal `cancelled`, never hatched, still attested.
+
+        Spec 32 ticket 20 (G16): the same attested path also cancels eggs
+        still queued at coopd shutdown and stale queued rows recovered at
+        startup (`reason` says which; `spec` is passed when the egg file may
+        be gone)."""
         self._cancel_requested.discard(item["run_id"])
+        self._in_queue.discard(item["run_id"])
         assert self.pipeline is not None
         with audit_via(str(item.get("via", "socket"))):
-            await self.pipeline.cancel_queued(item)
+            await self.pipeline.cancel_queued(item, reason=reason, spec=spec)
+
+    def _cancel_spec(self, item: dict[str, Any]) -> JobSpec | None:
+        """Best-effort spec for the attested cancel path: the egg file when it
+        still exists, else the spec TOML stored in ``job_specs`` at enqueue
+        (the file may be gone by startup-recovery time; the stored copy was
+        already candled). Returns None only when both fail — the row then
+        stays queued and the status alerts surface it."""
+        path = item.get("spec_path") or ""
+        if path:
+            try:
+                return load_spec(path)
+            except SpecValidationError:
+                pass
+        if self.db is not None:
+            row = self.db.execute(
+                "SELECT spec_toml FROM job_specs WHERE id = ?", (item["job_id"],)
+            ).fetchone()
+            if row and row[0]:
+                try:
+                    return load_spec_text(row[0], source=f"stored spec of egg {item['job_id']!r}")
+                except SpecValidationError:
+                    return None
+        return None
+
+    async def _recover_stale_queued(self) -> list[str]:
+        """Spec 32 ticket 20 (G16): rows still `queued` from a previous coopd
+        (a crash or kill — a clean shutdown cancels its own queued eggs) are
+        recovered at startup through the same attested cancel path as
+        `run_stop` on a queued egg: terminal `cancelled`, manifest, Headcount
+        rows, attestation (1,1,1). Runs before the socket accepts, so no run
+        is left non-terminal across restarts. Returns the recovered run ids."""
+        if self.db is None or self.pipeline is None or self.audit is None:
+            return []
+        rows = self.db.execute(
+            "SELECT r.id, r.job_id, r.trigger, r.started_at, r.parent_run_id, j.spec_path, j.spec_hash"
+            " FROM runs r JOIN job_specs j ON j.id = r.job_id WHERE r.status = 'queued'"
+        ).fetchall()
+        recovered: list[str] = []
+        for run_id, job_id, trigger, started_at, parent_run_id, spec_path, digest in rows:
+            item: dict[str, Any] = {
+                "run_id": run_id,
+                "job_id": job_id,
+                "spec_path": spec_path or "",
+                "spec_hash": digest,
+                "trigger": trigger,
+                "weight": 1.0,
+                "started_at": started_at,
+                "via": "socket",
+            }
+            if parent_run_id:
+                item["parent_run_id"] = parent_run_id
+            with contextlib.suppress(Exception):
+                await self._cancel_item(
+                    item,
+                    reason=(
+                        "cancelled at startup — stale queued egg recovered after a coopd restart;"
+                        " the egg never hatched"
+                    ),
+                    spec=self._cancel_spec(item),
+                )
+            row = self.db.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if row is not None and row[0] in TERMINAL_STATES:
+                recovered.append(run_id)
+        if recovered:
+            self.audit.append(
+                {"event": "coopd.recovered", "count": len(recovered), "recovered": sorted(recovered)}
+            )
+        return recovered
 
     async def _run_item(self, item: dict[str, Any]) -> None:
         run_id = item["run_id"]
