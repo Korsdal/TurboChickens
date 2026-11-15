@@ -333,7 +333,7 @@ def test_chained_run_consumes_earlier_clutch_and_records_lineage(daemon, tmp_pat
         {
             "attachment": uri,
             "run_id": run_a,
-            "artifact_path": str(clutch_path),
+            "artifact_path": f"results/{run_a}/output.json",  # spec 32 (G17): data-dir-relative
             "size_bytes": len(clutch_bytes),
         }
     ]
@@ -348,7 +348,7 @@ def test_chained_run_consumes_earlier_clutch_and_records_lineage(daemon, tmp_pat
     assert len(consumed) == 1
     assert consumed[0]["source_run_id"] == run_a
     assert consumed[0]["attachment"] == uri
-    assert consumed[0]["artifact"] == str(clutch_path)
+    assert consumed[0]["artifact"] == f"results/{run_a}/output.json"  # spec 32 (G17)
     logs = request(sock, "runs_logs", run_id=run_b, timeout=2.0)["events"]
     assert any("status → running" in e["line"] for e in logs)
     assert any(e["source"] == "harness" for e in logs)

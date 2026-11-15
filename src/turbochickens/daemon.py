@@ -197,7 +197,7 @@ from turbochickens.settings import SOCKET_STREAM_LIMIT, UPLOAD_MAX_BYTES, Settin
 from turbochickens.spec.loader import SpecValidationError, load_spec, spec_hash
 from turbochickens.spec.model import NETWORK_POLICIES
 from turbochickens.storage import init_db
-from turbochickens.util import utcnow, utcnow_iso
+from turbochickens.util import display_relpath, redact_host_paths, utcnow, utcnow_iso
 
 #: how often the retention sweeper re-runs after the startup sweep (spec 08)
 RETENTION_SWEEP_INTERVAL_SEC = 3600.0
@@ -359,7 +359,9 @@ class Daemon:
                 "event": "coopd.started",
                 "pid": os.getpid(),
                 "version": __version__,
-                "socket": str(s.socket_path),
+                # spec 32 (G17): the Headcount carries the data-dir-relative
+                # name only — never a host absolute path
+                "socket": display_relpath(s.socket_path, s.data_dir),
             }
         )
         if s.socket_path.exists():
@@ -630,14 +632,16 @@ class Daemon:
                 "started_at": utcnow_iso() if self.started_at is None else self.started_at.isoformat(),
                 "uptime_sec": self._uptime_sec(),
             },
-            "socket": str(self.settings.socket_path),
+            # spec 32 (G17): served as data-dir-relative identifiers only —
+            # a host absolute path never appears in a served payload
+            "socket": display_relpath(self.settings.socket_path, self.settings.data_dir),
             "queue_depth": self._queue_depth(),
             "in_flight": [
                 {"run_id": run_id, "weight": weight} for run_id, weight in self.in_flight.items()
             ],
             "weight_budget": self.settings.weight_budget,
-            "db_path": str(self.settings.db_path),
-            "audit_log": str(self.settings.audit_log_path),
+            "db_path": display_relpath(self.settings.db_path, self.settings.data_dir),
+            "audit_log": display_relpath(self.settings.audit_log_path, self.settings.data_dir),
             "schedules": self._schedule_count(),
             "alerts": self._alerts(),
             "retention": {
@@ -935,7 +939,8 @@ class Daemon:
             "result": (
                 {
                     "valid": bool(res[0]),
-                    "artifacts_dir": res[1],
+                    # spec 32 (G17): `artifacts_dir` is daemon-internal state
+                    # (the DB column stays, schema v5) — never served
                     "schema_errors": json.loads(res[2]) if res[2] else None,
                 }
                 if res
@@ -1150,10 +1155,15 @@ class Daemon:
             }
         except OSError as e:
             # raced with the abattoir: the workspace vanished mid-peek
+            # (spec 32 G17: the OS error's host path is redacted from the
+            # served payload — full detail stays in coopd's own log)
             return {
                 "ok": False,
                 "protocol": PROTOCOL_VERSION,
-                "error": f"the beak is closed: chicken {run_id!r} workspace disappeared mid-peek ({e})",
+                "error": (
+                    f"the beak is closed: chicken {run_id!r} workspace disappeared mid-peek"
+                    f" ({redact_host_paths(str(e), self.settings.data_dir)})"
+                ),
                 "workspace_gone": True,
                 "run_id": run_id,
             }
@@ -1342,7 +1352,8 @@ class Daemon:
                 "quarantined": True,
                 "schema_errors": json.loads(schema_errors) if schema_errors else [],
                 "raw_output": output_json,
-                "artifacts_dir": artifacts_dir,
+                # spec 32 (G17): no `artifacts_dir` in served payloads — the
+                # quarantine location is daemon-internal state (DB column stays)
             }
         return {
             "ok": True,
@@ -1351,7 +1362,7 @@ class Daemon:
             "run_id": run_id,
             "valid": True,
             "output": json.loads(output_json),
-            "artifacts_dir": artifacts_dir,
+            # spec 32 (G17): no `artifacts_dir` in served payloads
         }
 
     # --- per-job usage stats (spec 08) ---------------------------------------
@@ -2038,7 +2049,9 @@ class Daemon:
                 "event": "egg.candled",
                 "job_id": spec.job.name,
                 "spec_hash": f"sha256:{digest}",
-                "spec_path": str(spec_path),
+                # spec 32 (G17): the Headcount carries the data-dir-relative
+                # uploads path only — never a host absolute path
+                "spec_path": display_relpath(spec_path, self.settings.data_dir),
                 "size_bytes": total,
                 "n_files": len(decoded),
             }
@@ -2094,7 +2107,12 @@ class Daemon:
             )
         except Exception as e:
             self.audit.append(
-                {"event": "rooster.missed", "job_id": job_id, "error": f"{type(e).__name__}: {e}"}
+                {
+                    "event": "rooster.missed",
+                    "job_id": job_id,
+                    # spec 32 (G17): redact any host path from the served row
+                    "error": redact_host_paths(f"{type(e).__name__}: {e}", self.settings.data_dir),
+                }
             )
             return
         if resp.get("ok"):

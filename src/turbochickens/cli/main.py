@@ -268,9 +268,11 @@ def status(
         f"coopd: up (pid={d['pid']}, version={d['version']}, "
         f"uptime={d['uptime_sec']}s, started_at={d['started_at']})"
     )
-    typer.echo(f"socket: {resp['socket']}")
-    typer.echo(f"db: {resp['db_path']}")
-    typer.echo(f"audit_log: {resp['audit_log']}")
+    # spec 32 (G17): the socket payload serves data-dir-relative identifiers
+    # only; the local CLI prints the operator's own absolute paths (local-only)
+    typer.echo(f"socket: {settings.socket_path}")
+    typer.echo(f"db: {settings.db_path}")
+    typer.echo(f"audit_log: {settings.audit_log_path}")
     typer.echo(f"weight_budget: {resp['weight_budget']}")
     typer.echo(f"pecking order: {resp['queue_depth']}")
     in_flight = resp["in_flight"]
@@ -409,10 +411,16 @@ def runs_show(
         err_console.print("[bold red]ALERT: terminal chicken without an abattoir attestation[/bold red]")
     if r.get("result"):
         res = r["result"]
+        # spec 32 (G17): the served payload carries no artifacts_dir — the
+        # local CLI derives the operator's own path from its local settings
+        local_settings = load_settings(settings_path)
         if res["valid"]:
-            typer.echo(f"clutch: valid (nest box: {res['artifacts_dir']})")
+            typer.echo(f"clutch: valid (nest box: {local_settings.results_dir / run_id})")
         else:
-            typer.echo(f"clutch: QUARANTINED — failed candling, schema errors below (quarantine: {res['artifacts_dir']})")
+            typer.echo(
+                f"clutch: QUARANTINED — failed candling, schema errors below"
+                f" (quarantine: {local_settings.quarantine_dir / run_id})"
+            )
             for e in res["schema_errors"] or []:
                 typer.echo(f"  schema error: {e}")
 
@@ -476,8 +484,10 @@ def results_get(
         if resp.get("quarantined"):
             for e in resp.get("schema_errors", []):
                 err_console.print(f"  schema error: {e}")
-            if resp.get("artifacts_dir"):
-                err_console.print(f"  quarantined clutch kept at: {resp['artifacts_dir']}")
+            # spec 32 (G17): the served payload carries no artifacts_dir — the
+            # local CLI derives the operator's own quarantine path from settings
+            local_settings = load_settings(settings_path)
+            err_console.print(f"  quarantined clutch kept at: {local_settings.quarantine_dir / run_id}")
         if resp.get("expired"):
             err_console.print("  the clutch was composted under the retention TTL; the append-only index row remains")
         raise typer.Exit(code=1) from None

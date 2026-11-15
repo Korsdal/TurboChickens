@@ -84,7 +84,9 @@ def sweep_expired_results(
         entry = {
             "run_id": run_id,
             "kind": "result" if valid else "quarantine",
-            "artifacts_dir": str(resolved),
+            # spec 32 (G17): no `artifacts_dir` in served payloads or Headcount
+            # rows — the composted location is daemon-internal state (the
+            # append-only `results` row keeps its column, schema v5)
             "finished_at": finished_at,
             "retention_months": settings.results_retention_months,
         }

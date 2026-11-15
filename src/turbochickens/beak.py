@@ -152,7 +152,12 @@ def peek_file(root: Path, rel: str) -> dict[str, Any]:
         with open(target, "rb") as f:
             blob = f.read(WORKSPACE_PEEK_MAX_BYTES + 1)
     except OSError as e:
-        return {"error": f"cannot read {rel!r} from the workspace: {e}", "refused": "unreadable"}
+        # spec 32 (G17): the OS error carries the resolved host path — the
+        # served error reports the workspace-relative name and the errno only
+        return {
+            "error": f"cannot read {rel!r} from the workspace: {e.strerror or type(e).__name__}",
+            "refused": "unreadable",
+        }
     truncated = len(blob) > WORKSPACE_PEEK_MAX_BYTES
     served = blob[:WORKSPACE_PEEK_MAX_BYTES]
     try:

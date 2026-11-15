@@ -22,6 +22,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from turbochickens.util import display_relpath
+
 SETTINGS_ENVVAR = "TURBOCHICKENS_SETTINGS"
 DEFAULT_DATA_DIR = Path("~/.turbochickens").expanduser()
 
@@ -149,19 +151,22 @@ class Settings(BaseModel):
 
         Every field except secrets: `coop_auth_token` is deliberately omitted —
         it is never served, printed (beyond the one-time startup line), logged,
-        or audited. Paths are included as strings so the payload is JSON-safe.
+        or audited. Paths are served data-dir-relative (spec 32, G17): the keys
+        are the settings fields, but the values never carry a host absolute
+        path, so a remote GUI user does not learn the host filesystem layout.
         """
+        d = self.data_dir
         return {
-            "data_dir": str(self.data_dir),
-            "socket_path": str(self.socket_path),
-            "db_path": str(self.db_path),
-            "audit_log_path": str(self.audit_log_path),
-            "results_dir": str(self.results_dir),
-            "quarantine_dir": str(self.quarantine_dir),
-            "seats_dir": str(self.seats_dir),
-            "uploads_dir": str(self.uploads_dir),
-            "providers_path": str(self.providers_path) if self.providers_path else None,
-            "connectors_path": str(self.connectors_path) if self.connectors_path else None,
+            "data_dir": display_relpath(d, d),
+            "socket_path": display_relpath(self.socket_path, d),
+            "db_path": display_relpath(self.db_path, d),
+            "audit_log_path": display_relpath(self.audit_log_path, d),
+            "results_dir": display_relpath(self.results_dir, d),
+            "quarantine_dir": display_relpath(self.quarantine_dir, d),
+            "seats_dir": display_relpath(self.seats_dir, d),
+            "uploads_dir": display_relpath(self.uploads_dir, d),
+            "providers_path": display_relpath(self.providers_path, d) if self.providers_path else None,
+            "connectors_path": display_relpath(self.connectors_path, d) if self.connectors_path else None,
             "weight_budget_override": self.weight_budget_override,
             "weight_budget": self.weight_budget,
             "audit_retention": self.audit_retention,
