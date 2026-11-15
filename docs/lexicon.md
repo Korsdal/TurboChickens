@@ -21,7 +21,7 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 | **Feeders** | Model providers — who feeds the Chickens | `providers.py` |
 | **Feed Budget** | Per-run budgets: timeout, context cap, cost | run budgets / `budget.outcome` |
 | **Feed Ledger** | The per-egg rollup of what the flock was actually fed — tokens in/out, expected feed per Chicken | `stats.py`, the Feed view |
-| **Clutch** | A run's output artifacts — the eggs a Chicken lays | run results / artifacts |
+| **Clutch** | A run's output artifacts — the eggs a Chicken lays; size-capped — an over-cap Clutch is stored truncated with a `truncated` marker in the manifest budget, never unbounded in memory, DB, or disk | run results / artifacts |
 | **Nest Box** | Results store — where Clutches are found | `storage.py` (results) |
 | **Abattoir** | De-provisioning with attested, verifiable teardown | teardown / destruction |
 | **Compost** | Retention — old Clutches rot away; audit records stay forever | `retention.py` |

@@ -36,6 +36,25 @@ UPLOAD_MAX_BYTES = 10 * 1024 * 1024
 UPLOAD_MAX_HTTP_BODY = UPLOAD_MAX_BYTES * 4 // 3 + 2 * 1024 * 1024
 SOCKET_STREAM_LIMIT = UPLOAD_MAX_HTTP_BODY + 1024 * 1024
 
+#: spec 32 (review finding G20): the Fence — resource caps so a malicious
+#: Chicken or remote client cannot DoS coopd. Bounded keepalive, connection
+#: count, and per-handler time on both listeners; a per-chicken cap on stored
+#: run events (the table is append-only, so the cap is enforced at insert)
+#: with a bounded `runs_logs` tail; and a cap on collected/stored harness
+#: output (the Clutch), which is stored truncated with a `truncated` marker
+#: instead of growing memory/DB/disk without bound.
+COOP_KEEPALIVE_TIMEOUT_SEC = 30.0  # idle keep-alive connections on the coop listener
+COOP_MAX_CONNECTIONS = 32  # concurrent in-flight coop requests
+COOP_HANDLER_TIMEOUT_SEC = 30.0  # one coop HTTP handler may not run longer
+SOCKET_MAX_CONNECTIONS = 16  # concurrent unix-socket clients
+SOCKET_IDLE_TIMEOUT_SEC = 300.0  # an idle socket connection is closed (keepalive cap)
+SOCKET_HANDLER_TIMEOUT_SEC = 60.0  # one socket op may not run longer
+MAX_RUN_EVENTS = 5_000  # stored run_events per chicken
+RUN_EVENT_LINE_MAX_LEN = 4_000  # stored event line length
+RUNS_LOGS_TAIL_DEFAULT = 500  # `runs_logs` serves the last N events by default
+RUNS_LOGS_TAIL_MAX = 5_000  # ...and never more than this, whatever is asked
+OUTPUT_MAX_BYTES = 1_048_576  # harness output (clutch) collected/stored cap: 1 MiB
+
 
 class SettingsError(Exception):
     """Settings file missing, unreadable, or invalid."""

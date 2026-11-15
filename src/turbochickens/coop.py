@@ -98,6 +98,7 @@ transport through ``settings_set``.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hmac
 import ipaddress
@@ -111,7 +112,14 @@ from typing import Any, Protocol
 from aiohttp import web
 
 from turbochickens.client import DEFAULT_TIMEOUT, DaemonUnreachable, request_async
-from turbochickens.settings import UPLOAD_MAX_BYTES, UPLOAD_MAX_HTTP_BODY, Settings
+from turbochickens.settings import (
+    COOP_HANDLER_TIMEOUT_SEC,
+    COOP_KEEPALIVE_TIMEOUT_SEC,
+    COOP_MAX_CONNECTIONS,
+    UPLOAD_MAX_BYTES,
+    UPLOAD_MAX_HTTP_BODY,
+    Settings,
+)
 
 #: backstop for request bodies (spec 15): a bundle at the decoded cap encodes
 #: to ~4/3 in base64 inside JSON — allow that plus slack; the daemon enforces
@@ -224,6 +232,9 @@ class CoopServer:
         # spec 26: the Farmhand MCP endpoint mounted on this same listener at
         # farmhand_https_path when the farmhand transport includes "https"
         self.farmhand: Any | None = None
+        # spec 32 (G20, the Fence): in-flight requests right now — over
+        # COOP_MAX_CONNECTIONS the next request is refused with a 503
+        self._active_requests = 0
 
     def status_block(self) -> dict[str, Any]:
         """The `coop` block of the status op — never contains the token."""
@@ -240,8 +251,15 @@ class CoopServer:
         # shutdown_timeout bounds the handler drain at cleanup, so a hung
         # client connection (e.g. an open MCP SSE stream, spec 26) can never
         # wedge daemon shutdown beyond it
-        app = web.Application(middlewares=[self._auth_middleware], client_max_size=CLIENT_MAX_BODY)
-        self._runner = web.AppRunner(app, shutdown_timeout=15.0)
+        app = web.Application(
+            middlewares=[self._auth_middleware, self._caps_middleware], client_max_size=CLIENT_MAX_BODY
+        )
+        # spec 32 (G20): keepalive cap — an idle keep-alive connection on the
+        # coop listener is closed after COOP_KEEPALIVE_TIMEOUT_SEC instead of
+        # the library default (3630 s), so slow-loris style holds cannot pile up
+        self._runner = web.AppRunner(
+            app, shutdown_timeout=15.0, keepalive_timeout=COOP_KEEPALIVE_TIMEOUT_SEC
+        )
         app.router.add_get("/api/ping", self._api_ping)
         app.router.add_get("/api/status", self._api_status)
         # spec 13: read-only mirrors of the GUI socket ops
@@ -337,6 +355,51 @@ class CoopServer:
                     {"ok": False, "error": "unauthorized: send Authorization: Bearer <token>"}, status=401
                 )
         return await handler(request)
+
+    def _is_farmhand_path(self, path: str) -> bool:
+        """The Farmhand MCP endpoint (streamable-HTTP, possibly a long-lived
+        SSE stream) is exempt from the per-handler timeout — it is bounded by
+        the connection cap and the runner's shutdown_timeout instead."""
+        p = self.settings.farmhand_https_path
+        return path == p or path.startswith(p + "/")
+
+    @web.middleware
+    async def _caps_middleware(self, request: web.Request, handler):
+        """Spec 32 (G20, the Fence): connection-count cap and per-handler
+        timeout on the coop listener, so a remote client cannot pile up
+        concurrent requests or wedge the shared supervision loop with one
+        slow handler. Over the cap → 503; over the handler time → 504."""
+        if self._active_requests >= COOP_MAX_CONNECTIONS:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": (
+                        f"the fence is full: the coop serves at most {COOP_MAX_CONNECTIONS} requests"
+                        " at once — retry shortly"
+                    ),
+                },
+                status=503,
+            )
+        self._active_requests += 1
+        try:
+            if self._is_farmhand_path(request.path):
+                return await handler(request)
+            try:
+                async with asyncio.timeout(COOP_HANDLER_TIMEOUT_SEC):
+                    return await handler(request)
+            except TimeoutError:
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": (
+                            f"the Fox cut the request short after {COOP_HANDLER_TIMEOUT_SEC:g}s"
+                            " — the coop is swamped, retry"
+                        ),
+                    },
+                    status=504,
+                )
+        finally:
+            self._active_requests -= 1
 
     # --- /api/* — thin mirrors of socket ops over the transport seam --------
 
@@ -539,7 +602,16 @@ class CoopServer:
         return await self._mirror_resource("runs_show", run_id=request.match_info["run_id"])
 
     async def _api_run_logs(self, request: web.Request) -> web.Response:
-        return await self._mirror_resource("runs_logs", run_id=request.match_info["run_id"])
+        # spec 32 (G20): ?limit= forwards to the socket op's bounded tail
+        # (?limit=abc → 400, like /api/audit); without it the daemon default applies
+        payload: dict[str, Any] = {"run_id": request.match_info["run_id"]}
+        raw = request.query.get("limit")
+        if raw is not None:
+            try:
+                payload["limit"] = int(raw)
+            except ValueError:
+                return web.json_response({"ok": False, "error": "limit must be an integer"}, status=400)
+        return await self._mirror_resource("runs_logs", **payload)
 
     async def _api_run_workspace(self, request: web.Request) -> web.Response:
         """GET /api/runs/{run_id}/workspace(?path=…) — the Beak (spec 29): the

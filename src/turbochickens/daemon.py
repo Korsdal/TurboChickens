@@ -193,7 +193,17 @@ from turbochickens.retention import sweep_expired_results
 from turbochickens.runner import TERMINAL_STATES, RunPipeline
 from turbochickens.scheduler import CronScheduler
 from turbochickens.seat import DeviceGrant, SeatBroker, SeatError, _iso
-from turbochickens.settings import SOCKET_STREAM_LIMIT, UPLOAD_MAX_BYTES, Settings
+from turbochickens.settings import (
+    MAX_RUN_EVENTS,
+    RUNS_LOGS_TAIL_DEFAULT,
+    RUNS_LOGS_TAIL_MAX,
+    SOCKET_HANDLER_TIMEOUT_SEC,
+    SOCKET_IDLE_TIMEOUT_SEC,
+    SOCKET_MAX_CONNECTIONS,
+    SOCKET_STREAM_LIMIT,
+    UPLOAD_MAX_BYTES,
+    Settings,
+)
 from turbochickens.spec.loader import SpecValidationError, load_spec, spec_hash
 from turbochickens.spec.model import NETWORK_POLICIES
 from turbochickens.storage import init_db
@@ -327,6 +337,9 @@ class Daemon:
         # the pipeline (which registers each harness pid at spawn) — used to
         # resolve a socket peer pid to the owning chicken
         self._chicken_pids: dict[int, str] = {}
+        # spec 32 (G20, the Fence): concurrent unix-socket clients served right
+        # now — over SOCKET_MAX_CONNECTIONS the connection is refused
+        self._active_clients = 0
 
     def request_stop(self) -> None:
         if self._stop is not None:
@@ -478,13 +491,36 @@ class Daemon:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        # spec 32 (G20, the Fence): a connection over the cap is refused once,
+        # then closed — a client cannot pile up idle connections on coopd
+        if self._active_clients >= SOCKET_MAX_CONNECTIONS:
+            resp = {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": (
+                    f"the fence is full: coopd accepts at most {SOCKET_MAX_CONNECTIONS} connections"
+                    " at once — close one and retry"
+                ),
+            }
+            writer.write(json.dumps(resp).encode("utf-8") + b"\n")
+            with contextlib.suppress(Exception):
+                await writer.drain()
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return
+        self._active_clients += 1
         # spec 32 (ticket 10, G8): caller identity is established server-side
         # from SO_PEERCRED on every connection, before any request is read
         caller = self._caller_identity(writer)
         try:
             while self._stop is None or not self._stop.is_set():
                 try:
-                    line = await reader.readline()
+                    # keepalive cap: an idle connection is closed after
+                    # SOCKET_IDLE_TIMEOUT_SEC without a request
+                    line = await asyncio.wait_for(reader.readline(), timeout=SOCKET_IDLE_TIMEOUT_SEC)
+                except TimeoutError:
+                    break
                 except ValueError:
                     # over SOCKET_STREAM_LIMIT: answer once, then close — the
                     # stream is desynced after a LimitOverrunError
@@ -499,12 +535,24 @@ class Daemon:
                     break
                 if not line:
                     break
-                resp = await self._respond(line, caller)
+                try:
+                    # per-handler cap: one op may not wedge the supervision loop
+                    resp = await asyncio.wait_for(self._respond(line, caller), timeout=SOCKET_HANDLER_TIMEOUT_SEC)
+                except TimeoutError:
+                    resp = {
+                        "ok": False,
+                        "protocol": PROTOCOL_VERSION,
+                        "error": (
+                            f"the Fox cut the request short after {SOCKET_HANDLER_TIMEOUT_SEC:g}s"
+                            " — coopd is swamped, retry"
+                        ),
+                    }
                 writer.write(json.dumps(resp, ensure_ascii=False).encode("utf-8") + b"\n")
                 await writer.drain()
         except (ConnectionResetError, BrokenPipeError):
             pass
         finally:
+            self._active_clients -= 1
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
@@ -1050,18 +1098,39 @@ class Daemon:
         run_id = str(req.get("run_id", ""))
         if self.db is None or self._run_row(run_id) is None:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"unknown chicken: {run_id!r}"}
-        events = self.db.execute(
-            "SELECT seq, ts, level, source, line FROM run_events WHERE run_id = ? ORDER BY seq",
-            (run_id,),
+        # spec 32 (G20): `runs_logs` serves a bounded tail — `limit` (default
+        # RUNS_LOGS_TAIL_DEFAULT, hard-capped at RUNS_LOGS_TAIL_MAX) newest
+        # events; the response reports the total stored and whether the tail
+        # was cut off or the log itself hit the per-chicken event cap
+        limit = req.get("limit", RUNS_LOGS_TAIL_DEFAULT)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": "runs_logs limit must be a positive integer",
+            }
+        limit = min(limit, RUNS_LOGS_TAIL_MAX)
+        total = self.db.execute(
+            "SELECT COUNT(*) FROM run_events WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        rows = self.db.execute(
+            "SELECT seq, ts, level, source, line FROM run_events WHERE run_id = ?"
+            " ORDER BY seq DESC LIMIT ?",
+            (run_id, limit),
         ).fetchall()
+        events = [
+            {"seq": e[0], "ts": e[1], "level": e[2], "source": e[3], "line": e[4]} for e in reversed(rows)
+        ]
         return {
             "ok": True,
             "op": "runs_logs",
             "protocol": PROTOCOL_VERSION,
             "run_id": run_id,
-            "events": [
-                {"seq": e[0], "ts": e[1], "level": e[2], "source": e[3], "line": e[4]} for e in events
-            ],
+            "events": events,
+            "limit": limit,
+            "total": total,
+            "truncated": total > len(events),
+            "capped": total >= MAX_RUN_EVENTS,
         }
 
     # --- spec 29: the Beak — read-only live view into a running chicken -------

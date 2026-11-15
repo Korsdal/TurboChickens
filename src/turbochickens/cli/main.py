@@ -430,10 +430,23 @@ def runs_logs(
     run_id: str = typer.Argument(..., help="Chicken ID, e.g. run-0123abcd4567."),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Print the chicken's streamed events (sanitized log lines + state transitions)."""
+    """Print the chicken's streamed events (sanitized log lines + state transitions).
+
+    The log is the bounded tail (spec 32: the per-chicken event log is capped);
+    a capped or cut-off tail is noted on stderr."""
     resp = _request_or_exit(settings_path, "runs_logs", run_id=run_id)
     for e in resp["events"]:
         typer.echo(f"{e['seq']:>4} {e['ts']} [{e['level']}] {e['source']}: {e['line']}")
+    if resp.get("capped"):
+        typer.echo(
+            f"the fence capped this chicken's log at {resp['total']} events — only the tail is kept",
+            err=True,
+        )
+    elif resp.get("truncated"):
+        typer.echo(
+            f"showing the last {len(resp['events'])} of {resp['total']} events (tail)",
+            err=True,
+        )
 
 
 @runs_app.command("stop")
