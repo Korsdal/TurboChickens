@@ -58,8 +58,11 @@ ancestors. On a chicken-owned connection, `spec_path` on `enqueue`, `run_rerun`,
 `schedule_add` is allowlisted to the **Uploads** area plus already-registered Egg paths —
 the Fox refuses anything else with a field-named `spec_path` error before the file is
 ever read, so a Chicken cannot use `spec_path` as a host-file existence or read oracle.
-Security refusals in this vocabulary say so plainly: *the Fox refuses — a chicken
-is not an operator*.
+That scope is enforced **server-side** in Coopd on every chicken-owned
+connection: operator-only ops — shutdown, settings, gates, auth, upload, re-run, schedule,
+retention, Farmhand info — are refused before any handler runs, with a field-named error
+whose field names the refused op. Security refusals in this vocabulary say so plainly:
+*the Fox refuses — a chicken is not an operator*.
 
 ## The Interface Layer
 

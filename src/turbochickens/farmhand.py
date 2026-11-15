@@ -118,7 +118,10 @@ def spec_bundle_b64(spec_path: Path) -> dict[str, str]:
 
 #: spec 27: tools a sub-chicken's Farmhand does NOT expose — schedule/auth/
 #: settings changes, bundle candling, and re-run are operator-side chores; a
-#: sub gets enqueue + read tools (plus the guarded run_stop)
+#: sub gets enqueue + read tools (plus the guarded run_stop). Spec 32 ticket 11
+#: (review G8 scope) enforces the same scope server-side: the daemon refuses
+#: these (and every other operator-only socket op) on any chicken-owned
+#: connection, so the narrowing does not rely on this client-side list alone.
 SUB_SCOPE_EXCLUDED = ("jobs_validate", "run_rerun", "schedule_add", "schedule_list", "schedule_rm", "settings_get")
 
 
