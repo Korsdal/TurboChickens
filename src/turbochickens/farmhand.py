@@ -31,6 +31,11 @@ Transports (settings ``farmhand_transport``, CLI ``--transport``):
   stdio server and the HTTPS endpoint in one process; a coopd with
   ``coop_enabled`` serves ``/mcp`` alongside the GUI).
 
+In every transport mode stdout stays protocol-only: all informational output —
+including the ephemeral coop-token notice — goes to stderr, so the stdio MCP
+channel stays clean in ``both`` mode and the bearer never lands in client-side
+logs.
+
 Secrecy: no tool result ever contains token/seat/device-code material — the
 socket ops already guarantee that (``settings_get`` omits ``coop_auth_token``,
 the ``auth_*`` ops are not exposed), and the coop bearer itself never appears
@@ -599,8 +604,10 @@ async def serve_https(settings: Settings) -> None:
     site = web.TCPSite(runner, settings.coop_host, settings.coop_port)
     await site.start()
     if farmhand.auth.required and farmhand.auth.ephemeral:
-        # printed exactly once, at startup; never logged or audited
-        print(f"coop auth token: {farmhand.auth.token}", flush=True)
+        # printed exactly once, at startup; never logged or audited. stderr
+        # only: stdout is the stdio MCP protocol channel in "both" mode, so the
+        # bearer must never land there (or in client-side logs of it)
+        print(f"coop auth token: {farmhand.auth.token}", file=sys.stderr, flush=True)
     try:
         await asyncio.Event().wait()
     finally:

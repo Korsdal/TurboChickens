@@ -731,3 +731,237 @@ def test_farmhand_serve_both_transports_simultaneously(tmp_path, monkeypatch, fa
     finally:
         dt.stop()
         SOCKET[0] = None
+
+
+# --- spec 32 / G6: informational output on stderr only, stdout protocol-only --
+#
+# In every transport mode (`stdio`, `https`, `both`) the Farmhand's
+# informational lines — including the ephemeral coop-token notice — must land
+# on stderr, so the stdio MCP channel stays protocol-clean in `both` mode and
+# the bearer never lands in client-side logs of the protocol stream.
+
+_TEE_WRAPPER = r"""
+import os, subprocess, sys, threading
+
+def pump(src, *dsts):
+    fd = src.fileno()
+    while True:
+        chunk = os.read(fd, 65536)  # returns as soon as any bytes are available
+        if not chunk:
+            break
+        for d in dsts:
+            d.write(chunk)
+            d.flush()
+
+out_cap = open(sys.argv[1], "wb")
+err_cap = open(sys.argv[2], "wb")
+proc = subprocess.Popen(
+    [sys.executable, "-m", "turbochickens", "farmhand", "serve", "--transport", sys.argv[3]],
+    stdin=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+)
+t1 = threading.Thread(target=pump, args=(proc.stdout, sys.stdout.buffer, out_cap), daemon=True)
+t2 = threading.Thread(target=pump, args=(proc.stderr, sys.stderr.buffer, err_cap), daemon=True)
+t1.start(); t2.start()
+rc = proc.wait()
+t1.join(timeout=5); t2.join(timeout=5)
+out_cap.close(); err_cap.close()
+sys.exit(rc)
+"""
+
+
+def run_stdio_capture(fn, transport: str, out_cap: Path, err_cap: Path, timeout: float = 120.0):
+    """Like run_stdio, but the serve subprocess's stdout/stderr are teed into
+    capture files, so the test can assert which stream each line landed on."""
+
+    async def main():
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=["-c", _TEE_WRAPPER, str(out_cap), str(err_cap), transport],
+            env=dict(os.environ),
+        )
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                return await fn(session)
+
+    return asyncio.run(asyncio.wait_for(main(), timeout))
+
+
+def assert_stdout_protocol_only(out_cap: Path) -> None:
+    """Every stdout line of a stdio-serving Farmhand is one JSON-RPC frame —
+    the protocol channel carries nothing else (no token notice, no info)."""
+    lines = [l for l in out_cap.read_bytes().splitlines() if l.strip()]
+    assert lines, "no protocol frames captured on stdout"
+    for line in lines:
+        frame = json.loads(line)  # a non-protocol line (e.g. the token) breaks this
+        assert isinstance(frame, dict) and "jsonrpc" in frame, f"non-protocol line on stdout: {line[:120]!r}"
+
+
+def _token_from_stderr(err_cap: Path, timeout: float = 10.0) -> str:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        tl = [l for l in err_cap.read_text(errors="replace").splitlines() if l.startswith("coop auth token: ")]
+        if tl:
+            return tl[0].split(": ", 1)[1].strip()
+        time.sleep(0.05)
+    raise AssertionError(f"no ephemeral token line on stderr; stderr so far: {err_cap.read_text(errors='replace')!r}")
+
+
+def test_serve_both_ephemeral_token_on_stderr_only_and_clean_stdio(tmp_path, monkeypatch, fake_vibe) -> None:
+    # G6: non-loopback host + no configured token → an ephemeral bearer is
+    # minted; in `both` mode (the default) that notice used to go to stdout,
+    # corrupting the stdio MCP channel. Now: stderr only, stdout protocol-only.
+    port = free_port()
+    f = write_settings(tmp_path, coop_host="0.0.0.0", coop_port=port)  # no token → ephemeral
+    monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
+    settings = load_settings(f)
+    SOCKET[0] = settings.socket_path
+    dt = DaemonThread(settings)  # coop disabled here → the port is the farmhand process's own
+    dt.start()
+    out_cap = tmp_path / "stdout.cap"
+    err_cap = tmp_path / "stderr.cap"
+    try:
+        spec = write_job(tmp_path, name="g6-egg", prompt="Say hello")
+
+        def drive(session: ClientSession):
+            async def go():
+                # the token notice is already on stderr while the stdio
+                # session is up — read it there and prove it gates the HTTPS
+                # side of the very same process
+                token = _token_from_stderr(err_cap)
+                c = httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=10.0)
+                assert c.post("/mcp", json=MCP_INIT_BODY, headers=MCP_INIT_HEADERS).status_code == 401
+                r = c.post("/mcp", json=MCP_INIT_BODY, headers={**MCP_INIT_HEADERS, "Authorization": f"Bearer {token}"})
+                assert r.status_code == 200 and r.headers.get("mcp-session-id")
+
+                # a clean stdio MCP session on the same channel: tools + a
+                # full enqueue → clutch round trip
+                tools = await session.list_tools()
+                assert {t.name for t in tools.tools} == EXPECTED_TOOLS
+                p = tool_payload(await _call(session, "status"))
+                assert p["ok"] is True and p["daemon"]["up"] is True
+                p = tool_payload(await _call(session, "enqueue", {"spec_path": str(spec)}))
+                rid = p["run_id"]
+                run = await wait_terminal_async(rid, timeout=30)
+                assert run["status"] == "succeeded"
+                res = tool_payload(await _call(session, "results_get", {"run_id": rid}))
+                assert res["ok"] is True and res["output"]["message"] == "hello from fake vibe"
+                return token
+            return go()
+
+        token = run_stdio_capture(drive, "both", out_cap, err_cap)
+
+        # stdout carried only JSON-RPC frames; the bearer never touched it
+        assert_stdout_protocol_only(out_cap)
+        stdout_text = out_cap.read_text(errors="replace")
+        assert not any(l.startswith("coop auth token:") for l in stdout_text.splitlines())
+        assert token not in stdout_text
+        # the notice is on stderr, exactly once, and never in the Headcount
+        stderr_text = err_cap.read_text(errors="replace")
+        assert len([l for l in stderr_text.splitlines() if l.startswith("coop auth token: ")]) == 1
+        assert f"coop auth token: {token}" in stderr_text
+        assert token not in settings.audit_log_path.read_text()
+    finally:
+        dt.stop()
+        SOCKET[0] = None
+
+
+def test_serve_stdio_stdout_protocol_only_informational_on_stderr(daemon, tmp_path) -> None:
+    # stdio mode: the CLI's informational "farmhand serving …" line is on
+    # stderr; stdout carries only MCP frames
+    out_cap = tmp_path / "stdout.cap"
+    err_cap = tmp_path / "stderr.cap"
+
+    def drive(session: ClientSession):
+        async def go():
+            tools = await session.list_tools()
+            assert {t.name for t in tools.tools} == EXPECTED_TOOLS
+            p = tool_payload(await _call(session, "status"))
+            assert p["ok"] is True and p["daemon"]["up"] is True
+        return go()
+
+    run_stdio_capture(drive, "stdio", out_cap, err_cap)
+    assert_stdout_protocol_only(out_cap)
+    stdout_text = out_cap.read_text(errors="replace")
+    assert not any(l.startswith("coop auth token:") for l in stdout_text.splitlines())
+    assert "farmhand serving" not in stdout_text
+    err_text = err_cap.read_text(errors="replace")
+    assert "farmhand serving transport=stdio" in err_text  # informational line on stderr
+
+
+def test_serve_https_informational_and_token_on_stderr_only(tmp_path, monkeypatch, fake_vibe) -> None:
+    # https mode on a non-loopback host with no configured token: both the
+    # "farmhand serving …" line and the ephemeral token notice are stderr-only;
+    # stdout stays empty (no protocol channel here, but no leaks either)
+    port = free_port()
+    f = write_settings(tmp_path, coop_host="0.0.0.0", coop_port=port)
+    monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
+    settings = load_settings(f)
+    SOCKET[0] = settings.socket_path
+    dt = DaemonThread(settings)
+    dt.start()
+    env = dict(os.environ)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "turbochickens", "farmhand", "serve", "--transport", "https"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+    )
+    out_lines: list[str] = []
+    err_lines: list[str] = []
+
+    def _drain(stream, sink) -> None:
+        for line in stream:
+            sink.append(line.rstrip("\n"))
+
+    r1 = threading.Thread(target=_drain, args=(proc.stdout, out_lines), daemon=True)
+    r2 = threading.Thread(target=_drain, args=(proc.stderr, err_lines), daemon=True)
+    r1.start()
+    r2.start()
+    try:
+        # wait until the listener answers 401 (bearer required, ephemeral token)
+        deadline = time.time() + 15
+        up = False
+        while time.time() < deadline:
+            try:
+                if httpx.post(f"http://127.0.0.1:{port}/mcp", json=MCP_INIT_BODY, headers=MCP_INIT_HEADERS, timeout=1.0).status_code == 401:
+                    up = True
+                    break
+            except httpx.ConnectError:
+                pass
+            if proc.poll() is not None:
+                raise AssertionError("farmhand https subprocess exited early")
+            time.sleep(0.05)
+        assert up, "the farmhand https listener did not come up"
+
+        token = _token_from_lines(err_lines)
+        # the bearer from stderr gates the endpoint; stdout stayed clean
+        c = httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=10.0)
+        assert c.post("/mcp", json=MCP_INIT_BODY, headers=MCP_INIT_HEADERS).status_code == 401
+        r = c.post("/mcp", json=MCP_INIT_BODY, headers={**MCP_INIT_HEADERS, "Authorization": f"Bearer {token}"})
+        assert r.status_code == 200 and r.headers.get("mcp-session-id")
+        time.sleep(0.3)  # let the drain threads see everything written so far
+        assert not [l for l in out_lines if l.strip()], f"informational output leaked to stdout: {out_lines}"
+        assert not any("coop auth token" in l for l in out_lines)
+        assert any("farmhand serving transport=https" in l for l in err_lines)
+        assert len([l for l in err_lines if l.startswith("coop auth token: ")]) == 1
+        assert token not in settings.audit_log_path.read_text()
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        r1.join(timeout=5)
+        r2.join(timeout=5)
+        dt.stop()
+        SOCKET[0] = None
+
+
+def _token_from_lines(lines: list[str], timeout: float = 10.0) -> str:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        tl = [l for l in lines if l.startswith("coop auth token: ")]
+        if tl:
+            return tl[0].split(": ", 1)[1].strip()
+        time.sleep(0.05)
+    raise AssertionError(f"no ephemeral token line on stderr; stderr so far: {lines}")
