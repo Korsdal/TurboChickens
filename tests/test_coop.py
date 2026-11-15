@@ -69,8 +69,9 @@ def http_client(settings: Settings) -> httpx.Client:
 
 @pytest.fixture
 def coop_file(tmp_path, monkeypatch) -> Path:
-    """Settings with coop enabled on a free loopback port, no token (open mode)."""
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    """Settings with coop enabled on a free loopback port, no token — open via
+    the spec-32 coop_loopback_open opt-in (the default requires the bearer)."""
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     return f
 
@@ -119,10 +120,31 @@ def test_is_loopback() -> None:
     assert not is_loopback("::")
 
 
-def test_coop_auth_loopback_no_token_is_open() -> None:
+def test_coop_auth_loopback_no_token_requires_bearer_by_default() -> None:
+    # spec 32 (G3): "loopback + no token → open" is gone; the bearer is required
+    # on every bind unless coop_loopback_open opts out — an ephemeral token is
+    # minted when none is configured, even on loopback
     s = Settings(coop_host="127.0.0.1")
     a = coop_auth(s)
+    assert a.required is True and a.ephemeral is True and a.token
+
+
+def test_coop_auth_loopback_open_only_with_explicit_opt_in() -> None:
+    s = Settings(coop_host="127.0.0.1", coop_loopback_open=True)
+    a = coop_auth(s)
     assert a.required is False and a.token is None and a.ephemeral is False
+
+
+def test_coop_auth_opt_in_does_not_open_non_loopback_binds() -> None:
+    s = Settings(coop_host="0.0.0.0", coop_loopback_open=True)
+    a = coop_auth(s)
+    assert a.required is True and a.ephemeral is True and a.token
+
+
+def test_coop_auth_opt_in_does_not_override_a_configured_token() -> None:
+    s = Settings(coop_host="127.0.0.1", coop_loopback_open=True, coop_auth_token="tok")
+    a = coop_auth(s)
+    assert a.required is True and a.token == "tok" and a.ephemeral is False
 
 
 def test_coop_auth_non_loopback_requires_token() -> None:
@@ -148,14 +170,19 @@ def test_coop_auth_configured_token_wins_on_loopback_too() -> None:
 # --- HTTP API against a thread daemon (open mode) ------------------------------
 
 
-def test_api_ping_unauthenticated_mirrors_socket_op(coop_daemon) -> None:
+def test_api_ping_unauthenticated_answers_bare_pong(coop_daemon) -> None:
+    # spec 32 ticket 05 (G17): the one open route discloses nothing — the HTTP
+    # ping is a bare pong (no version/pid/host path), while the socket op
+    # keeps its full payload for the local CLI
     c = http_client(coop_daemon.settings)
     r = c.get("/api/ping")
     assert r.status_code == 200
     body = r.json()
-    assert body["ok"] is True and body["pong"] is True
+    assert body == {"ok": True, "op": "ping", "pong": True}
+    assert "version" not in body and "pid" not in body
+    assert str(coop_daemon.settings.data_dir) not in r.text and "daemon.sock" not in r.text
     sock = request(coop_daemon.settings.socket_path, "ping", timeout=2.0)
-    assert body["version"] == sock["version"] and body["pid"] == sock["pid"]
+    assert sock["ok"] is True and sock["pong"] is True and sock["version"] and sock["pid"]
 
 
 def _normalize_status(status: dict) -> dict:
@@ -329,7 +356,7 @@ def test_ephemeral_token_printed_once_and_required(tmp_path, monkeypatch) -> Non
 
 
 def test_api_status_returns_daemon_down_payload_when_socket_unreachable(tmp_path, monkeypatch) -> None:
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     port = settings.coop_port
@@ -384,7 +411,7 @@ def _wait_socket(settings: Settings, proc, timeout: float = 15.0) -> None:
 def test_e2e_tc_coop_start_serves_gui_and_stops_cleanly(tmp_path, monkeypatch) -> None:
     # no coop_enabled in the file — `tc coop start` forces it on
     port = free_port()
-    f = write_settings(tmp_path, coop_port=port)
+    f = write_settings(tmp_path, coop_port=port, coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     env = dict(os.environ)

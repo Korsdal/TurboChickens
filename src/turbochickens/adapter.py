@@ -16,9 +16,12 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
-import unicodedata
+import tomllib
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
@@ -27,15 +30,18 @@ import httpx
 
 from turbochickens.chaining import attachment_workspace_name
 from turbochickens.providers import ProvidersConfig, ProvidersError, load_providers
+from turbochickens.settings import OUTPUT_MAX_BYTES
 from turbochickens.spec.model import JobSpec
+from turbochickens.util import cap_text_bytes, http_error_detail, sanitize_log_line
 
 ADAPTER_WEIGHTS: dict[str, float] = {"mistral-api": 0.25, "vibe-cli": 1.0}
 
 VIBE_BIN_ENVVAR = "TURBOCHICKENS_VIBE_BIN"
 
-#: Env keys copied from the daemon environment into the per-run env. Everything
-#: else (ambient secrets included) is left out — credentials enter only through
-#: the credential provider, as per-run env vars.
+#: Env keys the per-run env always carries. Only `PASSTHROUGH_ENV_KEYS` are
+#: copied verbatim from the daemon environment — everything else (ambient
+#: secrets included) is left out; credentials enter only through the
+#: credential provider, as per-run env vars.
 BASE_ENV_KEYS = (
     "PATH",
     "HOME",
@@ -49,9 +55,65 @@ BASE_ENV_KEYS = (
     "VIBE_HOME",
 )
 
+#: The subset of BASE_ENV_KEYS still passed through from the daemon env.
+#: HOME / TMPDIR / XDG_* / VIBE_HOME are deliberately NOT passthrough anymore
+#: (review G9, spec 32 ticket 12): they are repointed at the per-run Scratch
+#: inside the chicken's own workspace (see `materialize_scratch_home`), so a
+#: chicken can neither read nor write the operator's real $HOME, and nothing
+#: it plants in its "home" survives the abattoir's teardown.
+PASSTHROUGH_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "TERM")
+
+#: The per-run Scratch (lexicon): a directory inside the chicken's own
+#: workspace holding HOME, TMPDIR, XDG_* and VIBE_HOME plus a sanitized vibe
+#: profile. It is removed with the workspace at teardown.
+SCRATCH_HOME_DIRNAME = ".tc-home"
+
+#: The BASE_ENV_KEYS repointed at the Scratch instead of the daemon env.
+SCRATCH_ENV_KEYS = (
+    "HOME",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "VIBE_HOME",
+)
+
+#: the Scratch subpath each SCRATCH_ENV_KEYS entry points at (HOME is the
+#: Scratch root itself)
+_SCRATCH_SUBPATHS = {
+    "HOME": "",
+    "TMPDIR": "tmp",
+    "XDG_CONFIG_HOME": "config",
+    "XDG_DATA_HOME": "data",
+    "XDG_CACHE_HOME": "cache",
+    "VIBE_HOME": "vibe",
+}
+
 #: Default credential allowlist: names that may be injected per-run from the
 #: daemon's environment. The extension point is the CredentialProvider below.
 DEFAULT_CREDENTIAL_ALLOWLIST = ("MISTRAL_API_KEY",)
+
+#: a URL inside free text — transport-error strings can embed the provider URL
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _url_scrubbed(url: str) -> str:
+    """The URL without any userinfo (``user:pass@host``) — a provider
+    ``base_url`` may embed credentials, and neither a streamed log line nor a
+    served error may carry them (reviewer finding: userinfo leak)."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "<url withheld by the fox>"
+    if parts.username is None and parts.password is None:
+        return url
+    host = parts.hostname or ""
+    try:
+        if parts.port:
+            host = f"{host}:{parts.port}"
+    except ValueError:
+        pass
+    return urllib.parse.urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
 
 
 class AdapterNotImplemented(Exception):
@@ -65,18 +127,6 @@ class ProviderConfigError(Exception):
 def run_weight(adapter_name: str) -> float:
     """Resource weight of a run by adapter (baseline v0.2, decision 2)."""
     return ADAPTER_WEIGHTS[adapter_name]
-
-
-def sanitize_log_line(line: str, max_len: int = 4000) -> str:
-    """Make a streamed log line safe to store: strip control/format characters
-    (anything in Unicode category C*, except tab/newline) and cap the length.
-    Logs are data, never instructions."""
-    cleaned = "".join(
-        ch for ch in line if ch in ("\t", "\n") or not unicodedata.category(ch).startswith("C")
-    )
-    if len(cleaned) > max_len:
-        cleaned = cleaned[:max_len] + "…[truncated]"
-    return cleaned
 
 
 @dataclass
@@ -96,6 +146,11 @@ class RunContext:
     # spec 27 (ChickenSubs): the parent chicken when this run is a sub-chicken
     # enqueued through a spawn_subs chicken's Farmhand (lineage parent_run_id)
     parent_run_id: str | None = None
+    # spec 32 (ticket 10): the harness process pid, recorded at spawn; the
+    # daemon maps a socket peer pid back to this run through `on_spawn`, so
+    # lineage is forced from the peer credentials, never from client fields
+    pid: int | None = None
+    on_spawn: Callable[[int], None] | None = None
 
 
 @dataclass
@@ -113,13 +168,19 @@ class PreparedRun:
 
 @dataclass
 class HarnessResult:
-    """Raw, untrusted harness output plus usage telemetry and exit status."""
+    """Raw, untrusted harness output plus usage telemetry and exit status.
+
+    Spec 32 (G20): `raw_output` is capped at OUTPUT_MAX_BYTES — when the
+    harness produced more, `truncated` is True and only the first
+    OUTPUT_MAX_BYTES are kept (the Clutch is stored truncated, never
+    unbounded in memory/DB/disk)."""
 
     exit_code: int | None
     raw_output: str
     usage: dict[str, Any]
     timed_out: bool = False
     error: str | None = None
+    truncated: bool = False
 
 
 @dataclass
@@ -127,6 +188,39 @@ class TeardownReport:
     process_reaped: bool
     workspace_removed: bool
     env_cleared: bool
+
+
+#: spec 32 (review finding G15): the harness is spawned in its own session
+#: (``start_new_session=True``), so its process-group id is its own pid and
+#: every grandchild shares the group — stop/kill signals go to the whole
+#: group via `os.killpg`. After a group kill, both the reap and the pipe
+#: drains are bounded: a pipe-holding escapee can delay a run but can never
+#: wedge it in a non-terminal state forever.
+KILL_REAP_WAIT_SEC = 5.0
+PIPE_DRAIN_WAIT_SEC = 5.0
+
+
+def signal_process_group(proc: asyncio.subprocess.Process, sig: int) -> None:
+    """Signal the chicken's whole process group (pgid == the child's pid
+    thanks to ``start_new_session=True``); falls back to the direct child
+    only if the group is already gone."""
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        with contextlib.suppress(ProcessLookupError):
+            proc.send_signal(sig)
+
+
+async def reap_process_group(
+    proc: asyncio.subprocess.Process, wait_sec: float = KILL_REAP_WAIT_SEC
+) -> None:
+    """SIGKILL the whole process group, then reap the direct child with a
+    hard cap on the await — the post-kill wait is always bounded."""
+    signal_process_group(proc, signal.SIGKILL)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=wait_sec)
+    except (asyncio.TimeoutError, ProcessLookupError):
+        pass
 
 
 class CredentialProvider(Protocol):
@@ -149,8 +243,8 @@ class EnvAllowlistCredentialProvider:
     def auth_telemetry(self, run: RunContext) -> dict[str, Any]:
         """Spec 09: non-secret auth mode for the manifest/audit. An env
         credential present → "api-key"; absent → "none" (a subprocess harness
-        like vibe-cli may then use its own profile, e.g. browser auth from
-        ~/.vibe/config.toml, which is outside this platform's knowledge)."""
+        like vibe-cli may then use its own browser-auth profile, materialized
+        sanitized into the chicken's Scratch — see `materialize_scratch_home`)."""
         present = any(os.environ.get(k) is not None for k in self.allowlist)
         return {"mode": "api-key" if present else "none", "token_expires_at": None}
 
@@ -167,10 +261,119 @@ def auth_telemetry_of(provider: CredentialProvider, run: RunContext) -> dict[str
     return {"mode": "api-key", "token_expires_at": None}
 
 
+def scratch_home_env(workspace: Path) -> dict[str, str]:
+    """The HOME/XDG/TMPDIR/VIBE_HOME mapping of the per-run Scratch: every one
+    of them resolves inside the chicken's own workspace (review G9). Built
+    from SCRATCH_ENV_KEYS so the key list has a single source of truth."""
+    scratch = workspace / SCRATCH_HOME_DIRNAME
+    return {key: str(scratch / _SCRATCH_SUBPATHS[key]) for key in SCRATCH_ENV_KEYS}
+
+
+def _operator_vibe_config_text() -> str | None:
+    """The operator's own vibe profile text (read by the daemon, never by the
+    chicken): $VIBE_HOME/config.toml, else $XDG_CONFIG_HOME/vibe/config.toml,
+    else $HOME/.vibe/config.toml — first existing file wins."""
+    candidates: list[Path] = []
+    vibe_home = os.environ.get("VIBE_HOME")
+    if vibe_home:
+        candidates.append(Path(vibe_home) / "config.toml")
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        candidates.append(Path(xdg) / "vibe" / "config.toml")
+    home = os.environ.get("HOME")
+    if home:
+        candidates.append(Path(home) / ".vibe" / "config.toml")
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return cand.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return None
+
+
+def _toml_value(value: Any) -> str | None:
+    """Encode one profile value as a TOML value, or None when it is not a
+    plain scalar/array of scalars (tables are walked separately)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value)  # JSON basic strings are valid TOML basic strings
+    if isinstance(value, list):
+        items = [_toml_value(v) for v in value]
+        if all(i is not None for i in items):
+            return "[" + ", ".join(items) + "]"
+    return None
+
+
+def sanitize_vibe_profile(text: str | None) -> str:
+    """Whitelist copy of the operator's vibe profile for a chicken's Scratch
+    (review G9, spec 32 ticket 12): only ``browser_auth*`` fields survive —
+    they carry no secret material, and they keep the browser-auth seat flow
+    working inside the chicken. API keys, tokens, MCP server entries (gate
+    secrets), and every other setting are dropped. Unparseable or missing
+    input yields a minimal, explicitly sanitized profile."""
+    kept: dict[tuple[str, ...], list[tuple[str, Any]]] = {}
+    if text:
+        try:
+            data = tomllib.loads(text)
+        except (tomllib.TOMLDecodeError, ValueError):
+            data = {}
+
+        def walk(prefix: tuple[str, ...], table: dict[str, Any]) -> None:
+            for key, value in table.items():
+                if key.startswith("browser_auth") and _toml_value(value) is not None:
+                    kept.setdefault(prefix, []).append((key, value))
+                elif isinstance(value, dict):
+                    walk(prefix + (key,), value)
+
+        if isinstance(data, dict):
+            walk((), data)
+    lines = [
+        "# spec 32 ticket 12 (review G9): sanitized per-run vibe profile for the",
+        "# chicken's Scratch — only browser_auth* fields of the operator's profile",
+        "# are kept; api keys, tokens, and MCP server entries never reach a chicken.",
+    ]
+    for path in sorted(kept):
+        if path:
+            lines.append("")
+            lines.append("[" + ".".join(path) + "]")
+        for key, value in kept[path]:
+            encoded = _toml_value(value)
+            if encoded is not None:
+                lines.append(f"{key} = {encoded}")
+    return "\n".join(lines) + "\n"
+
+
+def materialize_scratch_home(run: RunContext) -> dict[str, str]:
+    """Create the per-run Scratch inside the chicken's own workspace and
+    materialize only a sanitized vibe profile in it. Returns the
+    HOME/TMPDIR/XDG_*/VIBE_HOME env pointing at the Scratch. Everything under
+    it is removed with the workspace at teardown — nothing a chicken plants in
+    its "home" survives the abattoir."""
+    env = scratch_home_env(run.workspace)
+    scratch = run.workspace / SCRATCH_HOME_DIRNAME
+    for sub in ("tmp", "config", "data", "cache", ".vibe", "vibe"):
+        (scratch / sub).mkdir(parents=True, exist_ok=True)
+    profile = sanitize_vibe_profile(_operator_vibe_config_text())
+    # every location vibe may resolve as its user-level profile, all sanitized
+    for rel in (".vibe/config.toml", "vibe/config.toml", "config/vibe/config.toml"):
+        target = scratch / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(profile)
+    return env
+
+
 def build_per_run_env(run: RunContext, credentials: dict[str, str]) -> dict[str, str]:
-    """Fresh per-run environment: base keys + injected credentials + run vars.
-    Deliberately not a copy of os.environ — no ambient secrets."""
-    env = {k: os.environ[k] for k in BASE_ENV_KEYS if k in os.environ}
+    """Fresh per-run environment: passthrough keys + the Scratch-pointed
+    HOME/XDG/TMPDIR/VIBE_HOME + injected credentials + run vars. Deliberately
+    not a copy of os.environ — no ambient secrets, and no real $HOME either."""
+    env = {k: os.environ[k] for k in PASSTHROUGH_ENV_KEYS if k in os.environ}
+    env.update(materialize_scratch_home(run))
     env.update(credentials)
     env["TURBOCHICKENS_RUN_ID"] = run.run_id
     env["TURBOCHICKENS_JOB_ID"] = run.job_id
@@ -321,20 +524,43 @@ class VibeCLIAdapter:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # spec 32 (G15): own session → own process group, so a stop
+                # or kill reaches the whole group, not just the direct child
+                start_new_session=True,
             )
         except OSError as e:
             return HarnessResult(exit_code=None, raw_output="", usage={}, error=f"cannot spawn {self.bin}: {e}")
         run.proc = proc
+        # spec 32 (ticket 10): record the chicken's pid at spawn and notify
+        # the pipeline, so the daemon can map a socket peer pid back to this
+        # run (peer-credential identity)
+        run.pid = proc.pid
+        if run.on_spawn is not None:
+            run.on_spawn(proc.pid)
         stdout_chunks: list[str] = []
+        collected = 0
+        truncated = False
 
         async def _pump(stream: asyncio.StreamReader, level: str, collect: bool) -> None:
+            nonlocal collected, truncated
             while True:
                 line = await stream.readline()
                 if not line:
                     break
                 text = line.decode("utf-8", "replace")
                 if collect:
-                    stdout_chunks.append(text)
+                    # spec 32 (G20): the collected output (the clutch) is
+                    # capped at OUTPUT_MAX_BYTES — the pipe is still drained,
+                    # but nothing past the cap is kept in memory
+                    if collected < OUTPUT_MAX_BYTES:
+                        chunk = text
+                        if collected + len(chunk) > OUTPUT_MAX_BYTES:
+                            chunk = chunk[: OUTPUT_MAX_BYTES - collected]
+                            truncated = True
+                        stdout_chunks.append(chunk)
+                        collected += len(chunk)
+                    else:
+                        truncated = True
                 await event_sink("harness", level, sanitize_log_line(text.rstrip("\r\n")))
 
         pump_out = asyncio.create_task(_pump(proc.stdout, "stdout", True))  # type: ignore[arg-type]
@@ -344,11 +570,20 @@ class VibeCLIAdapter:
             await asyncio.wait_for(proc.wait(), timeout=timeout_sec)
         except asyncio.TimeoutError:
             timed_out = True
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            with contextlib.suppress(Exception):
-                await proc.wait()
-        await asyncio.gather(pump_out, pump_err)
+            # spec 32 (G15): hard kill goes to the whole process group, and
+            # the post-kill reap is bounded
+            await reap_process_group(proc)
+        # Drain the pipes. After a kill the drain is bounded too — a
+        # pipe-holding escapee must not wedge the run non-terminal.
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(pump_out, pump_err),
+                timeout=PIPE_DRAIN_WAIT_SEC if timed_out else None,
+            )
+        except asyncio.TimeoutError:
+            for pump in (pump_out, pump_err):
+                pump.cancel()
+            await asyncio.gather(pump_out, pump_err, return_exceptions=True)
         raw_output = "".join(stdout_chunks).strip()
         usage = self._read_usage(export_dir)
         return HarnessResult(
@@ -356,6 +591,7 @@ class VibeCLIAdapter:
             raw_output=raw_output,
             usage=usage,
             timed_out=timed_out,
+            truncated=truncated,
         )
 
     def _read_usage(self, export_dir: Path) -> dict[str, Any]:
@@ -379,10 +615,8 @@ class VibeCLIAdapter:
     async def teardown(self, run: RunContext) -> TeardownReport:
         process_reaped = True
         if run.proc is not None and run.proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                run.proc.kill()
-            with contextlib.suppress(Exception):
-                await run.proc.wait()
+            # spec 32 (G15): kill the whole process group, reap bounded
+            await reap_process_group(run.proc)
             process_reaped = run.proc.returncode is not None
         workspace_removed = True
         if run.workspace.exists():
@@ -530,7 +764,7 @@ class MistralAPIAdapter:
         await event_sink(
             "harness",
             "info",
-            f"POST {url} model={self.model} json_mode={str(self.model_profile.json_mode).lower()}",
+            f"POST {_url_scrubbed(url)} model={self.model} json_mode={str(self.model_profile.json_mode).lower()}",
         )
         delay = self.backoff_base_sec
         attempt = 0
@@ -542,7 +776,9 @@ class MistralAPIAdapter:
                 resp = await client.post(url, json=body, headers=headers)
                 status = resp.status_code
             except httpx.TransportError as e:
-                err = f"{type(e).__name__}: {e}"
+                # reviewer finding: a transport error's text can embed the
+                # provider URL (userinfo leak) — strip every URL from it
+                err = f"{type(e).__name__}: {_URL_RE.sub('<url withheld by the fox>', str(e))}"
             if resp is not None and status == 200:
                 return await self._on_success(resp, event_sink)
             retryable = status is None or status == 429 or status >= 500
@@ -587,16 +823,12 @@ class MistralAPIAdapter:
 
     @staticmethod
     def _error_detail(resp: httpx.Response | None) -> str:
+        # G10: a Feeder's error response is untrusted bytes — only the parsed
+        # `error` field (sanitized) may surface; never the raw `resp.text`,
+        # which could echo credentials or carry terminal escape sequences.
         if resp is None:
             return "no response"
-        try:
-            data = resp.json()
-            msg = data.get("error", {}).get("message") if isinstance(data.get("error"), dict) else None
-            if msg:
-                return str(msg)
-        except ValueError:
-            pass
-        return resp.text[:200]
+        return http_error_detail(resp)
 
     async def _on_success(self, resp: httpx.Response, event_sink: Callable[[str, str, str], Awaitable[None]]) -> HarnessResult:
         try:
@@ -623,7 +855,12 @@ class MistralAPIAdapter:
         await event_sink(
             "harness", "info", f"provider http 200: tokens_in={tokens_in} tokens_out={tokens_out}"
         )
-        return HarnessResult(exit_code=0, raw_output=content or "", usage=usage)
+        content = content or ""
+        # spec 32 (G20, reviewer finding): the cap is on ENCODED BYTE length,
+        # not characters — a hostile/huge provider response is capped, not
+        # buffered whole — the clutch is stored truncated
+        content, truncated = cap_text_bytes(content, OUTPUT_MAX_BYTES)
+        return HarnessResult(exit_code=0, raw_output=content, usage=usage, truncated=truncated)
 
     async def teardown(self, run: RunContext) -> TeardownReport:
         """No subprocess to reap for a pure HTTP adapter; workspace gone + env

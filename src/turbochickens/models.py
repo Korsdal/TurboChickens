@@ -36,6 +36,7 @@ from turbochickens.adapter import resolve_vibe_bin, vibe_version
 from turbochickens.providers import DEFAULT_PROVIDER, ProviderProfile, ProvidersConfig
 from turbochickens.seat import SeatError
 from turbochickens.spec.model import JobSpec
+from turbochickens.util import http_error_detail
 
 #: Sentinel model for the vibe probe — never a real model, so vibe rejects it
 #: before any API call and reports its available list instead.
@@ -112,14 +113,9 @@ def fetch_models(
 
 
 def _error_detail(resp: httpx.Response) -> str:
-    try:
-        data = resp.json()
-        msg = data.get("error", {}).get("message") if isinstance(data.get("error"), dict) else None
-        if msg:
-            return str(msg)[:200]
-    except ValueError:
-        pass
-    return resp.text[:200]
+    # G10: only the parsed `error` field may surface — the raw body is
+    # untrusted feeder bytes (credential echo / terminal escapes), never text.
+    return http_error_detail(resp)
 
 
 #: Credential source for a /models call: the seat broker (spec 09), the

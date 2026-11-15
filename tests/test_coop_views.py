@@ -52,7 +52,7 @@ def fake_vibe(tmp_path, monkeypatch):
 
 @pytest.fixture
 def coop_daemon(tmp_path, monkeypatch):
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     dt = DaemonThread(settings)
@@ -146,10 +146,11 @@ def test_settings_get_effective_settings_never_the_token(tmp_path, monkeypatch) 
         resp = request(settings.socket_path, "settings_get", timeout=2.0)
         assert resp["ok"] is True and resp["op"] == "settings_get"
         s = resp["settings"]
-        assert s["data_dir"] == str(settings.data_dir)
-        assert s["socket_path"] == str(settings.socket_path)
-        assert s["db_path"] == str(settings.db_path)
-        assert s["audit_log_path"] == str(settings.audit_log_path)
+        # spec 32 (G17): paths are served data-dir-relative — no host absolute path
+        assert s["data_dir"] == "."
+        assert s["socket_path"] == "daemon.sock"
+        assert s["db_path"] == "turbochickens.db"
+        assert s["audit_log_path"] == "audit.jsonl"
         assert s["weight_budget"] == 4 and s["weight_budget_override"] == 4
         assert s["audit_retention"] == "forever" and s["results_retention_months"] == 6
         assert s["coop"]["enabled"] is False  # coop not enabled here
@@ -244,7 +245,7 @@ def test_api_views_require_bearer_when_auth_required(auth_daemon) -> None:
 
 
 def test_api_views_daemon_down_payload_not_500(tmp_path, monkeypatch) -> None:
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     port = settings.coop_port

@@ -26,7 +26,7 @@ and the manifest records the resolved sources (`chaining`) plus a
 `clutch.consumed` Headcount row.
 
 Spec 23 (Free-Range) adds `resources.free_range`: a Free-Range chicken has no
-fence — the hard wall-clock kill is removed (`timeout_sec` is optional in the
+wall-clock cap — the hard wall-clock kill is removed (`timeout_sec` is optional in the
 egg, and never enforced as a kill for a free-range chicken) — so it dies only
 via `run_stop` (spec 22) or daemon shutdown, both ending in the same attested
 `stopped` teardown as any terminal state.
@@ -52,6 +52,27 @@ The pipeline owns all SQLite writes for a chicken: status transitions on
 `runs`, streamed `run_events`, the manifest, the `results` row (spec 04: a
 valid clutch is stored in the nest box, an invalid one quarantined), and the
 `teardown_attestations` row.
+
+Spec 32 (ticket 10, review finding G8) records each Chicken's pid at
+hatch/spawn: the adapter's spawn hook writes the harness process pid into the
+pipeline's shared pid registry (chicken pid → run id) and the manifest's
+harness block carries `pid`. The daemon reads SO_PEERCRED on every socket
+connection and resolves the peer pid (the chicken itself or one of its
+descendants) to the owning run through that registry, so lineage
+(`parent_run_id` / `caller_run_id`) is forced from the authenticated peer —
+client-sent lineage fields are ignored on chicken-owned connections.
+
+Spec 32 ticket 12 (review G9, spawn isolation) provisions the chicken's
+Scratch: `adapter.prepare` materializes `.tc-home/` inside the workspace and
+points the per-run HOME/TMPDIR/XDG_*/VIBE_HOME at it, with only a sanitized
+vibe profile in it — nothing the chicken plants in its "home" survives the
+abattoir's teardown, and the operator's real $HOME stays out of reach.
+
+Spec 32 ticket 21 (review finding G18) re-verifies the spec hash at hatch:
+the hash pinned when the egg was queued is recomputed when the egg is loaded
+at hatch, and a mismatch (an egg swapped between enqueue and hatch) fails
+closed — the run ends terminal `failed` with the abattoir's attestation, and
+nothing is provisioned or sent to the feeder under the stale hash.
 """
 
 from __future__ import annotations
@@ -59,19 +80,25 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import shutil
+import signal
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 from turbochickens.adapter import (
+    SCRATCH_HOME_DIRNAME,
     HarnessResult,
+    PreparedRun,
     RunContext,
     TeardownReport,
     auth_telemetry_of,
     make_adapter,
-    sanitize_log_line,
+    reap_process_group,
+    signal_process_group,
 )
+from turbochickens import fox
 from turbochickens.audit import AuditLog
 from turbochickens.chaining import (
     NestboxError,
@@ -79,14 +106,24 @@ from turbochickens.chaining import (
     parse_nestbox_uri,
     resolve_nestbox_clutch,
 )
+from turbochickens.fence import UnsafeRefError, contained_ref
 from turbochickens.providers import ProvidersConfig, ProvidersError, load_providers
 from turbochickens.seat import SeatBroker
-from turbochickens.settings import Settings
-from turbochickens.spec.loader import load_spec
+from turbochickens.settings import (
+    MAX_RUN_EVENTS,
+    OUTPUT_MAX_BYTES,
+    RUN_EVENT_LINE_MAX_LEN,
+    Settings,
+)
+from turbochickens.spec.loader import load_spec, spec_hash
 from turbochickens.spec.model import JobSpec
 from turbochickens.stats import rollup_usage
-from turbochickens.util import utcnow_iso
+from turbochickens.util import cap_text_bytes, display_relpath, redact_host_paths, sanitize_log_line, utcnow_iso
 from turbochickens.validate import OutputValidation, validate_output
+
+#: coopd's own log (stderr of the daemon process) — the full, unredacted detail
+#: of a failure stays here; only the redacted form is ever served (spec 32, G17)
+_log = logging.getLogger("turbochickens.coopd")
 
 #: terminal states — every one requires a teardown attestation (baseline §5).
 #: spec 22 adds `cancelled` (queued egg pulled from the pecking order) and
@@ -95,6 +132,14 @@ TERMINAL_STATES = ("succeeded", "failed", "cancelled", "stopped")
 
 #: spec 22: grace between SIGTERM and the hard kill when stopping a chicken
 STOP_TERM_GRACE_SEC = 5.0
+
+#: spec 32 (review finding G15): cap on the post-kill `await` of the harness
+#: task. The chicken runs in its own session and is killed as a whole process
+#: group, so the task normally completes right away; if a pipe-holding
+#: escapee keeps the pipes open past the kill, the bounded await times out and
+#: a synthetic harness result is produced so teardown always completes and
+#: the run always reaches a terminal state with its attestation.
+POST_KILL_AWAIT_SEC = 5.0
 
 OUTPUT_EVENT_MAX_LEN = 20_000
 
@@ -114,6 +159,11 @@ def cost_cap_exceeded(usage: dict[str, Any], max_cost_usd: float | None) -> bool
     return float(cost) > float(max_cost_usd)
 
 
+class _HatchHashMismatch(Exception):
+    """Spec 32 ticket 21 (review G18): the egg loaded at hatch no longer
+    candles to the hash pinned at enqueue — the egg was swapped in between."""
+
+
 class RunPipeline:
     """Executes queued runs against the daemon's db/audit. One instance per
     daemon; DB writes are serialized through an asyncio lock."""
@@ -125,6 +175,7 @@ class RunPipeline:
         audit: AuditLog,
         providers: ProvidersConfig | None = None,
         credential_provider: Any = None,
+        pid_registry: dict[int, str] | None = None,
     ) -> None:
         self.settings = settings
         self.db = db
@@ -139,9 +190,35 @@ class RunPipeline:
         # actively driving; `request_stop` sets the event and the run ends
         # `stopped` (SIGTERM, then hard kill) instead of collecting output
         self._active: dict[str, asyncio.Event] = {}
-        # spec 23: the active Free-Range chickens (no fence — they die only via
-        # `run_stop` or daemon shutdown), so shutdown can ask them to stop
+        # spec 23: the active Free-Range chickens (no wall-clock cap — they die
+        # only via `run_stop` or daemon shutdown), so shutdown can ask them to stop
         self._active_free_range: set[str] = set()
+        # spec 32 (ticket 10): chicken pid → run_id registry shared with the
+        # daemon — the daemon reads SO_PEERCRED on every socket connection and
+        # resolves the peer pid (a chicken or one of its descendants) to the
+        # owning run, so lineage is forced from the peer, never client-sent
+        self._pid_registry = pid_registry
+        # spec 32 (G17): run_id → the path roots redacted from every stored
+        # run-event line of that chicken (the data dir + the egg's own dir) —
+        # harness-streamed lines can echo the chicken's absolute HOME (the
+        # Scratch inside its workspace), so the redaction happens at the
+        # single _event choke point, not per call site
+        self._run_path_roots: dict[str, tuple[Path, ...]] = {}
+
+    def _register_chicken_pid(self, run_id: str, pid: int) -> None:
+        """Spec 32 (ticket 10): a chicken's harness process pid is registered
+        at spawn (called from the adapter's spawn hook) so the daemon can
+        attribute socket connections from that pid (or its descendants) to
+        this run."""
+        if self._pid_registry is not None:
+            self._pid_registry[pid] = run_id
+
+    def _unregister_chicken_pids(self, run_id: str) -> None:
+        if self._pid_registry is None:
+            return
+        for pid, rid in list(self._pid_registry.items()):
+            if rid == run_id:
+                del self._pid_registry[pid]
 
     def request_stop(self, run_id: str) -> bool:
         """Spec 22: ask an active chicken to stop. Returns True when the run
@@ -160,16 +237,42 @@ class RunPipeline:
         that were signalled."""
         return [run_id for run_id in sorted(self._active_free_range) if self.request_stop(run_id)]
 
+    def _path_roots(self, ctx: RunContext) -> tuple[Path, ...]:
+        """Spec 32 (G17): the roots redacted from served text — the data dir
+        (workspaces, uploads, results all live under it) and the egg's own
+        directory (a CLI-run egg may live anywhere on the host)."""
+        return (Path(self.settings.data_dir), Path(ctx.spec_path).parent)
+
     # --- db helpers -------------------------------------------------------
 
     async def _event(self, run_id: str, source: str, level: str, line: str) -> None:
+        # G10: every streamed run-event line passes through the log sanitizer
+        # at this single choke point — supervisor-authored lines included — so
+        # a hostile Feeder's error bytes can never reach `tc runs logs` raw
+        # (no ANSI/OSC escape sequences).
+        # spec 32 (G17): the same choke point also redacts host paths — a
+        # harness-streamed line can echo the chicken's absolute HOME (the
+        # Scratch inside its workspace) or the egg's host directory, and none
+        # of that may reach runs_logs
+        roots = self._run_path_roots.get(run_id)
+        if roots:
+            line = redact_host_paths(line, *roots)
+        # spec 32 (G20, the Fence): the line is also length-capped here, and
+        # the per-chicken run-event log itself is capped at MAX_RUN_EVENTS
+        # rows (the table is append-only, so the cap is enforced at insert —
+        # a spamming chicken cannot grow the DB without bound; `runs_logs`
+        # reports `capped=true` and serves the bounded tail)
+        line = sanitize_log_line(line, RUN_EVENT_LINE_MAX_LEN)
         async with self._db_lock:
             row = self.db.execute(
-                "SELECT COALESCE(MAX(seq), -1) + 1 FROM run_events WHERE run_id = ?", (run_id,)
+                "SELECT COALESCE(MAX(seq), -1) + 1, COUNT(*) FROM run_events WHERE run_id = ?", (run_id,)
             ).fetchone()
+            seq, count = row[0], row[1]
+            if count >= MAX_RUN_EVENTS:
+                return
             self.db.execute(
                 "INSERT INTO run_events (run_id, seq, ts, level, source, line) VALUES (?, ?, ?, ?, ?, ?)",
-                (run_id, row[0], utcnow_iso(), level, source, line),
+                (run_id, seq, utcnow_iso(), level, source, line),
             )
             self.db.commit()
 
@@ -193,9 +296,29 @@ class RunPipeline:
         cannot be bypassed by chaining) and the resolved chaining sources for
         the manifest (injected trajectory state is post-MVP)."""
         ws = ctx.workspace
-        ws.mkdir(parents=True, exist_ok=True)
+        # spec 32 (G11, the Fox): workspaces are created restrictive — the
+        # workspaces root and the per-run workspace are both 0700 (also
+        # tightening pre-existing looser dirs)
+        fox.ensure_dir(ws.parent)
+        fox.ensure_dir(ws)
         spec_dir = ctx.spec_path.parent
-        prompt_src = spec_dir / ctx.spec.input.prompt_file
+        # spec 32 (G1): defensive re-check at the fence BEFORE any file is
+        # copied or read — Candling already enforced containment, but the egg
+        # on disk may have changed since, so every host-path ref (prompt,
+        # plain attachments, schema) is re-contained here. An escaping ref
+        # (`..`, absolute, backslash, symlink out of the egg dir) raises
+        # UnsafeRefError and fails the run closed at provisioning with a
+        # field-named Fox refusal — nothing lands in the workspace.
+        prompt_src = contained_ref(spec_dir, ctx.spec.input.prompt_file, "input.prompt_file")
+        contained_ref(spec_dir, ctx.spec.output.schema_file, "output.schema_file")
+        plain_sources: dict[str, tuple[Path, str]] = {}
+        for att in ctx.spec.input.attachments:
+            if parse_nestbox_uri(att) is None:
+                plain_sources[att] = (
+                    contained_ref(spec_dir, att, "input.attachments"),
+                    attachment_workspace_name(att),
+                )
+        # (fox.ensure_dir(ws) above already created the workspace — no extra mkdir)
         shutil.copyfile(prompt_src, ws / "prompt.txt")
         injected = prompt_src.stat().st_size
         chaining: list[dict[str, Any]] = []
@@ -212,13 +335,15 @@ class RunPipeline:
                         {
                             "attachment": att,
                             "run_id": clutch.run_id,
-                            "artifact_path": clutch.artifact_path,
+                            # spec 32 (G17): the manifest/Headcount carry the
+                            # data-dir-relative artifact path, never the host path
+                            "artifact_path": display_relpath(clutch.artifact_path, self.settings.data_dir),
                             "size_bytes": len(clutch.data),
                         }
                     )
                 else:
-                    src = spec_dir / att
-                    shutil.copyfile(src, ws / attachment_workspace_name(att))
+                    src, name = plain_sources[att]
+                    shutil.copyfile(src, ws / name)
                     injected += src.stat().st_size
         except NestboxError as e:
             e.injected_bytes = injected
@@ -233,10 +358,13 @@ class RunPipeline:
         Artifacts live under data_dir, not the workspace — the workspace is
         destroyed at teardown, the result survives."""
         artifacts_dir = self.settings.results_dir / run_id
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        (artifacts_dir / "output.json").write_text(
+        # spec 32 (G11, the Fox): clutch artifacts are state at rest — dirs
+        # 0700, files 0600 at creation
+        fox.ensure_dir(self.settings.results_dir)
+        fox.ensure_dir(artifacts_dir)
+        fox.write_text_0600(
+            artifacts_dir / "output.json",
             json.dumps(outcome.output, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-            encoding="utf-8",
         )
         async with self._db_lock:
             self.db.execute(
@@ -246,7 +374,12 @@ class RunPipeline:
             )
             self.db.commit()
         self.audit.append(
-            {"event": "clutch.stored", "run_id": run_id, "artifacts_dir": str(artifacts_dir)}
+            {
+                "event": "clutch.stored",
+                "run_id": run_id,
+                # spec 32 (G17): no `artifacts_dir` in Headcount rows — the
+                # on-disk location is daemon-internal state (DB column stays)
+            }
         )
 
     async def _quarantine(self, run_id: str, raw_output: str, schema_errors: list[str]) -> None:
@@ -254,10 +387,14 @@ class RunPipeline:
         recorded in a `results` row with valid=0 — never stored as valid, never
         discarded (baseline v0.2 §10.2)."""
         qdir = self.settings.quarantine_dir / run_id
-        qdir.mkdir(parents=True, exist_ok=True)
-        (qdir / "raw_output.txt").write_text(raw_output, encoding="utf-8")
-        (qdir / "schema_errors.json").write_text(
-            json.dumps(schema_errors, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        # spec 32 (G11, the Fox): quarantine evidence is state at rest too —
+        # dirs 0700, files 0600 at creation
+        fox.ensure_dir(self.settings.quarantine_dir)
+        fox.ensure_dir(qdir)
+        fox.write_text_0600(qdir / "raw_output.txt", raw_output)
+        fox.write_text_0600(
+            qdir / "schema_errors.json",
+            json.dumps(schema_errors, indent=2, ensure_ascii=False) + "\n",
         )
         async with self._db_lock:
             self.db.execute(
@@ -270,7 +407,7 @@ class RunPipeline:
             {
                 "event": "clutch.quarantined",
                 "run_id": run_id,
-                "artifacts_dir": str(qdir),
+                # spec 32 (G17): no `artifacts_dir` in Headcount rows
                 "schema_errors": schema_errors,
             }
         )
@@ -367,7 +504,9 @@ class RunPipeline:
             "started_at": item.get("started_at"),
             "finished_at": utcnow_iso(),
             "usage": result.usage if result else {"tokens_in": 0, "tokens_out": 0},
-            "workspace": str(ctx.workspace),
+            # spec 32 (G17): the manifest never embeds the host workspace
+            # path — a data-dir-relative identifier only
+            "workspace": display_relpath(ctx.workspace, self.settings.data_dir),
             "env_keys": sorted(ctx.env.keys()),
             "status": status,
             "status_reason": reason,
@@ -390,6 +529,10 @@ class RunPipeline:
         # spawn_subs chicken's Farmhand
         if item.get("parent_run_id"):
             manifest["parent_run_id"] = item["parent_run_id"]
+        # spec 32 (ticket 10): the chicken's pid, recorded at hatch/spawn
+        # (None when the harness runs no process of its own, e.g. the API
+        # adapter) — mirrored in the harness block of the manifest
+        manifest["harness"]["pid"] = ctx.pid
         return manifest
 
     # --- the lifecycle ----------------------------------------------------
@@ -399,6 +542,20 @@ class RunPipeline:
         attestation and audit rows."""
         run_id = item["run_id"]
         spec = load_spec(item["spec_path"])
+        # spec 32 ticket 21 (review G18): the hash pinned at enqueue is
+        # re-verified at hatch — the egg is loaded again here, and if it no
+        # longer candles to the pinned hash it was swapped between enqueue
+        # and hatch, so the run fails closed below (Fox refusal copy): nothing
+        # is provisioned and nothing is sent to the feeder under the stale hash
+        recomputed_hash = spec_hash(spec)
+        hash_mismatch: str | None = None
+        if recomputed_hash != item["spec_hash"]:
+            hash_mismatch = (
+                "the fox refuses to hatch a swapped egg — hash mismatch at hatch: the egg was queued"
+                f" pinned as sha256:{item['spec_hash']} but the egg on disk now candles to"
+                f" sha256:{recomputed_hash}; the egg changed after enqueue, so nothing was"
+                " provisioned and nothing was sent to the feeder"
+            )
         adapter = make_adapter(
             spec, credential_provider=self.credential_provider, providers=self.providers, settings=self.settings
         )
@@ -413,6 +570,14 @@ class RunPipeline:
             # spec 27 (ChickenSubs): sub-chicken lineage
             parent_run_id=item.get("parent_run_id"),
         )
+        # spec 32 (G17): from here on, every run-event line of this chicken is
+        # host-path-redacted against these roots at the _event choke point
+        self._run_path_roots[run_id] = self._path_roots(ctx)
+        # spec 32 (ticket 10): the spawn hook records the chicken's pid in
+        # the shared registry at hatch/spawn, so the daemon can force lineage
+        # from the socket peer's credentials
+        if self._pid_registry is not None:
+            ctx.on_spawn = lambda pid: self._register_chicken_pid(run_id, pid)
         status = "failed"
         reason = "internal error"
         result: HarnessResult | None = None
@@ -426,8 +591,8 @@ class RunPipeline:
             "connectors": list(spec.harness.connectors),
         }
         budget: dict[str, Any] = {
-            # spec 23: a Free-Range chicken has no fence — timeout_sec is the
-            # declared value (possibly None) and no hard kill is enforced
+            # spec 23: a Free-Range chicken has no wall-clock cap — timeout_sec
+            # is the declared value (possibly None) and no hard kill is enforced
             "free_range": spec.resources.free_range,
             "timeout_sec": spec.resources.timeout_sec,
             "max_context_mb": spec.resources.max_context_mb,
@@ -467,7 +632,13 @@ class RunPipeline:
                 }
             )
             provision_error: str | None = None
+            injected_bytes = 0
             try:
+                if hash_mismatch is not None:
+                    # spec 32 ticket 21 (G18): fail closed at hatch — the egg
+                    # on disk was swapped after enqueue; nothing is provisioned
+                    # or sent to the feeder under the stale pinned hash
+                    raise _HatchHashMismatch(hash_mismatch)
                 injected_bytes, chaining = self._provision(ctx)
                 budget["injected_context_bytes"] = injected_bytes
                 # spec 25: lineage in the Headcount + run log — this chicken
@@ -489,17 +660,40 @@ class RunPipeline:
                         f"chained clutch from chicken {c['run_id']}: {c['attachment']}"
                         f" → {attachment_workspace_name(c['attachment'])} ({c['size_bytes']} bytes)",
                     )
-            except NestboxError as e:
+            except (NestboxError, UnsafeRefError) as e:
                 # spec 25 fail-closed: a quarantined / composted / missing /
                 # malformed clutch fails the run at provisioning, before any
-                # harness work — attested teardown as usual
+                # harness work — attested teardown as usual.
+                # spec 32 (G1): the same for a spec ref that crosses the fence
+                # at the Hatchery re-check — nothing was copied, nothing is
+                # shipped to the feeder, the run fails closed at provisioning
                 provision_error = str(e)
-                budget["injected_context_bytes"] = e.injected_bytes
+                if isinstance(e, NestboxError):
+                    budget["injected_context_bytes"] = e.injected_bytes
                 status, reason = "failed", f"provisioning failed: {e}"
-                await self._event(run_id, "supervisor", "error", sanitize_log_line(reason))
+                # spec 32 (G17): the served event line is redacted of host paths
+                await self._event(
+                    run_id,
+                    "supervisor",
+                    "error",
+                    sanitize_log_line(redact_host_paths(reason, *self._path_roots(ctx))),
+                )
+            except _HatchHashMismatch as e:
+                # spec 32 ticket 21 (G18): a swapped egg fails closed at hatch —
+                # terminal `failed` with the Fox refusal as the reason, before
+                # any harness work; the abattoir attestation lands in _finalize
+                # exactly like any provisioning failure
+                provision_error = str(e)
+                status, reason = "failed", str(e)
+                await self._event(
+                    run_id,
+                    "supervisor",
+                    "error",
+                    sanitize_log_line(redact_host_paths(reason, *self._path_roots(ctx))),
+                )
             cap_bytes = spec.resources.max_context_mb * 1024 * 1024
             if provision_error is not None:
-                pass  # chaining resolution failed — status/reason set above
+                pass  # swapped egg (G18) / chaining resolution failed — status/reason set above
             elif injected_bytes > cap_bytes:
                 # spec 07: hard cap on injected context, enforced at
                 # provisioning — the run fails before any harness work
@@ -516,6 +710,16 @@ class RunPipeline:
                 prepared = adapter.prepare(ctx)
                 harness = prepared.harness
                 auth = prepared.auth or auth
+                # spec 32 ticket 12 (review G9): the chicken's HOME/XDG/TMPDIR
+                # point at its Scratch inside the workspace — the operator's
+                # real $HOME and coopd's /proc environ stay out of reach
+                await self._event(
+                    run_id,
+                    "supervisor",
+                    "info",
+                    f"scratch home prepared at {SCRATCH_HOME_DIRNAME}/ inside the chicken's workspace"
+                    " — HOME/XDG/TMPDIR point there, with only a sanitized vibe profile",
+                )
                 if isinstance(harness.get("farmhand"), dict):
                     # spec 27 (ChickenSubs): the Farmhand is attached to this
                     # chicken's harness runtime over stdio
@@ -556,6 +760,26 @@ class RunPipeline:
                     result, stopped_reason = await self._execute_harness(
                         adapter, prepared, ctx, stop_event, hard_timeout
                     )
+            # spec 32 (G20, the Fence): the output (Clutch) cap is enforced here
+            # as well as at collection in the adapter — defense in depth, so no
+            # path can store unbounded raw output in memory, the DB, or on disk;
+            # the manifest budget records `truncated`
+            if result is not None:
+                # reviewer finding: the cap counts encoded bytes, not characters
+                capped, was_capped = cap_text_bytes(result.raw_output, OUTPUT_MAX_BYTES)
+                if was_capped:
+                    result.raw_output = capped
+                    result.truncated = True
+            if result is not None and result.truncated:
+                budget["output_truncated"] = True
+                budget["output_cap_bytes"] = OUTPUT_MAX_BYTES
+                await self._event(
+                    run_id,
+                    "supervisor",
+                    "warn",
+                    f"harness output hit the {OUTPUT_MAX_BYTES}-byte fence —"
+                    " the clutch is stored truncated (truncated=true)",
+                )
             if stopped_reason is not None:
                 status, reason = "stopped", stopped_reason
             elif result is not None and result.timed_out:
@@ -588,8 +812,14 @@ class RunPipeline:
                     await self._event(run_id, "supervisor", "error", reason)
                 else:
                     # spec 04: raw output is untrusted until it passes the job schema
-                    schema_path = ctx.spec_path.parent / ctx.spec.output.schema_file
-                    outcome = validate_output(result.raw_output, schema_path)
+                    # spec 32 (G1): re-check the fence right before the schema
+                    # file is read — an escaping ref fails the run closed here
+                    schema_path = contained_ref(
+                        ctx.spec_path.parent, ctx.spec.output.schema_file, "output.schema_file"
+                    )
+                    # spec 32 (G17): schema errors report the spec-relative
+                    # schema name, never the host path
+                    outcome = validate_output(result.raw_output, schema_path, schema_name=ctx.spec.output.schema_file)
                     if outcome.valid:
                         await self._store_result(run_id, outcome)
                         await self._event(
@@ -607,12 +837,25 @@ class RunPipeline:
                         )
                         status, reason = "failed", f"clutch failed candling (schema validation): {outcome.schema_errors[0]}"
         except Exception as e:
-            status, reason = "failed", f"{type(e).__name__}: {e}"
+            # spec 32 (G17): an OSError here can carry host paths (workspace,
+            # egg dir) — the full detail goes to coopd's own log (stderr), the
+            # served reason/event get the redacted form
+            _log.error("chicken %s failed: %s: %s", run_id, type(e).__name__, e)
+            status, reason = "failed", redact_host_paths(f"{type(e).__name__}: {e}", *self._path_roots(ctx))
             with contextlib.suppress(Exception):
-                await self._event(run_id, "supervisor", "error", sanitize_log_line(str(e)))
+                await self._event(
+                    run_id,
+                    "supervisor",
+                    "error",
+                    sanitize_log_line(redact_host_paths(str(e), *self._path_roots(ctx))),
+                )
         finally:
             self._active.pop(run_id, None)
             self._active_free_range.discard(run_id)
+            self._run_path_roots.pop(run_id, None)
+            # spec 32 (ticket 10): the chicken is gone — drop its pid from the
+            # peer-identity registry so a reused pid is never attributed to it
+            self._unregister_chicken_pids(run_id)
             await self._finalize(item, ctx, harness, result, status, reason, adapter, budget, auth, chaining)
 
     async def _execute_harness(
@@ -624,9 +867,13 @@ class RunPipeline:
         timeout_sec: int | None,
     ) -> tuple[HarnessResult, str | None]:
         """Spec 22: run the harness to completion, racing an operator stop.
-        When `run_stop` fires mid-run, the harness process gets SIGTERM first
-        and a hard kill after `STOP_TERM_GRACE_SEC`; the run then ends
-        `stopped` and its output is never collected or candled. Returns
+        When `run_stop` fires mid-run, the harness process group gets SIGTERM
+        first and a hard kill after `STOP_TERM_GRACE_SEC` (spec 32 / G15: the
+        chicken is spawned in its own session, so the signals reach the whole
+        group, and the post-kill await of the harness task is bounded — on
+        timeout a synthetic result is produced so the run always reaches a
+        terminal state with its attestation). The run then ends `stopped`
+        and its output is never collected or candled. Returns
         (harness result, stopped reason or None). `timeout_sec=None` (spec 23,
         Free-Range) means no wall-clock kill — only the stop event ends it."""
         run_id = ctx.run_id
@@ -643,28 +890,58 @@ class RunPipeline:
         if stop_event.is_set() and not exec_task.done():
             proc = ctx.proc
             if proc is not None and proc.returncode is None:
-                # SIGTERM first, then the hard kill after the grace period
-                with contextlib.suppress(ProcessLookupError):
-                    proc.terminate()
+                # spec 32 (G15): the chicken was spawned in its own session,
+                # so SIGTERM goes to the whole process group (grandchildren
+                # included), and after the grace the group gets a SIGKILL —
+                # a pipe-holding grandchild can no longer survive the stop
+                signal_process_group(proc, signal.SIGTERM)
                 hard_killed = False
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=STOP_TERM_GRACE_SEC)
                 except asyncio.TimeoutError:
-                    with contextlib.suppress(ProcessLookupError):
-                        proc.kill()
                     hard_killed = True
-                    with contextlib.suppress(Exception):
-                        await proc.wait()
+                # reap the whole group either way: SIGTERM survivors (and
+                # pipe-holders) must not outlive the stop; the reap await is
+                # bounded so it can never wedge the run
+                await reap_process_group(proc)
                 reason = (
                     f"stopped by operator: SIGTERM, then hard kill after {STOP_TERM_GRACE_SEC:g}s grace"
                     if hard_killed
                     else f"stopped by operator: SIGTERM (reaped within {STOP_TERM_GRACE_SEC:g}s grace)"
                 )
-                result = await exec_task  # completes now that the process is dead
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(exec_task), timeout=POST_KILL_AWAIT_SEC)
+                except asyncio.TimeoutError:
+                    # a pipe-holding escapee kept the harness task alive past
+                    # the group kill — synthesize the result so teardown
+                    # always completes and the run reaches terminal state
+                    exec_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await exec_task
+                    result = HarnessResult(
+                        exit_code=proc.returncode,
+                        raw_output="",
+                        usage={},
+                        error="stopped by operator (synthetic result: harness pipes still held after the process-group kill)",
+                    )
+                    reason = f"{reason}; harness output discarded (pipes still held after the group kill)"
             else:
                 # no live subprocess to signal (e.g. an HTTP adapter) — cancel
-                # the in-flight call itself
+                # the in-flight call itself, with a bounded await. The
+                # cancelled task raises CancelledError (not TimeoutError)
+                # through the shield, so both are caught here — otherwise a
+                # stopped proc-less chicken would end failed/internal error
+                # instead of `stopped`
                 exec_task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(exec_task), timeout=POST_KILL_AWAIT_SEC)
+                except asyncio.TimeoutError:
+                    pass
+                except asyncio.CancelledError:
+                    # re-raise only when OUR task was cancelled (not the inner one)
+                    task = asyncio.current_task()
+                    if task is not None and task.cancelling() > 0:
+                        raise
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await exec_task
                 result = HarnessResult(exit_code=None, raw_output="", usage={}, error="stopped by operator")
@@ -673,16 +950,27 @@ class RunPipeline:
         result = await exec_task
         return result, None
 
-    async def cancel_queued(self, item: dict[str, Any]) -> None:
+    async def cancel_queued(
+        self,
+        item: dict[str, Any],
+        reason: str | None = None,
+        spec: JobSpec | None = None,
+    ) -> None:
         """Spec 22: terminal-cancel an egg that was still in the pecking order.
         It never hatches (no harness events, no `egg.hatched`), but it still
         gets a manifest and the abattoir's attestation exactly like any
         terminal state — nothing was spawned or provisioned, so the
-        attestation verifies that (1, 1, 1)."""
+        attestation verifies that (1, 1, 1).
+
+        Spec 32 ticket 20 (G16): the same attested path also cancels eggs
+        still queued at coopd shutdown and stale queued rows recovered at
+        startup — pass ``reason`` for those; pass ``spec`` when the egg file
+        may be gone (the stored ``spec_toml`` was already candled)."""
         run_id = item["run_id"]
-        reason = "cancelled while queued — the egg never hatched"
+        reason = sanitize_log_line(reason or "cancelled while queued — the egg never hatched")
         now = utcnow_iso()
-        spec = load_spec(item["spec_path"])
+        if spec is None:
+            spec = load_spec(item["spec_path"])
         manifest: dict[str, Any] = {
             "run_id": run_id,
             "job_id": item["job_id"],
@@ -697,6 +985,8 @@ class RunPipeline:
                 "spawn_subs": spec.harness.spawn_subs,
                 # spec 28: gate names mirrored in the manifest (names only)
                 "connectors": list(spec.harness.connectors),
+                # spec 32 (ticket 10): never hatched, so no pid
+                "pid": None,
             },
             "started_at": item.get("started_at"),
             "finished_at": now,
@@ -777,6 +1067,14 @@ class RunPipeline:
         """Manifest + terminal status + teardown attestation + audit rows.
         Runs for every path out of `execute`, including exceptions."""
         run_id = ctx.run_id
+        # G10: the terminal reason lands in the manifest (status_reason), the
+        # Headcount and run events — served via /api/runs* and printed by the
+        # CLI. It may quote a Feeder/OAuth error, so it is sanitized here:
+        # control/format characters stripped, never raw response bytes.
+        # spec 32 (G17): one choke point — also redacted of host paths before
+        # it lands in the manifest, the runs row, or any Headcount row; full
+        # detail is in coopd's log
+        reason = redact_host_paths(sanitize_log_line(reason), *self._path_roots(ctx))
         manifest = self._manifest(item, ctx, harness, result, status, reason, budget, auth, chaining)
         # teardown first: destruction is verified, not assumed
         try:
@@ -784,7 +1082,12 @@ class RunPipeline:
         except Exception as e:
             report = TeardownReport(process_reaped=False, workspace_removed=False, env_cleared=False)
             with contextlib.suppress(Exception):
-                await self._event(run_id, "supervisor", "error", f"teardown error: {e}")
+                await self._event(
+                    run_id,
+                    "supervisor",
+                    "error",
+                    f"teardown error: {redact_host_paths(str(e), *self._path_roots(ctx))}",
+                )
         async with self._db_lock:
             self.db.execute(
                 "UPDATE runs SET status = ?, finished_at = ?, manifest_json = ?, usage_json = ? WHERE id = ?",

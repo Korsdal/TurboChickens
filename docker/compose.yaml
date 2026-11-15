@@ -1,23 +1,59 @@
-# Compose example for the coop container (spec 18). From the repo root:
+# Compose example for the coop container (spec 18; hardened in spec 32/G12;
+# loopback bind + commented fixed-token mount in spec 32 ticket 16 / G23).
+# From the repo root:
 #
 #   docker compose -f docker/compose.yaml up -d --build
 #   docker logs -f <container>     # the one-time GUI auth token
 #   open http://localhost:8737
 #
+# The GUI port is published on the host's LOOPBACK ONLY (127.0.0.1:8737:8737)
+# — the bearer token is the only auth on the published port, so the default
+# must not expose it on every host interface. To publish on all interfaces
+# deliberately, change the ports entry to "8737:8737" and put a TLS reverse
+# proxy in front (see docs/coop-container.md).
+#
 # State lives in the named volume `coop-data` mounted at /data, so
 # `docker compose down && up` (or plain container replacement) keeps jobs,
 # runs, results and schedules.
+#
+# The service is hardened (G12) — a coop compromise yields neither root nor
+# host OOM:
+#   user 10001:10001          non-root (matches the image's USER coop)
+#   cap_drop: ALL             every Linux capability dropped
+#   no-new-privileges         setuid/file-caps can never re-elevate
+#   read_only + tmpfs /tmp    root filesystem read-only; /tmp is a tmpfs
+#   init: true                tini as PID 1 reaps orphaned children
+#   mem_limit / cpus          memory and CPU caps on the container
+# All writable state stays on the /data volume (and /tmp), which the image
+# prepares with the right ownership (see Dockerfile).
 services:
   coop:
     image: coop
     build:
       context: ..
       dockerfile: Dockerfile
+    user: "10001:10001"
     ports:
-      - "8737:8737"
+      # loopback only by default (G23)
+      - "127.0.0.1:8737:8737"
     volumes:
       - coop-data:/data
+      # Optional — pin a FIXED GUI bearer token instead of the ephemeral one
+      # printed once to `docker logs`: copy docker/settings.toml to
+      # ./coop-settings.toml, set coop_auth_token = "…" in the copy, and mount
+      # it read-only over the shipped settings:
+      # - ./coop-settings.toml:/etc/turbochickens/settings.toml:ro
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    mem_limit: 1g
+    cpus: "2"
 
 volumes:
   coop-data:

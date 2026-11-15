@@ -198,6 +198,34 @@ def test_seat_store_corrupt_file_fails_closed(tmp_path) -> None:
         store.load("seatco")
 
 
+def test_seat_store_unreadable_message_is_path_free(tmp_path) -> None:
+    # spec 32 (G17, reviewer finding): the unreadable-seat error surfaces via
+    # auth_providers' session_error and status_reason — it must serve only the
+    # seats/<provider>.json form, never the host path (an OSError str embeds it)
+    store = SeatStore(tmp_path / "data")
+    store.save(SeatSession("seatco", "t", "r", time.time() + 100))
+    (store.dir / "seatco.json").write_text("{not json")
+    with pytest.raises(SeatError) as ei:
+        store.load("seatco")
+    msg = str(ei.value)
+    assert "unreadable (seats/seatco.json)" in msg  # the seats/<provider>.json form
+    assert "tc auth login seatco" in msg  # the recovery hint is kept
+    assert str(tmp_path) not in msg and str(store.dir) not in msg, msg  # negative: no host path
+    # positive: an unreadable (permission-denied) file reports the same form
+    import os as _os
+    p = store.dir / "seatco.json"
+    p.write_text('{"access_token": "x", "refresh_token": "y", "expires_at": 1}')
+    _os.chmod(p, 0o000)
+    try:
+        with pytest.raises(SeatError) as ei2:
+            store.load("seatco")
+        msg2 = str(ei2.value)
+        assert "unreadable (seats/seatco.json)" in msg2
+        assert str(tmp_path) not in msg2 and str(store.dir) not in msg2, msg2
+    finally:
+        _os.chmod(p, 0o600)
+
+
 # --- broker contract over httpx.MockTransport ----------------------------------
 
 
@@ -209,8 +237,8 @@ def seat_providers_config() -> ProvidersConfig:
                     "base_url": "http://provider.test/v1",
                     "api_key_env": "SEATCO_TOKEN",
                     "auth": "seat",
-                    "oauth_device_url": "http://oauth.test/device",
-                    "oauth_token_url": "http://oauth.test/token",
+                    "oauth_device_url": "https://oauth.test/device",
+                    "oauth_token_url": "https://oauth.test/token",
                     "oauth_client_id": "tc-test-client",
                     "oauth_scope": "openid",
                     "models": {
@@ -464,7 +492,9 @@ class FakeOAuthHandler(BaseHTTPRequestHandler):
                 {
                     "device_code": "dev-123",
                     "user_code": "ABCD-EFGH",
-                    "verification_uri": f"http://127.0.0.1:{port}/verify",
+                    # https-only at ingest (spec 32/G7); the verify page is
+                    # never fetched by the client, only shown as a link
+                    "verification_uri": f"https://127.0.0.1:{port}/verify",
                     "interval": 0.05,
                     "expires_in": 300,
                 },
@@ -821,10 +851,12 @@ print(json.dumps({"message": "hello from fake vibe"}))
 
 
 def test_e2e_vibe_cli_without_env_key_uses_its_own_profile(seat_env, tmp_path, monkeypatch) -> None:
-    """vibe-cli needs no API key: HOME/XDG_* pass through BASE_ENV_KEYS, so a
-    browser-auth provider registered in ~/.vibe/config.toml (vibe's own
-    ProviderConfig browser_auth_* fields) is picked up by the vibe binary
-    itself. TurboChickens injects no credential and records mode "none"."""
+    """vibe-cli needs no API key: HOME/XDG_* point at the chicken's Scratch,
+    which holds a sanitized copy of the operator's ~/.vibe/config.toml
+    (browser_auth_* fields only, spec 32 ticket 12), so a browser-auth provider
+    registered there (vibe's own ProviderConfig browser_auth_* fields) is still
+    picked up by the vibe binary itself. TurboChickens injects no credential
+    and records mode "none"."""
     bin_path = tmp_path / "fake-vibe"
     bin_path.write_text(FAKE_VIBE_ENVFACT)
     bin_path.chmod(0o755)
@@ -847,7 +879,7 @@ def test_e2e_vibe_cli_without_env_key_uses_its_own_profile(seat_env, tmp_path, m
         logs = request(settings.socket_path, "runs_logs", run_id=run_id, timeout=2.0)["events"]
         envfacts = [e["line"] for e in logs if "ENVFACT" in e["line"]]
         assert envfacts, f"fake vibe env report missing from logs: {[e['line'] for e in logs]}"
-        assert "home=set" in envfacts[0]  # HOME passthrough → ~/.vibe/config.toml reachable
+        assert "home=set" in envfacts[0]  # HOME → the Scratch → sanitized profile reachable
         assert "mistral_api_key=unset" in envfacts[0]
         assert "seatco_token=unset" in envfacts[0]
     finally:

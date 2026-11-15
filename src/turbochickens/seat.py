@@ -31,8 +31,16 @@ from typing import Any, Callable
 import httpx
 
 from turbochickens.adapter import DEFAULT_CREDENTIAL_ALLOWLIST, RunContext
-from turbochickens.providers import ProviderProfile, ProvidersConfig, ProvidersError
+from turbochickens.fence import UnsafeRefError, containment_detail, resolve_contained
+from turbochickens.providers import (
+    ProviderProfile,
+    ProvidersConfig,
+    ProvidersError,
+    verification_uri_scheme_error,
+)
 from turbochickens.settings import Settings
+from turbochickens.util import redact_host_paths
+from turbochickens.util import http_error_detail
 
 #: refresh a token this many seconds before its stated expiry
 EXPIRY_LEEWAY_SEC = 30.0
@@ -59,7 +67,10 @@ class DeviceGrant:
     is the grant credential — it stays server-side (daemon memory), it is
     never returned to a caller or written to the audit log. Only the
     user-facing `user_code` + `verification_uri` leave the broker (CLI
-    prints them; the GUI relays them to the browser)."""
+    prints them; the GUI relays them to the browser) — and the
+    `verification_uri` is https-only, scheme-validated when the grant is
+    accepted (`start_device_flow`), so no scriptable URI ever leaves the
+    perch."""
 
     provider: str
     device_code: str
@@ -113,13 +124,32 @@ class SeatSession:
 
 class SeatStore:
     """On-disk seat sessions under ``<data_dir>/seats/`` — one 0600 JSON file
-    per provider. This is the only place tokens are stored."""
+    per provider. This is the only place tokens are stored.
+
+    Spec 32 (review finding G2): every session path is *contained* — the
+    provider name is joined onto the seats dir as one relative ref and the
+    resolved path must stay under the resolved seats dir (the shared Fence
+    rule, :func:`turbochickens.fence.resolve_contained`), so a crafted
+    provider name like ``/etc/anything`` or ``../../x`` is refused before any
+    filesystem touch and can never name — let alone unlink — a ``*.json``
+    file outside the data dir."""
 
     def __init__(self, data_dir: Path) -> None:
         self.dir = Path(data_dir) / "seats"
 
     def _path(self, provider: str) -> Path:
-        return self.dir / f"{provider}.json"
+        """The contained session-file path for `provider` (spec 32, G2).
+        Raises a field-named :class:`SeatError` (``provider: the fox refuses
+        …``) when the name would escape the seats dir — lexically (absolute,
+        ``..``, backslash, NUL) or after resolving (a symlink pointing out)."""
+        ref = f"{provider}.json"
+        target = resolve_contained(self.dir, ref)
+        if target is None:
+            detail = containment_detail(self.dir, ref) or "it resolves outside the seats dir"
+            raise SeatError(
+                str(UnsafeRefError("provider", provider, detail, area="the perch — the seats dir inside the data dir"))
+            )
+        return target
 
     def _ensure_dir(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -146,9 +176,22 @@ class SeatStore:
             data = json.loads(path.read_text(encoding="utf-8"))
             return SeatSession.from_dict(data)
         except (OSError, ValueError, KeyError, TypeError) as e:
-            raise SeatError(f"perch seat for provider {provider!r} is unreadable ({path}): {e}; run `tc auth login {provider}` again") from e
+            # spec 32 (G17, reviewer finding): the served message carries only
+            # the seats/<provider>.json form — never the host path (an OSError
+            # string embeds it). The message surfaces via auth_providers'
+            # session_error and status_reason, so the host path is redacted
+            # here; the full detail stays in coopd's own log.
+            detail = redact_host_paths(str(e), self.dir)
+            raise SeatError(
+                f"perch seat for provider {provider!r} is unreadable (seats/{provider}.json): {detail};"
+                f" run `tc auth login {provider}` again"
+            ) from e
 
     def delete(self, provider: str) -> bool:
+        """Unlink the provider's session file — only after `_path` has
+        contained it inside the seats dir (spec 32, G2), so no provider name
+        can delete a file outside the data dir. True when a session was
+        actually removed."""
         path = self._path(provider)
         if path.exists():
             path.unlink()
@@ -212,7 +255,8 @@ class SeatBroker:
             return {k: v for k in allow if (v := os.environ.get(k)) is not None}
         # vibe-cli and any future subprocess adapter: env allowlist only. A
         # seat-configured vibe profile is picked up by the vibe binary itself
-        # from ~/.vibe/config.toml (HOME/XDG_* pass through BASE_ENV_KEYS).
+        # from the sanitized profile materialized into the chicken's Scratch
+        # (per-run HOME — see adapter.materialize_scratch_home).
         return {k: v for k in self.env_allowlist if (v := os.environ.get(k)) is not None}
 
     def auth_telemetry(self, run: RunContext) -> dict[str, Any]:
@@ -299,7 +343,7 @@ class SeatBroker:
             self.store.delete(provider_name)
             raise SeatError(
                 f"perch seat for provider {provider_name!r} is revoked or expired "
-                f"(token endpoint http {resp.status_code}: {resp.text[:200]}); "
+                f"(token endpoint http {resp.status_code}: {http_error_detail(resp)}); "
                 f"run `tc auth login {provider_name}` again"
             )
         session = self._session_from_token(provider_name, resp.json(), fallback_refresh=session.refresh_token)
@@ -352,7 +396,8 @@ class SeatBroker:
             )
             if resp.status_code != 200:
                 raise SeatError(
-                    f"device endpoint for provider {provider_name!r} http {resp.status_code}: {resp.text[:200]}"
+                    f"device endpoint for provider {provider_name!r} http {resp.status_code}:"
+                    f" {http_error_detail(resp)}"
                 )
             dev = resp.json()
             device_code = dev.get("device_code")
@@ -362,6 +407,16 @@ class SeatBroker:
             expires_in = float(dev.get("expires_in", 1800) or 1800)
             if not device_code or not verification_uri:
                 raise SeatError(f"device endpoint for provider {provider_name!r} returned an incomplete device grant")
+            # spec 32 (G7): the verification URI is ingested here, before it is
+            # relayed anywhere — only https links may leave the perch, so a
+            # hostile/misconfigured auth server cannot inject a javascript:
+            # (or any non-https) URI that would execute in the coop origin.
+            scheme_err = verification_uri_scheme_error(verification_uri)
+            if scheme_err:
+                raise SeatError(
+                    f"the Fox refuses the device grant from provider {provider_name!r}: "
+                    f"verification_uri {scheme_err}"
+                )
             return DeviceGrant(
                 provider=provider_name,
                 device_code=str(device_code),
@@ -403,10 +458,10 @@ class SeatBroker:
             session = self._session_from_token(grant.provider, resp.json())
             self.store.save(session)
             return {"status": "authorized", "session": session}
-        try:
-            error = resp.json().get("error", "")
-        except ValueError:
-            error = resp.text[:200]
+        # G10: the token endpoint's error body is untrusted bytes — a hostile
+        # auth server can echo the posted device/refresh credential in it.
+        # Only the parsed `error` field (sanitized) may surface in the error.
+        error = http_error_detail(resp)
         if error == "authorization_pending":
             return {"status": "pending"}
         if error == "slow_down":
@@ -432,8 +487,21 @@ class SeatBroker:
         raise SeatError(f"device login for provider {provider_name!r} timed out (device code expired)")
 
     def logout(self, provider_name: str) -> None:
+        """Release a provider's stored perch seat (tokens removed, not
+        revoked) — spec 32, review finding G2: the provider must be a
+        *registered* provider name (validated against providers.toml), and
+        the session path is contained inside the data dir before any unlink
+        (see :meth:`SeatStore.delete`), so a crafted provider name like
+        ``/etc/anything`` can neither delete a ``*.json`` file outside the
+        data dir nor be audited as a release. Refusals are field-named
+        (``provider: …``)."""
+        if provider_name not in self.providers.providers:
+            raise SeatError(
+                f"provider: unknown provider {provider_name!r}; "
+                f"known providers: {', '.join(sorted(self.providers.providers)) or '(none)'}"
+            )
         if not self.store.delete(provider_name):
-            raise SeatError(f"no perch seat stored for provider {provider_name!r}")
+            raise SeatError(f"provider: no perch seat stored for provider {provider_name!r}")
 
     def status(self) -> list[dict[str, Any]]:
         """Non-secret overview for `tc auth status`: each provider's auth mode

@@ -4,6 +4,11 @@ The log file is only ever opened in append mode — rows are never rewritten,
 truncated, or deleted (retention default: forever, baseline v0.2 decision 3).
 Every line is one JSON object carrying a UTC ``ts`` timestamp.
 
+Spec 32 / review G24: every row also carries an additive ``via`` actor field
+(``socket`` / ``http`` / ``farmhand`` / ``rooster``) recording which surface
+the action entered through — stamped by the server-side request scope
+(``audit_via``), never taken from a client-writable request body.
+
 Spec 20 (lexicon adoption): rows are written with the farm event names
 (``egg.queued``, ``clutch.stored``, ``abattoir.attested``, …). Rows written by
 older versions keep their legacy names on disk forever — the append-only log
@@ -16,10 +21,39 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
 from turbochickens.util import utcnow_iso
+from turbochickens import fox
+
+#: The `via` actor values a Headcount row can carry (spec 32 / review G24):
+#: which surface the recorded action entered through — the local socket
+#: (CLI and other direct socket callers), the Coop HTTP API, the Farmhand
+#: MCP, or the Rooster's cron. Stamped server-side only, never client-sent.
+VIA_ACTORS: tuple[str, ...] = ("socket", "http", "farmhand", "rooster")
+
+_via_ctx: ContextVar[str] = ContextVar("turbochickens_audit_via", default="socket")
+
+
+def current_via() -> str:
+    """The actor the request currently being handled arrived through
+    (default: the local ``socket`` surface — daemon-internal writes)."""
+    via = _via_ctx.get()
+    return via if via in VIA_ACTORS else "socket"
+
+
+@contextmanager
+def audit_via(via: str):
+    """Scope of one request: every Headcount row appended inside the scope
+    carries this `via` actor."""
+    token = _via_ctx.set(via if via in VIA_ACTORS else "socket")
+    try:
+        yield
+    finally:
+        _via_ctx.reset(token)
 
 #: legacy (pre-spec-20) event names → lexicon event names. Applied on
 #: read/display only; rows on disk are never rewritten.
@@ -57,14 +91,25 @@ class AuditLog:
         self.path = Path(path)
 
     def append(self, event: dict[str, Any]) -> dict[str, Any]:
-        """Append one event row and return it (with its ts)."""
+        """Append one event row and return it (with its ts). Every row
+        carries the additive `via` actor of the request being handled
+        (spec 32 / G24) — stamped from the server-side scope, never from
+        the event dict."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        row = {"ts": utcnow_iso(), **event}
+        row = {"ts": utcnow_iso(), **event, "via": current_via()}
         line = json.dumps(row, ensure_ascii=False, sort_keys=True)
-        with open(self.path, "a", encoding="utf-8") as f:  # append-only: never opened for write/truncate
-            f.write(line + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        # spec 32 (G11, the Fox): the Headcount is state at rest — created
+        # 0600 at creation and fchmod-ed on every append (a pre-existing
+        # looser file is tightened), still append-only: never opened for
+        # write/truncate
+        fd = fox.open_append_0600(self.path)
+        try:
+            with os.fdopen(fd, "a", encoding="utf-8", closefd=False) as f:
+                f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        finally:
+            os.close(fd)
         return row
 
     def read_all(self) -> list[dict[str, Any]]:

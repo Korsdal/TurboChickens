@@ -37,9 +37,13 @@ env refs; they are resolved against the daemon's environment **only at
 injection time**, landing solely in the ephemeral (abattoir-attested) workspace
 config. No env value or resolved header ever appears in any socket/HTTP
 response, audit row, run log, or manifest — `connectors_list` serves stdio
-``env`` as key names only and https ``headers`` as the refs themselves. Audit
-rows (``gate.registered`` / ``gate.removed`` / ``gate.rejected``) carry the
-name and transport only.
+``env`` as key names only and https ``headers`` as refs only. A **literal**
+(non-``$ref``) https header value is refused at registration with a field-named
+``connectors.<name>.headers`` error (spec-32 ticket 08, review finding G5); a
+literal that is already at rest in a hand-edited registry still loads (the
+operator owns the 0600 file, like stdio env literals) but is never served —
+listings render it as ``<withheld>``. Audit rows (``gate.registered`` /
+``gate.removed`` / ``gate.rejected``) carry the name and transport only.
 """
 
 from __future__ import annotations
@@ -53,6 +57,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator, model_validator
 
+from turbochickens import fox
+
 CONNECTORS_ENVVAR = "TURBOCHICKENS_CONNECTORS"
 DEFAULT_DATA_DIR = Path("~/.turbochickens").expanduser()
 
@@ -65,7 +71,35 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 #: `$VAR` / `${VAR}` env references inside env/header values
 _REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
+#: what a listing serves for a header value that is not an env ref (spec-32
+#: ticket 08 / G5): a literal at rest in a hand-edited registry is withheld,
+#: never served
+WITHHELD_HEADER = "<withheld>"
+
 _BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def is_env_ref(value: str) -> bool:
+    """True when the value full-matches the ref grammar: literal segments plus
+    *complete* `$VAR` / `${VAR}` refs only — every `$` in the value must start
+    a whole ref that is not glued onto a preceding word character. The old
+    substring heuristic let partial literals like ``prefix$TOKEN`` (or a secret
+    that merely contains a `$`, e.g. ``sk$abc123``) pass registration and be
+    served verbatim; those are literals, not refs, and are refused/withheld."""
+    pos = 0
+    found = False
+    while pos < len(value):
+        m = _REF_RE.match(value, pos)
+        if m is not None:
+            if pos > 0 and (value[pos - 1].isalnum() or value[pos - 1] == "_"):
+                return False  # glued to a word char: part of a literal, not a ref boundary
+            found = True
+            pos = m.end()
+        elif value[pos] == "$":
+            return False  # a `$` that does not start a complete ref
+        else:
+            pos += 1
+    return found
 
 
 class ConnectorsError(Exception):
@@ -99,7 +133,8 @@ class StdioConnector(BaseModel):
 
 class HttpsConnector(BaseModel):
     """An https gate: a streamable-HTTP MCP endpoint. `headers` values are
-    env refs (e.g. ``"Bearer $TOKEN"``) or literals — never served resolved."""
+    env refs (e.g. ``"Bearer $TOKEN"``) — a literal (non-`$ref`) header secret
+    is refused at registration (spec-32 ticket 08 / G5) and never served."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -151,10 +186,11 @@ def fmt_error_loc(loc: tuple) -> str:
 
 
 def public_entry(name: str, entry: StdioConnector | HttpsConnector) -> dict[str, Any]:
-    """The non-secret summary served by `connectors_list`: stdio gates expose
-    the command/args and only the *names* of env keys; https gates expose the
-    url and the header refs as references. Never an env value, never a
-    resolved header."""
+    """The non-secret summary served by `connectors_list` (and echoed by
+    `connectors_add`): stdio gates expose the command/args and only the *names*
+    of env keys; https gates expose the url and the header refs as references.
+    Never an env value, never a resolved header — a header value that carries
+    no `$ref` (a literal at rest in a hand-edited registry) is withheld."""
     if entry.transport == "stdio":
         assert isinstance(entry, StdioConnector)
         return {
@@ -169,7 +205,8 @@ def public_entry(name: str, entry: StdioConnector | HttpsConnector) -> dict[str,
         "name": name,
         "transport": "https",
         "url": entry.url,
-        "headers": dict(entry.headers),  # refs stay refs
+        # refs stay refs; literals are withheld, never served (G5)
+        "headers": {k: (v if is_env_ref(v) else WITHHELD_HEADER) for k, v in entry.headers.items()},
     }
 
 
@@ -244,6 +281,24 @@ def validate_connector_payload(name: str, payload: dict[str, Any]) -> tuple[Stdi
             for err in e.errors()
         ]
         return None, errors
+    # spec-32 ticket 08 (review finding G5): an https header value must carry an
+    # env ref — a literal header secret is refused at registration, fail closed
+    # with a field-named error, exactly like the stdio env side never serves
+    # values. The message names the header, never the value.
+    if isinstance(entry, HttpsConnector):
+        literal = [k for k, v in entry.headers.items() if not is_env_ref(v)]
+        if literal:
+            return None, [
+                {
+                    "field": f"connectors.{name}.headers",
+                    "message": (
+                        f"header {literal[0]!r} must be an env ref ($VAR / ${{VAR}}) like"
+                        ' "Bearer $TOKEN" — literal header secrets are refused at registration;'
+                        " the Fox keeps gate credentials out of every listing, the Gates view,"
+                        " and the Headcount"
+                    ),
+                }
+            ]
     return entry, []
 
 
@@ -277,8 +332,9 @@ _REGISTRY_HEADER = """\
 # $TURBOCHICKENS_CONNECTORS > <data_dir>/connectors.toml.
 #
 # stdio gate: command (+ optional args, env). https gate: url (+ optional
-# headers). env/header values may be env refs like "$TOKEN" — resolved
-# against the daemon environment only at injection, never served.
+# headers). env values may be literals or env refs like "$TOKEN" — only key
+# names are ever served. https header values MUST be env refs — a literal
+# header secret is refused at registration and withheld from every listing.
 """
 
 
@@ -301,12 +357,12 @@ def dump_registry_toml(raw: dict[str, Any]) -> str:
 def save_registry(path: Path | None, raw: dict[str, Any], data_dir: Path) -> Path:
     """Atomically write the registry file, always 0600 — it may hold literal
     secret env values (refs are fine, literals are the operator's at-rest
-    secret). Returns the written path."""
+    secret). The tmp file is created 0600 at creation (spec 32/G11, the Fox —
+    no umask window before the atomic rename). Returns the written path."""
     target = path if path is not None else data_dir / "connectors.toml"
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + f".tmp-{uuid.uuid4().hex[:8]}")
-    tmp.write_text(dump_registry_toml(raw), encoding="utf-8")
-    os.chmod(tmp, 0o600)
+    fox.write_text_0600(tmp, dump_registry_toml(raw))
     os.replace(tmp, target)
     return target
 
@@ -323,9 +379,14 @@ def _resolve_refs(connector_name: str, mapping: dict[str, str], kind: str) -> di
     def sub(m: re.Match[str]) -> str:
         var = m.group(1) or m.group(2)
         if var not in os.environ:
+            tail = (
+                "(https header values must be env refs — literals are refused at registration)"
+                if kind == "header"
+                else "or use a literal value (values are never exposed)"
+            )
             raise ConnectorsError(
                 f"connector {connector_name!r} {kind} references ${var}, which is not set in the"
-                " daemon environment — set it there or use a literal value (values are never exposed)"
+                f" daemon environment — set it there {tail}"
             )
         return os.environ[var]
 
@@ -376,7 +437,9 @@ def attach_connectors_to_run(run: Any, settings: Any, names: list[str] | None = 
             )
         entries.append((name, mcp_config_entry(name, entry)))
     vibe_dir = run.workspace / ".vibe"
-    vibe_dir.mkdir(parents=True, exist_ok=True)
+    # spec 32 (G11, the Fox): the injected harness config holds resolved gate
+    # secrets — the .vibe dir is 0700 and config.toml 0600 at creation
+    fox.ensure_dir(vibe_dir)
     config_path = vibe_dir / "config.toml"
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     lines = ["", "# spec 28: gates (registered connectors) this chicken opted into via harness.connectors", ""]
@@ -388,5 +451,5 @@ def attach_connectors_to_run(run: Any, settings: Any, names: list[str] | None = 
     text = existing
     if text and not text.endswith("\n"):
         text += "\n"
-    config_path.write_text(text + "\n".join(lines), encoding="utf-8")
+    fox.write_text_0600(config_path, text + "\n".join(lines))
     return names

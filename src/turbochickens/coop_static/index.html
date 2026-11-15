@@ -8,9 +8,9 @@
   <title>TurboChickens</title>
   <meta name="description" content="TurboChickens — the coop GUI: local-first management for ephemeral AI agent jobs (chickens hatched from eggs).">
   <link rel="icon" href="/icons/egg.svg" type="image/svg+xml">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <!-- no third-party runtime fetches: the SPA is fully self-hosted (system
+       font stack in styles.css), so the admin page leaks no Referer and has
+       no MITM font surface -->
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -472,7 +472,7 @@
           <div class="card gate-form-card" id="gate-form-card">
             <div class="card-head">
               <h3>Register a gate</h3>
-              <p class="muted">A gate is registered here; a chicken opts in per egg via <span class="mono">harness.connectors</span>. Env/header values may be <span class="mono">$REFS</span> — they stay at rest and are never served.</p>
+              <p class="muted">A gate is registered here; a chicken opts in per egg via <span class="mono">harness.connectors</span>. Env values may be literals or <span class="mono">$REFS</span> — only key names are ever served. https header values must be <span class="mono">$REFS</span> like <span class="mono">Bearer $TOKEN</span>: literal header secrets are refused at registration — the Fox keeps gate credentials out of every listing.</p>
             </div>
             <form class="gate-form" id="gate-form" novalidate>
               <div class="gate-grid">
@@ -509,7 +509,7 @@
                   <p class="field-error" id="gate-url-error" hidden></p>
                 </div>
                 <div class="upload-field" data-for="https">
-                  <label for="gate-headers">Headers — one KEY=VALUE per line</label>
+                  <label for="gate-headers">Headers — one KEY=$REF per line (literals refused)</label>
                   <textarea id="gate-headers" class="mono" rows="3" spellcheck="false"></textarea>
                   <p class="field-error" id="gate-headers-error" hidden></p>
                 </div>

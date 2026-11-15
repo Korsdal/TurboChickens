@@ -204,8 +204,9 @@ def coop_start(
     """Start coopd with the coop GUI enabled — HTTP at coop_host:coop_port serving / and /api/*.
 
     Identical to `tc daemon start` with coop_enabled = true in settings (the coop
-    container's CMD). Loopback with no coop_auth_token → open; otherwise a bearer
-    token is required and an ephemeral one is printed once to stdout."""
+    container's CMD). The bearer token is required on every bind by default; loopback
+    with no coop_auth_token is open only with the coop_loopback_open opt-in. When a
+    token is required and none configured, an ephemeral one is printed once to stdout."""
     from turbochickens.coop import coop_auth
 
     try:
@@ -221,7 +222,7 @@ def coop_start(
         f"weight_budget={settings.weight_budget}"
     )
     typer.echo(
-        f"coop: gui at {settings.coop_url} auth={'required (bearer token)' if auth.required else 'open (loopback, no token configured)'}"
+        f"coop: gui at {settings.coop_url} auth={'required (bearer token)' if auth.required else 'open (loopback opt-in coop_loopback_open, no token configured)'}"
     )
     try:
         asyncio.run(run_daemon(settings))
@@ -267,16 +268,21 @@ def status(
         f"coopd: up (pid={d['pid']}, version={d['version']}, "
         f"uptime={d['uptime_sec']}s, started_at={d['started_at']})"
     )
-    typer.echo(f"socket: {resp['socket']}")
-    typer.echo(f"db: {resp['db_path']}")
-    typer.echo(f"audit_log: {resp['audit_log']}")
+    # spec 32 (G17): the socket payload serves data-dir-relative identifiers
+    # only; the local CLI prints the operator's own absolute paths (local-only)
+    typer.echo(f"socket: {settings.socket_path}")
+    typer.echo(f"db: {settings.db_path}")
+    typer.echo(f"audit_log: {settings.audit_log_path}")
     typer.echo(f"weight_budget: {resp['weight_budget']}")
     typer.echo(f"pecking order: {resp['queue_depth']}")
     in_flight = resp["in_flight"]
     typer.echo(f"in_flight: {len(in_flight)}")
     alerts = resp.get("alerts", [])
     if alerts:
-        err_console.print(f"[bold red]alerts[/bold red]: {len(alerts)} terminal chicken(s) without an abattoir attestation: {', '.join(alerts)}")
+        err_console.print(
+            f"[bold red]alerts[/bold red]: {len(alerts)} chicken(s) needing attention"
+            f" (terminal without an abattoir attestation, or stranded non-terminal): {', '.join(alerts)}"
+        )
     else:
         typer.echo("alerts: 0")
     retention = resp.get("retention") or {}
@@ -408,10 +414,16 @@ def runs_show(
         err_console.print("[bold red]ALERT: terminal chicken without an abattoir attestation[/bold red]")
     if r.get("result"):
         res = r["result"]
+        # spec 32 (G17): the served payload carries no artifacts_dir — the
+        # local CLI derives the operator's own path from its local settings
+        local_settings = load_settings(settings_path)
         if res["valid"]:
-            typer.echo(f"clutch: valid (nest box: {res['artifacts_dir']})")
+            typer.echo(f"clutch: valid (nest box: {local_settings.results_dir / run_id})")
         else:
-            typer.echo(f"clutch: QUARANTINED — failed candling, schema errors below (quarantine: {res['artifacts_dir']})")
+            typer.echo(
+                f"clutch: QUARANTINED — failed candling, schema errors below"
+                f" (quarantine: {local_settings.quarantine_dir / run_id})"
+            )
             for e in res["schema_errors"] or []:
                 typer.echo(f"  schema error: {e}")
 
@@ -421,10 +433,23 @@ def runs_logs(
     run_id: str = typer.Argument(..., help="Chicken ID, e.g. run-0123abcd4567."),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Print the chicken's streamed events (sanitized log lines + state transitions)."""
+    """Print the chicken's streamed events (sanitized log lines + state transitions).
+
+    The log is the bounded tail (spec 32: the per-chicken event log is capped);
+    a capped or cut-off tail is noted on stderr."""
     resp = _request_or_exit(settings_path, "runs_logs", run_id=run_id)
     for e in resp["events"]:
         typer.echo(f"{e['seq']:>4} {e['ts']} [{e['level']}] {e['source']}: {e['line']}")
+    if resp.get("capped"):
+        typer.echo(
+            f"the fence capped this chicken's log at {resp['total']} events — only the tail is kept",
+            err=True,
+        )
+    elif resp.get("truncated"):
+        typer.echo(
+            f"showing the last {len(resp['events'])} of {resp['total']} events (tail)",
+            err=True,
+        )
 
 
 @runs_app.command("stop")
@@ -475,8 +500,10 @@ def results_get(
         if resp.get("quarantined"):
             for e in resp.get("schema_errors", []):
                 err_console.print(f"  schema error: {e}")
-            if resp.get("artifacts_dir"):
-                err_console.print(f"  quarantined clutch kept at: {resp['artifacts_dir']}")
+            # spec 32 (G17): the served payload carries no artifacts_dir — the
+            # local CLI derives the operator's own quarantine path from settings
+            local_settings = load_settings(settings_path)
+            err_console.print(f"  quarantined clutch kept at: {local_settings.quarantine_dir / run_id}")
         if resp.get("expired"):
             err_console.print("  the clutch was composted under the retention TTL; the append-only index row remains")
         raise typer.Exit(code=1) from None
@@ -679,8 +706,9 @@ def farmhand_serve(
 
     stdio speaks MCP on stdin/stdout for same-machine agents (the 0600 daemon socket gates access).
     https serves streamable-HTTP at farmhand_https_path on the coop listener (coop_host:coop_port),
-    behind the same bearer rule as /api/* — loopback with no token configured is open, otherwise a
-    bearer token is required (an ephemeral one is printed once when non-loopback and none configured).
+    behind the same bearer rule as /api/* — the bearer is required on every bind by default; loopback
+    with no token configured is open only with the coop_loopback_open opt-in. When a token is required
+    and none is configured, an ephemeral one is printed once.
     both runs the two simultaneously. A coopd started with coop_enabled serves the https side itself
     on its existing listener when farmhand_transport includes 'https'."""
     from turbochickens.farmhand import TRANSPORTS, serve_transport
@@ -731,7 +759,8 @@ def _parse_kv_pairs(pairs: list[str] | None, flag: str) -> dict[str, str]:
 def connectors_list(
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """List the registered gates (connectors) with non-secret summaries — never env values."""
+    """List the registered gates (connectors) with non-secret summaries — env key
+    names and header refs only, never literal values."""
     resp = _request_or_exit(settings_path, "connectors_list")
     if not resp["connectors"]:
         typer.echo("no gates registered")
@@ -755,12 +784,13 @@ def connectors_add(
     env: list[str] | None = typer.Option(None, "--env", help="stdio: KEY=VALUE (repeatable); values may be $ENV refs."),
     url: str | None = typer.Option(None, "--url", help="https: the MCP endpoint URL."),
     headers: list[str] | None = typer.Option(
-        None, "--header", help="https: NAME=REF (repeatable), e.g. --header 'Authorization=Bearer $TOKEN'."
+        None, "--header", help="https: NAME=$REF (repeatable), e.g. --header 'Authorization=Bearer $TOKEN' — literal secrets are refused."
     ),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Register (or replace) a gate in connectors.toml. Env/header values may be
-    $ENV refs — they stay references everywhere the platform serves them."""
+    """Register (or replace) a gate in connectors.toml. Env values may be literals
+    or $ENV refs (only key names are ever served); https header values must be
+    $ENV refs — a literal header secret is refused with a field-named error."""
     payload: dict = {"transport": transport}
     if command is not None:
         payload["command"] = command

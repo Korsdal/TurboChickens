@@ -32,7 +32,7 @@ from typer.testing import CliRunner
 
 from test_daemon import DaemonThread
 from test_farmhand import EXPECTED_TOOLS, tool_payload
-from test_run_e2e import db_row
+from test_run_e2e import db_row, upload_egg
 from turbochickens.audit import AuditLog
 from turbochickens.cli.main import app
 from turbochickens.client import request
@@ -537,12 +537,17 @@ def test_run_stop_refuses_ancestor_target_for_sub_caller(daemon, tmp_path) -> No
 def test_e2e_subspawn_through_attached_farmhand_over_stdio(daemon, tmp_path) -> None:
     settings = daemon.settings
     sock = settings.socket_path
+    # spec 32 (ticket 02): a chicken-owned connection may only queue
+    # allowlisted (uploads-area) spec paths — the operator registers the eggs
+    # first and the prompts carry the stored paths
     # grand egg: spawn_subs = true, would be refused when enqueued by the sub (depth cap)
     grand = write_job_subs(tmp_path, "grand-egg", "never runs", spawn_subs=True)
+    grand_up = upload_egg(sock, grand)
     # the sub egg: spawn_subs = true so the sub itself gets a Farmhand attached
-    sub = write_job_subs(tmp_path, "sub-egg", f"SUBSCOPE {grand}", spawn_subs=True)
+    sub = write_job_subs(tmp_path, "sub-egg", f"SUBSCOPE {grand_up}", spawn_subs=True)
+    sub_up = upload_egg(sock, sub)
     # the parent egg: spawn_subs = true, its fake vibe drives the Farmhand
-    parent = write_job_subs(tmp_path, "parent-egg", f"SUBSPAWN {sub}", spawn_subs=True)
+    parent = write_job_subs(tmp_path, "parent-egg", f"SUBSPAWN {sub_up}", spawn_subs=True)
 
     resp = request(sock, "enqueue", spec_path=str(parent), timeout=10.0)
     assert resp["ok"] is True and resp["weight"] == 1.0 and "parent_run_id" not in resp
@@ -707,7 +712,10 @@ def test_subspawn_carries_no_token_material(tmp_path, monkeypatch) -> None:
     try:
         sock = settings.socket_path
         sub = write_job_subs(tmp_path, "sec-sub", "hello sub")
-        parent = write_job_subs(tmp_path, "sec-parent", f"SUBSPAWN {sub}", spawn_subs=True)
+        # spec 32 (ticket 02): the sub-egg path the chicken queues is the
+        # allowlisted (uploaded) one
+        sub_up = upload_egg(sock, sub)
+        parent = write_job_subs(tmp_path, "sec-parent", f"SUBSPAWN {sub_up}", spawn_subs=True)
         pid = request(sock, "enqueue", spec_path=str(parent), timeout=10.0)["run_id"]
         run_p = wait_terminal(sock, pid, timeout=150)
         assert run_p["status"] == "succeeded"

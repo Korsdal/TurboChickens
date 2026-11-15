@@ -16,6 +16,18 @@
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
+  /* The Fox only links https: an untrusted URI (e.g. a `javascript:` scheme
+     injected by a hostile auth server) must never become an href in the coop
+     origin — it would run with access to the sessionStorage bearer. */
+  function httpsOnlyHref(uri) {
+    try {
+      const u = new URL(uri);
+      return u.protocol === "https:" ? u.href : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
   let token = sessionStorage.getItem(TOKEN_KEY);
   let pollTimer = null;
   let lastStats = {};
@@ -1003,7 +1015,8 @@
   }
 
   function isBeakPrivate(path) {
-    return path.split("/")[0] === ".vibe" || path === ".tc-farmhand-settings.toml";
+    const top = path.split("/")[0];
+    return top === ".vibe" || top === ".tc-home" || path === ".tc-farmhand-settings.toml";
   }
 
   function renderBeakPane(run, logs, ws, wsFile) {
@@ -1873,8 +1886,14 @@
     $("#device-provider").textContent = provider;
     $("#device-code").textContent = resp.user_code || "—";
     const link = $("#device-verification");
-    link.textContent = resp.verification_uri || "";
-    link.href = resp.verification_uri || "#";
+    const uri = resp.verification_uri || "";
+    link.textContent = uri;
+    const safeHref = httpsOnlyHref(uri);
+    if (safeHref) {
+      link.href = safeHref;
+    } else {
+      link.removeAttribute("href"); // not https → shown as text only, never linked
+    }
     $("#device-expires").textContent = "code expires " + (resp.expires_at || "—");
     deviceStatus("Waiting for authorization…");
     $("#device-card").hidden = false;
@@ -2076,7 +2095,10 @@
       const env = (g.env_keys || []).join(", ");
       return (g.command || "—") + (args ? " " + args : "") + (env ? "  ·  env: " + env : "");
     }
-    const headers = Object.entries(g.headers || {}).map(([k, v]) => k + ": " + v).join(", ");
+    // refs only: a header value without a $ref is a literal — never rendered
+    const headers = Object.entries(g.headers || {})
+      .map(([k, v]) => k + ": " + (String(v).includes("$") ? v : "<withheld>"))
+      .join(", ");
     return (g.url || "—") + (headers ? "  ·  headers: " + headers : "");
   }
 

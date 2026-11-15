@@ -1,6 +1,6 @@
 [project]
 name = "turbochickens"
-version = "0.0.23"
+version = "0.0.24"
 description = "Local-first platform for ephemeral, just-in-time AI agent jobs."
 requires-python = ">=3.12"
 dependencies = [
@@ -20,7 +20,9 @@ dependencies = [
 tc = "turbochickens.cli.main:app"
 
 [build-system]
-requires = ["hatchling"]
+# Pinned exactly (spec 32 ticket 16 / review G22): the container builds the
+# wheel through this backend, so it must not float either.
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
@@ -28,6 +30,8 @@ packages = ["src/turbochickens"]
 
 [dependency-groups]
 dev = [
+    "packaging>=24",
+    "pyyaml>=6",
     "pytest>=8.3",
 ]
 

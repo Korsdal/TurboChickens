@@ -36,9 +36,10 @@ in-container path. Invalid bundles are never stored and never register a job.
 Spec 12 (coop): when ``coop_enabled`` is set, the same process also serves the
 TurboChickens GUI over HTTP (aiohttp, same event loop) — static SPA at ``/``
 and ``/api/ping`` + ``/api/status`` under ``/api``, thin mirrors of the socket
-ops called over the daemon's own socket. Loopback + no token → open;
-non-loopback (or any configured token) → bearer required, with an ephemeral
-token printed once at startup when none is configured.
+ops called over the daemon's own socket. The bearer token is required on every
+bind by default (spec 32, review G3); loopback + no token is open only with the
+``coop_loopback_open`` opt-in, and a configured token (or an ephemeral one
+printed once at startup) is required otherwise.
 
 Spec 19 (auth & access management in the GUI) adds the ops behind the Auth
 view: ``auth_providers`` (each provider's auth mode + perch seat expiry via
@@ -89,7 +90,9 @@ registry (resolved exactly like ``providers.toml``: ``settings.connectors_path``
 > ``$TURBOCHICKENS_CONNECTORS`` > ``<data_dir>/connectors.toml``), audit-logged
 as ``gate.registered`` / ``gate.removed`` / ``gate.rejected`` with name +
 transport only — never env/header material. ``connectors_list`` serves
-non-secret summaries only (stdio env as key names, https headers as refs).
+non-secret summaries only (stdio env as key names, https headers as refs only —
+a literal header secret is refused at `connectors_add` with a field-named
+``connectors.<name>.headers`` error and withheld from every listing).
 ``enqueue`` refuses ``harness.connectors`` names that are not registered
 (field-named ``harness.connectors`` error) and refuses the list for
 non-vibe-cli adapters (no harness runtime to inject into); the vibe-cli
@@ -103,8 +106,12 @@ It is available only while the workspace exists (in-flight chickens) — a
 terminal run answers a clear "the beak is closed" error, because the
 abattoir's attested teardown already removed the workspace. Paths are locked
 inside that run's workspace (traversal refused) and the chicken's private
-harness config (``.vibe/``, the farmhand settings file) is never served — see
-``beak.py`` for the pure seam.
+harness config (``.vibe/``, the farmhand settings file) is never served —
+checked on the resolved target, with symlink/hardlink targets refused and an
+O_NOFOLLOW open, so aliases and resolve→open races cannot serve private or
+out-of-workspace files (spec 32 ticket 07, review G4); the tree walk is
+capped before sorting and runs off the event loop (spec 32 ticket 07, G20) —
+see ``beak.py`` for the pure seam.
 
 Spec 31 (the Farmhand & Connectors GUI views) adds ``farmhand_info`` — the
 Farmhand view's payload: active transport(s), the HTTPS endpoint URL on the
@@ -119,6 +126,54 @@ error, never silently ignored), only ``MUTABLE_SETTINGS_FIELDS`` may change
 (everything else is read-only at runtime), the change is audited as
 ``settings.changed``, and the coop mounts/unmounts the Farmhand HTTPS endpoint
 when ``farmhand_transport`` crosses the https boundary.
+
+Spec 32 (ticket 10, review finding G8) establishes socket caller identity:
+every connection's peer credentials are read from the kernel (SO_PEERCRED)
+and the peer pid is resolved — directly or via its /proc ancestry — against
+the registry of chicken pids the Hatchery records at spawn, so a
+chicken-owned connection is identified server-side. On such a connection,
+``enqueue`` forces ``parent_run_id`` and ``run_stop`` forces ``caller_run_id``
+from the peer (client-sent lineage fields are ignored), so the ChickenSub
+depth cap and the ancestor-stop refusal hold even against a direct socket
+caller. ``runs_list`` rows and the manifest's harness block carry the
+chicken's ``pid``. Trust model: socket and Coop HTTP access mean operator;
+Chickens are not operators (see ``docs/lexicon.md``).
+
+Spec 32 (ticket 02, review finding G1 entry points) adds the spec-path
+allowlist: on a chicken-owned connection, ``spec_path`` on ``enqueue``,
+``run_rerun``, and ``schedule_add`` must resolve inside the coop uploads
+area or be an already-registered egg path — anything else is refused with a
+field-named ``spec_path`` error before the file is ever read, so
+``spec_path`` is never a host-file existence/read oracle from a ChickenSub.
+``jobs_upload`` additionally requires the egg's ``schema_file`` to be a
+bundle member, so candling of an uploaded bundle cannot be aimed at a host
+file and cannot silently pass-everything.
+
+Spec 32 (ticket 11, the G8 scope half): the ChickenSub op scope is enforced
+server-side on every chicken-owned connection — ``_dispatch_op`` serves only
+``CHICKEN_OPS_ALLOWED`` (enqueue + the read ops + the guarded ``run_stop``,
+plus ``ping``/``workspace_peek``) and refuses every other op (shutdown,
+settings, gates, auth, upload, re-run, schedule, retention, farmhand info,
+unknown ops) with a field-named Fox refusal (:func:`_chicken_op_refusal`).
+The narrowing therefore exists in the daemon, not only in the Farmhand's
+client-side tool list.
+
+Spec 32 ticket 12 (review G9, spawn isolation) hardens coopd itself and the
+spawn env: at startup coopd marks itself non-dumpable
+(``harden_daemon_process``) so a same-uid chicken cannot read
+``/proc/<coopd>/environ`` for ambient secrets, and every chicken's per-run env
+points HOME/TMPDIR/XDG_*/VIBE_HOME at its own Scratch (``.tc-home/`` inside
+its workspace) holding only a sanitized vibe profile — see ``adapter.py``.
+
+Spec 32 ticket 20 (review G16): eggs still in the Pecking Order when coopd
+shuts down are cancelled through the same attested path as ``run_stop`` on a
+queued egg (terminal ``cancelled``, Headcount rows ``egg.cancelled`` /
+``abattoir.attested`` / ``chicken.finished``, attestation (1,1,1)) — never
+stranded ``queued``. Rows left ``queued`` by a dead coopd (a crash or kill)
+are recovered at startup into that same cancelled-with-attestation state
+before the socket accepts (Headcount row ``coopd.recovered``), and the
+status alerts also surface any non-terminal row this coopd does not own, so
+no run is left non-terminal across restarts without being visible.
 """
 
 from __future__ import annotations
@@ -131,16 +186,21 @@ import os
 import re
 import shutil
 import signal
+import socket
 import sqlite3
+import struct
+import sys
 import time
+import tomllib
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
 
-from turbochickens import __version__, beak
+from turbochickens import __version__, beak, fox
 from turbochickens.adapter import (
     BASE_ENV_KEYS,
     DEFAULT_CREDENTIAL_ALLOWLIST,
@@ -148,8 +208,9 @@ from turbochickens.adapter import (
     ProviderConfigError,
     run_weight,
 )
-from turbochickens.audit import AuditLog
+from turbochickens.audit import VIA_ACTORS, AuditLog, audit_via, current_via
 from turbochickens.chaining import is_nestbox_uri
+from turbochickens.fence import safe_ref
 from turbochickens.connectors import (
     ConnectorsConfig,
     ConnectorsError,
@@ -167,11 +228,21 @@ from turbochickens.retention import sweep_expired_results
 from turbochickens.runner import TERMINAL_STATES, RunPipeline
 from turbochickens.scheduler import CronScheduler
 from turbochickens.seat import DeviceGrant, SeatBroker, SeatError, _iso
-from turbochickens.settings import SOCKET_STREAM_LIMIT, UPLOAD_MAX_BYTES, Settings
-from turbochickens.spec.loader import SpecValidationError, load_spec, spec_hash
-from turbochickens.spec.model import NETWORK_POLICIES
+from turbochickens.settings import (
+    MAX_RUN_EVENTS,
+    RUNS_LOGS_TAIL_DEFAULT,
+    RUNS_LOGS_TAIL_MAX,
+    SOCKET_HANDLER_TIMEOUT_SEC,
+    SOCKET_IDLE_TIMEOUT_SEC,
+    SOCKET_MAX_CONNECTIONS,
+    SOCKET_STREAM_LIMIT,
+    UPLOAD_MAX_BYTES,
+    Settings,
+)
+from turbochickens.spec.loader import SpecValidationError, load_spec, load_spec_text, spec_hash
+from turbochickens.spec.model import NETWORK_POLICIES, JobSpec
 from turbochickens.storage import init_db
-from turbochickens.util import utcnow, utcnow_iso
+from turbochickens.util import display_relpath, redact_host_paths, utcnow, utcnow_iso
 
 #: how often the retention sweeper re-runs after the startup sweep (spec 08)
 RETENTION_SWEEP_INTERVAL_SEC = 3600.0
@@ -184,10 +255,149 @@ AUDIT_TAIL_MAX = 1000
 UPLOAD_MAX_FILES = 200
 
 #: spec 31 `settings_set`: the settings mutable at runtime from the GUI (the
-#: Farmhand view's transport switch). Everything else stays read-only there.
+#: Farmhand view's transport switch). Everything else stays read-only there —
+#: including ``coop_loopback_open`` (spec 32): the loopback-open opt-in is a
+#: startup setting, never flippable from the GUI.
 MUTABLE_SETTINGS_FIELDS = ("farmhand_transport",)
 
 PROTOCOL_VERSION = 1
+
+
+@dataclass
+class CallerIdentity:
+    """Spec 32 (ticket 10, review finding G8): who is on the other end of a
+    socket connection, established server-side from the kernel's peer
+    credentials (SO_PEERCRED), never from the request body. `run_id` is set
+    when the peer pid is a live chicken (or a descendant of one) — such a
+    connection is chicken-owned and its lineage fields are forced from the
+    peer, not trusted from the client. Socket/HTTP access means operator;
+    Chickens are not operators."""
+
+    pid: int | None
+    uid: int | None
+    gid: int | None
+    run_id: str | None = None
+
+    @property
+    def is_chicken(self) -> bool:
+        return self.run_id is not None
+
+
+#: Spec 32 (ticket 11, review finding G8 scope): the ops a chicken-owned
+#: connection may use — the narrowed sub-chicken op set: ``enqueue`` + the
+#: read ops + the guarded ``run_stop`` (plus ``ping`` and the Beak's
+#: ``workspace_peek``). Everything else — shutdown, settings, gates,
+#: auth, upload, re-run, schedule, retention, farmhand info — is
+#: operator-only and refused server-side, so the narrowing no longer
+#: lives only in the Farmhand's client-side tool list.
+CHICKEN_OPS_ALLOWED = frozenset(
+    {
+        "ping",
+        "status",
+        "jobs_list",
+        "enqueue",
+        "runs_list",
+        "runs_show",
+        "runs_logs",
+        "workspace_peek",
+        "run_stop",
+        "results_get",
+        "stats_list",
+        "stats_show",
+        "audit_tail",
+    }
+)
+
+
+def _chicken_op_refusal(op: Any, caller: CallerIdentity) -> dict[str, Any]:
+    """Spec 32 (ticket 11, G8 scope): refuse an operator-only op on a
+    chicken-owned connection. Field-named like every other refusal — the
+    field names the refused op — with the Fox copy from docs/lexicon.md."""
+    msg = (
+        f"the fox refuses op {op!r} — a chicken is not an operator: this connection"
+        f" belongs to chicken {caller.run_id!r}, and coopd serves a chicken-owned"
+        " connection only the sub-chicken op set (enqueue + read ops + the guarded"
+        " run_stop)"
+    )
+    return {
+        "ok": False,
+        "protocol": PROTOCOL_VERSION,
+        "error": msg,
+        "errors": [{"field": str(op), "message": msg}],
+    }
+
+
+def _peer_credentials(writer: asyncio.StreamWriter) -> tuple[int | None, int | None, int | None]:
+    """Read the peer credentials of a unix-socket connection (Linux
+    SO_PEERCRED: pid, uid, gid of the connecting process). Returns
+    (None, None, None) where the kernel offers no peer credentials — such a
+    caller is treated as an operator, same as any non-chicken peer."""
+    sock = writer.get_extra_info("socket")
+    if sock is None or not hasattr(socket, "SO_PEERCRED"):
+        return None, None, None
+    try:
+        raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        pid, uid, gid = struct.unpack("3i", raw)
+        return pid, uid, gid
+    except OSError:
+        return None, None, None
+
+
+def _ppid_of(pid: int) -> int | None:
+    """Parent pid from /proc (Linux), or None when unreadable."""
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        # the comm field may contain spaces/parens — parse after the last ')'
+        return int(data.rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+#: spec 32 / review G24 — the Headcount `via` actor. `via` values an
+#: in-process forwarder may stamp: the coop web layer (`http`), the
+#: scheduler's loopback (`rooster`), and the mounted Farmhand (`farmhand`)
+#: all connect to this daemon's own socket from this very process, which
+#: SO_PEERCRED verifies (peer pid == our pid).
+_INPROC_VIA = ("http", "farmhand", "rooster")
+
+
+def _peer_runs_farmhand(pid: int) -> bool:
+    """Best-effort check that the peer process is a `… farmhand serve …`
+    server (its /proc cmdline), so a standalone Farmhand process is
+    attributed correctly. Linux-only; any failure means False."""
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        return b"farmhand" in argv and b"serve" in argv
+    except Exception:
+        return False
+
+
+def _resolve_via(
+    sent_via: Any, caller: CallerIdentity | None, chicken_pids: dict[int, str] | None = None
+) -> str:
+    """Resolve the `via` actor for one socket request. A client-sent `via`
+    in the request body is honored only when the peer is verifiably trusted:
+    an in-process forwarder (peer pid == our pid, SO_PEERCRED-verified) or a
+    `farmhand serve` process. Every other caller is the plain `socket`
+    surface, whatever it claims.
+
+    Reviewer finding (hardening): on a chicken-owned connection the /proc
+    cmdline check alone is not enough — a chicken process can fake its argv,
+    so the `farmhand` label is pinned only when the peer is a strict
+    *descendant* of a registered chicken (the attached Farmhand serve
+    process), never the chicken process itself."""
+    if not isinstance(sent_via, str) or sent_via not in VIA_ACTORS:
+        return "socket"
+    peer_pid = caller.pid if caller is not None else None
+    if peer_pid is not None and peer_pid == os.getpid():
+        return sent_via if sent_via in _INPROC_VIA else "socket"
+    if sent_via == "farmhand" and peer_pid is not None and _peer_runs_farmhand(peer_pid):
+        if caller is not None and caller.is_chicken and (chicken_pids or {}).get(peer_pid) == caller.run_id:
+            # the peer IS the chicken process itself faking a farmhand argv —
+            # pin the honest `socket` label
+            return "socket"
+        return "farmhand"
+    return "socket"
 
 
 def _safe_bundle_relpath(key: str) -> str | None:
@@ -246,9 +456,21 @@ class Daemon:
         # spec 22: run_ids whose queued egg was pulled from the pecking order
         # via `run_stop` — the scheduler cancels them instead of admitting
         self._cancel_requested: set[str] = set()
+        # spec 32 ticket 20 (G16): run_ids of eggs sitting in the pecking
+        # order (asyncio queue or the pending backlog) that this coopd owns —
+        # used by the status alerts to tell a legitimately queued egg apart
+        # from a non-terminal row stranded by a dead coopd
+        self._in_queue: set[str] = set()
         # spec 19: seat broker for the auth ops + in-flight device grants
         self._broker: SeatBroker | None = None
         self._device_grants: dict[str, DeviceGrant] = {}
+        # spec 32 (ticket 10, G8): chicken pid → run_id registry, shared with
+        # the pipeline (which registers each harness pid at spawn) — used to
+        # resolve a socket peer pid to the owning chicken
+        self._chicken_pids: dict[int, str] = {}
+        # spec 32 (G20, the Fence): concurrent unix-socket clients served right
+        # now — over SOCKET_MAX_CONNECTIONS the connection is refused
+        self._active_clients = 0
 
     def request_stop(self) -> None:
         if self._stop is not None:
@@ -266,7 +488,11 @@ class Daemon:
 
     async def serve(self) -> None:
         s = self.settings
-        s.data_dir.mkdir(parents=True, exist_ok=True)
+        # spec 32 (G11, the Fox): the data dir is created restrictive (0700)
+        # and a pre-existing looser dir is tightened — all state under it
+        # (db, Headcount, socket, workspaces, results, quarantine, uploads,
+        # seats, registry) is owner-only
+        fox.ensure_dir(s.data_dir)
         self.db = init_db(s.db_path)
         self.audit = AuditLog(s.audit_log_path)
         self.providers = load_providers(s.providers_path, s.data_dir)
@@ -277,14 +503,22 @@ class Daemon:
                 "event": "coopd.started",
                 "pid": os.getpid(),
                 "version": __version__,
-                "socket": str(s.socket_path),
+                # spec 32 (G17): the Headcount carries the data-dir-relative
+                # name only — never a host absolute path
+                "socket": display_relpath(s.socket_path, s.data_dir),
             }
         )
         if s.socket_path.exists():
             if await self._socket_alive():
                 raise DaemonAlreadyRunning(f"daemon already running on {s.socket_path}")
             s.socket_path.unlink()  # stale socket from a dead daemon
-        self.pipeline = RunPipeline(s, self.db, self.audit, providers=self.providers)
+        self.pipeline = RunPipeline(
+            s, self.db, self.audit, providers=self.providers, pid_registry=self._chicken_pids
+        )
+        # spec 32 ticket 20 (G16): recover stale queued rows left by a dead
+        # coopd into the cancelled-with-attestation state before the socket
+        # accepts — no run is left non-terminal across restarts
+        await self._recover_stale_queued()
         # spec 08: retention — sweep expired result artifacts once at startup
         # (the audit log itself is never TTL-deleted), then periodically
         self._last_retention = sweep_expired_results(s, self.db, self.audit)
@@ -313,6 +547,9 @@ class Daemon:
         self._server = await asyncio.start_unix_server(
             self._handle_client, path=str(s.socket_path), limit=SOCKET_STREAM_LIMIT
         )
+        # spec 32 (G11, the Fox): the socket is created 0600 at bind (the
+        # daemon's restrictive umask); this explicit chmod also covers a
+        # pre-existing socket file and in-process callers
         os.chmod(s.socket_path, 0o600)
         serve_task = asyncio.create_task(self._server.serve_forever())
         stop_task = asyncio.create_task(self._stop.wait())
@@ -321,8 +558,8 @@ class Daemon:
         try:
             await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            # spec 23: a Free-Range chicken has no fence — daemon shutdown is
-            # one of its two attested death paths, so ask every active one to
+            # spec 23: a Free-Range chicken has no wall-clock cap — daemon
+            # shutdown is one of its two attested death paths, so ask every active one to
             # stop via the spec-22 stop path (SIGTERM → hard kill → `stopped`)
             # instead of waiting out the bounded drain below
             if self.pipeline is not None:
@@ -342,6 +579,26 @@ class Daemon:
                 self._retention_task.cancel()
             if self.cron is not None:
                 self.cron.stop()
+            # spec 32 ticket 20 (G16): eggs still in the pecking order at
+            # shutdown are cancelled through the same attested path as
+            # `run_stop` on a queued egg — never stranded `queued` forever
+            if self.pipeline is not None and self._sched_task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._sched_task  # let the cancelled scheduler settle
+                drained = list(self.pending)
+                self.pending.clear()
+                while True:
+                    try:
+                        drained.append(self.queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                for item in drained:
+                    with contextlib.suppress(Exception):
+                        await self._cancel_item(
+                            item,
+                            reason="cancelled at coopd shutdown — the egg never hatched",
+                            spec=self._cancel_spec(item),
+                        )
             if self._run_tasks:  # graceful: let in-flight runs finish (bounded)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(
@@ -360,13 +617,104 @@ class Daemon:
             with contextlib.suppress(OSError):
                 s.socket_path.unlink()
 
+    def _caller_run_id(self, pid: int | None) -> str | None:
+        """Spec 32 (ticket 10, G8): resolve a socket peer pid to the chicken
+        that owns it. The peer itself may be the chicken's harness process,
+        or a descendant of it (e.g. the Farmhand serve process the chicken's
+        runtime spawned) — walk the /proc ancestry up to PID 1 and return the
+        first registered chicken pid found. Returns None for any non-chicken
+        caller (operator CLI, coop web layer, cron loopback — all of which
+        connect from processes that are not chickens)."""
+        if pid is None:
+            return None
+        seen: set[int] = set()
+        cur: int | None = pid
+        while cur is not None and cur > 1 and cur not in seen:
+            seen.add(cur)
+            run_id = self._chicken_pids.get(cur)
+            if run_id is not None:
+                return run_id
+            cur = _ppid_of(cur)
+        return None
+
+    def _caller_identity(self, writer: asyncio.StreamWriter) -> CallerIdentity:
+        """Establish the caller of a socket connection from the kernel's peer
+        credentials (read once per connection, on every connection)."""
+        pid, uid, gid = _peer_credentials(writer)
+        return CallerIdentity(pid=pid, uid=uid, gid=gid, run_id=self._caller_run_id(pid))
+
+    def _spec_path_allowlisted(self, spec_path: Path) -> bool:
+        """Spec 32 (ticket 02, review finding G1): the spec-path allowlist — a
+        `spec_path` is allowlisted when it resolves inside the coop uploads
+        area (a Coop-uploaded egg bundle, `uploads/<job>-<spec_hash>/`) or is
+        an already-registered egg path (`job_specs.spec_path`). The check
+        only resolves paths — it never stats, opens, or reads the target — so
+        a refused path yields the identical refusal whether or not the host
+        file exists: `spec_path` cannot be used as a file-existence oracle."""
+        try:
+            resolved = spec_path.resolve()
+        except OSError:
+            return False
+        uploads = self.settings.uploads_dir.resolve()
+        if resolved == uploads or uploads in resolved.parents:
+            return True
+        if self.db is not None:
+            row = self.db.execute(
+                "SELECT 1 FROM job_specs WHERE spec_path = ?", (str(resolved),)
+            ).fetchone()
+            return row is not None
+        return False
+
+    def _spec_path_refusal(self) -> dict[str, Any]:
+        """Spec 32 (ticket 02, G1): the field-named Fox refusal for a
+        non-allowlisted `spec_path` on a chicken-owned connection. The copy
+        never echoes the caller's path (G17: no host absolute paths are
+        served back)."""
+        msg = (
+            "spec_path: the fox refuses — a chicken is not an operator: only registered egg paths"
+            " inside the coop uploads area can be queued, re-run, or scheduled over a chicken's"
+            " connection; the fence holds"
+        )
+        return {
+            "ok": False,
+            "protocol": PROTOCOL_VERSION,
+            "error": msg,
+            "errors": [{"field": "spec_path", "message": msg}],
+        }
+
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        # spec 32 (G20, the Fence): a connection over the cap is refused once,
+        # then closed — a client cannot pile up idle connections on coopd
+        if self._active_clients >= SOCKET_MAX_CONNECTIONS:
+            resp = {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": (
+                    f"the fence is full: coopd accepts at most {SOCKET_MAX_CONNECTIONS} connections"
+                    " at once — close one and retry"
+                ),
+            }
+            writer.write(json.dumps(resp).encode("utf-8") + b"\n")
+            with contextlib.suppress(Exception):
+                await writer.drain()
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return
+        self._active_clients += 1
+        # spec 32 (ticket 10, G8): caller identity is established server-side
+        # from SO_PEERCRED on every connection, before any request is read
+        caller = self._caller_identity(writer)
         try:
             while self._stop is None or not self._stop.is_set():
                 try:
-                    line = await reader.readline()
+                    # keepalive cap: an idle connection is closed after
+                    # SOCKET_IDLE_TIMEOUT_SEC without a request
+                    line = await asyncio.wait_for(reader.readline(), timeout=SOCKET_IDLE_TIMEOUT_SEC)
+                except TimeoutError:
+                    break
                 except ValueError:
                     # over SOCKET_STREAM_LIMIT: answer once, then close — the
                     # stream is desynced after a LimitOverrunError
@@ -381,17 +729,52 @@ class Daemon:
                     break
                 if not line:
                     break
-                resp = await self._respond(line)
+                # per-handler cap: one op may not wedge the supervision loop.
+                # spec 32 (reviewer finding): the dispatch runs shielded, so on
+                # timeout the caller gets the Fox error below while the
+                # mutating op itself still runs to completion (it is never
+                # cancelled mid-flight) — the client simply retries/reads the
+                # outcome afterwards
+                dispatch_task = asyncio.create_task(self._respond(line, caller))
+                # consume a late exception so it is never logged as unretrieved
+                dispatch_task.add_done_callback(
+                    lambda t: None if t.cancelled() else t.exception()
+                )
+                try:
+                    resp = await asyncio.wait_for(
+                        asyncio.shield(dispatch_task), timeout=SOCKET_HANDLER_TIMEOUT_SEC
+                    )
+                except TimeoutError:
+                    resp = {
+                        "ok": False,
+                        "protocol": PROTOCOL_VERSION,
+                        "error": (
+                            f"the Fox cut the request short after {SOCKET_HANDLER_TIMEOUT_SEC:g}s"
+                            " — coopd is swamped, retry"
+                        ),
+                    }
                 writer.write(json.dumps(resp, ensure_ascii=False).encode("utf-8") + b"\n")
                 await writer.drain()
         except (ConnectionResetError, BrokenPipeError):
             pass
         finally:
+            self._active_clients -= 1
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
-    async def _respond(self, line: bytes) -> dict[str, Any]:
+    def _redaction_roots(self) -> tuple[Path, ...]:
+        """spec 32 (G17): the path roots redacted from every served error of
+        this daemon — the data dir (socket, db, workspaces, uploads, seats
+        all live under it) and the socket's own directory when configured
+        elsewhere."""
+        roots = [self.settings.data_dir]
+        sock_parent = self.settings.socket_path.parent
+        if sock_parent != self.settings.data_dir:
+            roots.append(sock_parent)
+        return tuple(roots)
+
+    async def _respond(self, line: bytes, caller: CallerIdentity | None = None) -> dict[str, Any]:
         try:
             req = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -399,12 +782,41 @@ class Daemon:
         if not isinstance(req, dict):
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "request must be a JSON object"}
         try:
-            return await self._dispatch(req)
+            return await self._dispatch(req, caller)
         except Exception as e:  # never let one bad request kill the connection loop
-            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"{type(e).__name__}: {e}"}
+            # spec 32 (G17, reviewer finding): the catch-all error is served
+            # verbatim, so it is run through the host-path redactor with the
+            # daemon's path roots (an OSError str embeds host paths)
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": redact_host_paths(f"{type(e).__name__}: {e}", *self._redaction_roots()),
+            }
 
-    async def _dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
+    async def _dispatch(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
+        # spec 32 / review G24: the Headcount `via` actor is resolved from the
+        # SO_PEERCRED-verified peer, never trusted from the client-writable
+        # request body (`via` is popped here) — every row written while this
+        # request is handled carries the resolved actor
+        via = _resolve_via(req.pop("via", None), caller, self._chicken_pids)
+        with audit_via(via):
+            return await self._dispatch_op(req, caller)
+
+    async def _dispatch_op(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
         op = req.get("op")
+        # spec 32 (ticket 11, review G8 scope): a chicken-owned connection
+        # (SO_PEERCRED peer pid resolved to a live chicken, ticket 10) gets
+        # only the sub-chicken op set — enforced here in the daemon, not only
+        # in the Farmhand's client-side tool list. Operator-only ops
+        # (shutdown, settings, gates, auth, upload, re-run, schedule,
+        # retention, farmhand info — and any unknown op) are refused with a
+        # field-named error before any handler runs.
+        if (
+            caller is not None
+            and caller.is_chicken
+            and (not isinstance(op, str) or op not in CHICKEN_OPS_ALLOWED)
+        ):
+            return _chicken_op_refusal(op, caller)
         if op == "ping":
             return {
                 "ok": True,
@@ -418,7 +830,7 @@ class Daemon:
         if op == "status":
             return self._status()
         if op == "enqueue":
-            return await self._enqueue(req)
+            return await self._enqueue(req, caller)
         if op == "runs_list":
             return self._runs_list(req)
         if op == "runs_show":
@@ -426,11 +838,11 @@ class Daemon:
         if op == "runs_logs":
             return self._runs_logs(req)
         if op == "workspace_peek":
-            return self._workspace_peek(req)
+            return await self._workspace_peek(req)
         if op == "run_stop":
-            return await self._run_stop(req)
+            return await self._run_stop(req, caller)
         if op == "run_rerun":
-            return await self._run_rerun(req)
+            return await self._run_rerun(req, caller)
         if op == "results_get":
             return self._results_get(req)
         if op == "stats_list":
@@ -440,7 +852,7 @@ class Daemon:
         if op == "retention_sweep":
             return self._retention_sweep()
         if op == "schedule_add":
-            return await self._schedule_add(req)
+            return await self._schedule_add(req, caller)
         if op == "schedule_list":
             return self._schedule_list()
         if op == "schedule_rm":
@@ -490,7 +902,10 @@ class Daemon:
         return self.queue.qsize() + len(self.pending)
 
     def _alerts(self) -> list[str]:
-        """Terminal runs without a teardown attestation — an alert condition."""
+        """Alert conditions: terminal runs without a complete teardown
+        attestation, and — spec 32 ticket 20 (G16) — non-terminal rows this
+        coopd does not own (stranded by a dead coopd; startup recovery
+        cancels the queued ones, anything else must stay visible here)."""
         if self.db is None:
             return []
         placeholders = ", ".join("?" for _ in TERMINAL_STATES)
@@ -500,7 +915,13 @@ class Daemon:
             " AND (t.run_id IS NULL OR t.process_reaped = 0 OR t.workspace_removed = 0 OR t.env_cleared = 0)",
             TERMINAL_STATES,
         ).fetchall()
-        return [r[0] for r in rows]
+        alerts = [r[0] for r in rows]
+        tracked = self._in_queue | set(self.in_flight)
+        stranded = self.db.execute(
+            f"SELECT id FROM runs WHERE status NOT IN ({placeholders})", TERMINAL_STATES
+        ).fetchall()
+        alerts.extend(r[0] for r in stranded if r[0] not in tracked and r[0] not in alerts)
+        return alerts
 
     def _status(self) -> dict[str, Any]:
         return {
@@ -514,14 +935,16 @@ class Daemon:
                 "started_at": utcnow_iso() if self.started_at is None else self.started_at.isoformat(),
                 "uptime_sec": self._uptime_sec(),
             },
-            "socket": str(self.settings.socket_path),
+            # spec 32 (G17): served as data-dir-relative identifiers only —
+            # a host absolute path never appears in a served payload
+            "socket": display_relpath(self.settings.socket_path, self.settings.data_dir),
             "queue_depth": self._queue_depth(),
             "in_flight": [
                 {"run_id": run_id, "weight": weight} for run_id, weight in self.in_flight.items()
             ],
             "weight_budget": self.settings.weight_budget,
-            "db_path": str(self.settings.db_path),
-            "audit_log": str(self.settings.audit_log_path),
+            "db_path": display_relpath(self.settings.db_path, self.settings.data_dir),
+            "audit_log": display_relpath(self.settings.audit_log_path, self.settings.data_dir),
             "schedules": self._schedule_count(),
             "alerts": self._alerts(),
             "retention": {
@@ -546,7 +969,7 @@ class Daemon:
 
     # --- run submission (spec 03) ------------------------------------------
 
-    async def _enqueue(self, req: dict[str, Any]) -> dict[str, Any]:
+    async def _enqueue(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
         spec_path_raw = req.get("spec_path")
         if not spec_path_raw:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "enqueue requires spec_path"}
@@ -554,6 +977,18 @@ class Daemon:
         trigger = str(req.get("trigger", "manual"))
         rerun_of = req.get("rerun_of")  # spec 22: `run_rerun` lineage
         parent_run_id = req.get("parent_run_id")  # spec 27: ChickenSub lineage
+        if caller is not None and caller.is_chicken:
+            # spec 32 (ticket 10, G8): the connection is chicken-owned (peer
+            # pid resolved to a live chicken) — lineage is forced from the
+            # authenticated peer; any client-sent parent_run_id is ignored,
+            # so the depth cap holds even against a direct socket caller
+            parent_run_id = caller.run_id
+            # spec 32 (ticket 02, G1): on a chicken-owned connection the
+            # spec path must be allowlisted (uploads area / registered egg) —
+            # checked before the file is ever read, so `spec_path` is never a
+            # host-file existence/read oracle from a ChickenSub's Farmhand
+            if not self._spec_path_allowlisted(spec_path):
+                return self._spec_path_refusal()
         try:
             spec = load_spec(spec_path)
         except SpecValidationError as e:
@@ -660,6 +1095,10 @@ class Daemon:
         started_at = utcnow_iso()
         async with self._db_lock:
             assert self.db is not None
+            # spec 32 ticket 20 (G16): the egg is owned by this coopd's
+            # pecking order from the moment its row exists, so the status
+            # alerts never mistake it for a stranded row
+            self._in_queue.add(run_id)
             self.db.execute(
                 "INSERT OR IGNORE INTO job_specs (id, name, spec_hash, spec_toml, created_at, spec_path)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
@@ -678,6 +1117,9 @@ class Daemon:
             "trigger": trigger,
             "weight": weight,
             "started_at": started_at,
+            # spec 32/G24: the Headcount `via` actor travels with the queue
+            # item so the Hatchery's rows for this chicken carry it too
+            "via": current_via(),
         }
         if rerun_of:
             item["rerun_of"] = str(rerun_of)
@@ -731,6 +1173,9 @@ class Daemon:
                 if item["run_id"] in self._cancel_requested:
                     await self._cancel_item(item)
                     continue
+                # spec 32 ticket 20 (G16): admitted into the hatchery — the
+                # egg leaves the pecking order, the chicken is in flight
+                self._in_queue.discard(item["run_id"])
                 self.in_flight[item["run_id"]] = item["weight"]
                 task = asyncio.create_task(self._run_item(item))
                 self._run_tasks.add(task)
@@ -744,28 +1189,108 @@ class Daemon:
             else:
                 self.pending.append(item)
 
-    async def _cancel_item(self, item: dict[str, Any]) -> None:
+    async def _cancel_item(
+        self, item: dict[str, Any], reason: str | None = None, spec: JobSpec | None = None
+    ) -> None:
         """Spec 22: cancel a queued egg pulled from the pecking order by
-        `run_stop` — terminal `cancelled`, never hatched, still attested."""
+        `run_stop` — terminal `cancelled`, never hatched, still attested.
+
+        Spec 32 ticket 20 (G16): the same attested path also cancels eggs
+        still queued at coopd shutdown and stale queued rows recovered at
+        startup (`reason` says which; `spec` is passed when the egg file may
+        be gone)."""
         self._cancel_requested.discard(item["run_id"])
+        self._in_queue.discard(item["run_id"])
         assert self.pipeline is not None
-        await self.pipeline.cancel_queued(item)
+        with audit_via(str(item.get("via", "socket"))):
+            await self.pipeline.cancel_queued(item, reason=reason, spec=spec)
+
+    def _cancel_spec(self, item: dict[str, Any]) -> JobSpec | None:
+        """Best-effort spec for the attested cancel path: the egg file when it
+        still exists, else the spec TOML stored in ``job_specs`` at enqueue
+        (the file may be gone by startup-recovery time; the stored copy was
+        already candled). Returns None only when both fail — the row then
+        stays queued and the status alerts surface it."""
+        path = item.get("spec_path") or ""
+        if path:
+            try:
+                return load_spec(path)
+            except SpecValidationError:
+                pass
+        if self.db is not None:
+            row = self.db.execute(
+                "SELECT spec_toml FROM job_specs WHERE id = ?", (item["job_id"],)
+            ).fetchone()
+            if row and row[0]:
+                try:
+                    return load_spec_text(row[0], source=f"stored spec of egg {item['job_id']!r}")
+                except SpecValidationError:
+                    return None
+        return None
+
+    async def _recover_stale_queued(self) -> list[str]:
+        """Spec 32 ticket 20 (G16): rows still `queued` from a previous coopd
+        (a crash or kill — a clean shutdown cancels its own queued eggs) are
+        recovered at startup through the same attested cancel path as
+        `run_stop` on a queued egg: terminal `cancelled`, manifest, Headcount
+        rows, attestation (1,1,1). Runs before the socket accepts, so no run
+        is left non-terminal across restarts. Returns the recovered run ids."""
+        if self.db is None or self.pipeline is None or self.audit is None:
+            return []
+        rows = self.db.execute(
+            "SELECT r.id, r.job_id, r.trigger, r.started_at, r.parent_run_id, j.spec_path, j.spec_hash"
+            " FROM runs r JOIN job_specs j ON j.id = r.job_id WHERE r.status = 'queued'"
+        ).fetchall()
+        recovered: list[str] = []
+        for run_id, job_id, trigger, started_at, parent_run_id, spec_path, digest in rows:
+            item: dict[str, Any] = {
+                "run_id": run_id,
+                "job_id": job_id,
+                "spec_path": spec_path or "",
+                "spec_hash": digest,
+                "trigger": trigger,
+                "weight": 1.0,
+                "started_at": started_at,
+                "via": "socket",
+            }
+            if parent_run_id:
+                item["parent_run_id"] = parent_run_id
+            with contextlib.suppress(Exception):
+                await self._cancel_item(
+                    item,
+                    reason=(
+                        "cancelled at startup — stale queued egg recovered after a coopd restart;"
+                        " the egg never hatched"
+                    ),
+                    spec=self._cancel_spec(item),
+                )
+            row = self.db.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if row is not None and row[0] in TERMINAL_STATES:
+                recovered.append(run_id)
+        if recovered:
+            self.audit.append(
+                {"event": "coopd.recovered", "count": len(recovered), "recovered": sorted(recovered)}
+            )
+        return recovered
 
     async def _run_item(self, item: dict[str, Any]) -> None:
         run_id = item["run_id"]
-        try:
-            assert self.pipeline is not None
-            await self.pipeline.execute(item)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # the pipeline guarantees teardown+attestation itself; this is a
-            # last-resort guard so a run never disappears from in_flight
-            with contextlib.suppress(Exception):
+        # spec 32/G24: the Hatchery's Headcount rows for this chicken carry
+        # the `via` actor the egg was queued through
+        with audit_via(str(item.get("via", "socket"))):
+            try:
                 assert self.pipeline is not None
-                await self.pipeline.execute_guard(run_id)
-        finally:
-            self.in_flight.pop(run_id, None)
+                await self.pipeline.execute(item)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # the pipeline guarantees teardown+attestation itself; this is a
+                # last-resort guard so a run never disappears from in_flight
+                with contextlib.suppress(Exception):
+                    assert self.pipeline is not None
+                    await self.pipeline.execute_guard(run_id)
+            finally:
+                self.in_flight.pop(run_id, None)
 
     # --- run inspection ops --------------------------------------------------
 
@@ -813,7 +1338,8 @@ class Daemon:
             "result": (
                 {
                     "valid": bool(res[0]),
-                    "artifacts_dir": res[1],
+                    # spec 32 (G17): `artifacts_dir` is daemon-internal state
+                    # (the DB column stays, schema v5) — never served
                     "schema_errors": json.loads(res[2]) if res[2] else None,
                 }
                 if res
@@ -863,6 +1389,7 @@ class Daemon:
             cost_usd = None
             max_cost_usd = None
             budget_outcome = None
+            pid = None
             if r[9]:
                 try:
                     manifest = json.loads(r[9])
@@ -871,6 +1398,11 @@ class Daemon:
                         if isinstance(auth, dict):
                             auth_mode = auth.get("mode")
                         status_reason = manifest.get("status_reason")
+                        # spec 32 (ticket 10): the chicken's pid, recorded at
+                        # hatch/spawn, mirrored in the manifest harness block
+                        harness = manifest.get("harness")
+                        if isinstance(harness, dict):
+                            pid = harness.get("pid")
                         # spec 30: feed-budget telemetry for the coop table
                         usage = manifest.get("usage")
                         if isinstance(usage, dict) and usage.get("cost_usd") is not None:
@@ -894,6 +1426,8 @@ class Daemon:
                     "result_valid": None if r[8] is None else bool(r[8]),
                     "auth_mode": auth_mode,
                     "status_reason": status_reason,
+                    # spec 32 (ticket 10): the chicken's pid recorded at spawn
+                    "pid": pid,
                     # spec 30: measured cost vs the egg's feed-budget cap
                     "cost_usd": cost_usd,
                     "max_cost_usd": max_cost_usd,
@@ -915,32 +1449,55 @@ class Daemon:
         run_id = str(req.get("run_id", ""))
         if self.db is None or self._run_row(run_id) is None:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"unknown chicken: {run_id!r}"}
-        events = self.db.execute(
-            "SELECT seq, ts, level, source, line FROM run_events WHERE run_id = ? ORDER BY seq",
-            (run_id,),
+        # spec 32 (G20): `runs_logs` serves a bounded tail — `limit` (default
+        # RUNS_LOGS_TAIL_DEFAULT, hard-capped at RUNS_LOGS_TAIL_MAX) newest
+        # events; the response reports the total stored and whether the tail
+        # was cut off or the log itself hit the per-chicken event cap
+        limit = req.get("limit", RUNS_LOGS_TAIL_DEFAULT)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": "runs_logs limit must be a positive integer",
+            }
+        limit = min(limit, RUNS_LOGS_TAIL_MAX)
+        total = self.db.execute(
+            "SELECT COUNT(*) FROM run_events WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        rows = self.db.execute(
+            "SELECT seq, ts, level, source, line FROM run_events WHERE run_id = ?"
+            " ORDER BY seq DESC LIMIT ?",
+            (run_id, limit),
         ).fetchall()
+        events = [
+            {"seq": e[0], "ts": e[1], "level": e[2], "source": e[3], "line": e[4]} for e in reversed(rows)
+        ]
         return {
             "ok": True,
             "op": "runs_logs",
             "protocol": PROTOCOL_VERSION,
             "run_id": run_id,
-            "events": [
-                {"seq": e[0], "ts": e[1], "level": e[2], "source": e[3], "line": e[4]} for e in events
-            ],
+            "events": events,
+            "limit": limit,
+            "total": total,
+            "truncated": total > len(events),
+            "capped": total >= MAX_RUN_EVENTS,
         }
 
     # --- spec 29: the Beak — read-only live view into a running chicken -------
 
-    def _workspace_peek(self, req: dict[str, Any]) -> dict[str, Any]:
+    async def _workspace_peek(self, req: dict[str, Any]) -> dict[str, Any]:
         """The Beak: a running chicken's workspace file tree (no ``path``), or
         one file's size-capped content (``path`` given, workspace-relative).
         Available only while the workspace exists — terminal runs answer a
         clear closed-beak error because the abattoir already removed the
         workspace. This socket op is the single place that touches workspace
         files; the coop web layer only mirrors it over the transport seam.
-        Path lock, size caps, and the private-config blocklist live in
-        ``beak.py``; tree paths are workspace-relative, so no host path ever
-        leaves the daemon in a payload."""
+        Path lock, resolved-target privacy, symlink/hardlink refusal, the
+        O_NOFOLLOW open, and the size caps live in ``beak.py``; tree paths are
+        workspace-relative, so no host path ever leaves the daemon in a
+        payload. spec 32 (G20): the tree walk runs off the event loop via
+        ``beak.workspace_tree_async``."""
         run_id = str(req.get("run_id", ""))
         if not run_id:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "workspace_peek requires run_id"}
@@ -985,7 +1542,9 @@ class Daemon:
                     "run_id": run_id,
                     "status": status,
                     "mode": "tree",
-                    "tree": beak.workspace_tree(ws),
+                    # spec 32 (G20): the walk is capped before sorting and runs
+                    # in a worker thread, never on this event loop
+                    "tree": await beak.workspace_tree_async(ws),
                 }
             rel = beak.safe_relpath(str(rel))
             if rel is None:
@@ -1020,10 +1579,15 @@ class Daemon:
             }
         except OSError as e:
             # raced with the abattoir: the workspace vanished mid-peek
+            # (spec 32 G17: the OS error's host path is redacted from the
+            # served payload — full detail stays in coopd's own log)
             return {
                 "ok": False,
                 "protocol": PROTOCOL_VERSION,
-                "error": f"the beak is closed: chicken {run_id!r} workspace disappeared mid-peek ({e})",
+                "error": (
+                    f"the beak is closed: chicken {run_id!r} workspace disappeared mid-peek"
+                    f" ({redact_host_paths(str(e), self.settings.data_dir)})"
+                ),
                 "workspace_gone": True,
                 "run_id": run_id,
             }
@@ -1048,7 +1612,7 @@ class Daemon:
             cur = row[0]
         return ancestors
 
-    async def _run_stop(self, req: dict[str, Any]) -> dict[str, Any]:
+    async def _run_stop(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
         """End a chicken deliberately. A queued egg is pulled from the pecking
         order → terminal `cancelled` (it never hatches); a chicken already in
         the Hatchery gets SIGTERM, then a hard kill → terminal `stopped`. Both
@@ -1057,7 +1621,12 @@ class Daemon:
 
         Spec 27: when the request carries `caller_run_id` (a Farmhand running
         inside a sub-chicken), a target that is one of the caller's ancestors
-        is refused — a sub-chicken cannot stop its ancestors."""
+        is refused — a sub-chicken cannot stop its ancestors.
+
+        Spec 32 (ticket 10, G8): on a chicken-owned connection (peer pid
+        resolved to a live chicken) `caller_run_id` is forced from the
+        authenticated peer — a client-sent value is ignored, so the
+        ancestor-stop refusal holds even against a direct socket caller."""
         run_id = str(req.get("run_id", ""))
         if not run_id:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "run_stop requires run_id"}
@@ -1074,6 +1643,11 @@ class Daemon:
                 "error": f"chicken {run_id!r} is already terminal ({status}) — nothing to stop",
             }
         caller_run_id = req.get("caller_run_id")
+        if caller is not None and caller.is_chicken:
+            # spec 32 (ticket 10, G8): forced from the peer credentials —
+            # the client-sent caller_run_id is ignored on a chicken-owned
+            # connection, so the ancestor refusal cannot be bypassed
+            caller_run_id = caller.run_id
         if caller_run_id:
             caller_run_id = str(caller_run_id)
             if run_id in self._ancestor_run_ids(caller_run_id):
@@ -1129,7 +1703,7 @@ class Daemon:
             "reason": reason,
         }
 
-    async def _run_rerun(self, req: dict[str, Any]) -> dict[str, Any]:
+    async def _run_rerun(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
         """Spec 22: enqueue the same egg as a fresh run (new run_id), with the
         lineage recorded (`rerun_of` on the queue item → manifest + the
         `egg.queued` Headcount row). The new run goes through the normal
@@ -1152,7 +1726,11 @@ class Daemon:
                 "protocol": PROTOCOL_VERSION,
                 "error": f"no spec path recorded for egg {job_id!r}; queue it again with `tc run <job.toml>`",
             }
-        resp = await self._enqueue({"spec_path": spec_path, "trigger": "rerun", "rerun_of": run_id})
+        if caller is not None and caller.is_chicken and not self._spec_path_allowlisted(Path(spec_path)):
+            # spec 32 (ticket 02, G1): the re-run path is allowlisted like any
+            # other spec_path on a chicken-owned connection
+            return self._spec_path_refusal()
+        resp = await self._enqueue({"spec_path": spec_path, "trigger": "rerun", "rerun_of": run_id}, caller)
         if resp.get("ok"):
             resp["op"] = "run_rerun"
             resp["rerun_of"] = run_id
@@ -1202,7 +1780,8 @@ class Daemon:
                 "quarantined": True,
                 "schema_errors": json.loads(schema_errors) if schema_errors else [],
                 "raw_output": output_json,
-                "artifacts_dir": artifacts_dir,
+                # spec 32 (G17): no `artifacts_dir` in served payloads — the
+                # quarantine location is daemon-internal state (DB column stays)
             }
         return {
             "ok": True,
@@ -1211,7 +1790,7 @@ class Daemon:
             "run_id": run_id,
             "valid": True,
             "output": json.loads(output_json),
-            "artifacts_dir": artifacts_dir,
+            # spec 32 (G17): no `artifacts_dir` in served payloads
         }
 
     # --- per-job usage stats (spec 08) ---------------------------------------
@@ -1626,14 +2205,32 @@ class Daemon:
 
     def _auth_logout(self, req: dict[str, Any]) -> dict[str, Any]:
         """Release a provider's stored perch seat (tokens removed, not
-        revoked) and audit `perch.released` — provider + mode only."""
+        revoked) and audit `perch.released` — provider + mode only. Spec 32
+        (review finding G2): the provider is validated against the provider
+        registry and the session path is contained inside the data dir
+        before any unlink (seat.py), so an unregistered or traversal
+        provider name is refused with a field-named `provider` error,
+        touches no file, and never records a `perch.released` row — the
+        Headcount only ever records a truthful release."""
         provider = str(req.get("provider", ""))
         if not provider:
-            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "auth_logout requires provider"}
+            msg = "auth_logout requires provider"
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": msg,
+                "errors": [{"field": "provider", "message": msg}],
+            }
         try:
             self._seat_broker().logout(provider)
         except SeatError as e:
-            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": str(e)}
+            msg = str(e)
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": msg,
+                "errors": [{"field": "provider", "message": msg}],
+            }
         assert self.audit is not None
         self.audit.append({"event": "perch.released", "provider": provider, "mode": "seat"})
         return {"ok": True, "op": "auth_logout", "protocol": PROTOCOL_VERSION, "provider": provider}
@@ -1746,7 +2343,8 @@ class Daemon:
         Validation reuses the existing spec loader, so errors come back
         field-named exactly like ``tc jobs validate`` (``trigger.schedule: …``);
         the bundle must additionally contain the files the spec references
-        (prompt, plain attachments — the loader itself checks the schema file;
+        (prompt, plain attachments, and — spec 32 ticket 02 — the schema file
+        as a bundle member, so candling cannot be aimed at a host file;
         spec 25 `nestbox://` attachments are resolved from the nest box at
         provisioning, not shipped in the bundle). The
         total decoded size is capped at ``UPLOAD_MAX_BYTES``. Invalid bundles
@@ -1823,13 +2421,48 @@ class Daemon:
             }
         # stage the bundle, validate with the existing loader, store on success
         uploads = self.settings.uploads_dir
+        # spec 32 (G11, the Fox): uploads are created restrictive — dirs 0700,
+        # files 0600 at creation (no umask window)
+        fox.ensure_dir(uploads)
         staging = uploads / f".staging-{uuid.uuid4().hex[:12]}"
         try:
-            staging.mkdir(parents=True, exist_ok=True)
+            fox.ensure_dir(staging)
             for rel, blob in decoded.items():
                 dest = staging / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(blob)
+                fox.ensure_dir(dest.parent)
+                fox.write_bytes_0600(dest, blob)
+            # spec 32 (ticket 02, G1): bundle schema membership — a
+            # Coop-uploaded egg must carry its own `schema_file` as a bundle
+            # member, checked before candling, so candling cannot be aimed at
+            # a host file and cannot silently pass-everything. A lexically
+            # unsafe ref is left to the loader's fence refusal below.
+            try:
+                _raw = tomllib.loads((staging / "job.toml").read_text(encoding="utf-8"))
+                _schema_ref = _raw.get("output", {}).get("schema_file")
+            except Exception:
+                _schema_ref = None  # unreadable TOML is reported by the loader
+            if (
+                isinstance(_schema_ref, str)
+                and safe_ref(_schema_ref) == _schema_ref
+                and _schema_ref not in decoded
+            ):
+                errors = [
+                    {
+                        "field": "output.schema_file",
+                        "message": (
+                            f"output.schema_file: schema file {_schema_ref!r} is not in the bundle —"
+                            " the egg's schema must ship with the egg; candling cannot be aimed at a"
+                            " host file"
+                        ),
+                    }
+                ]
+                self._audit_upload_rejected(errors)
+                return {
+                    "ok": False,
+                    "valid": False,
+                    "protocol": PROTOCOL_VERSION,
+                    "errors": errors,
+                }
             try:
                 spec = load_spec(staging / "job.toml")
             except SpecValidationError as e:
@@ -1865,6 +2498,20 @@ class Daemon:
                             "message": f"input.attachments: attachment {att!r} is not in the bundle",
                         }
                     )
+            if spec.output.schema_file not in decoded:
+                # spec 32 (ticket 02, G1): bundle schema membership — the
+                # schema file must ship with the egg (defense in depth next to
+                # the pre-candling check above; the loader already guarantees
+                # it exists inside the staged bundle)
+                errors.append(
+                    {
+                        "field": "output.schema_file",
+                        "message": (
+                            f"output.schema_file: schema file {spec.output.schema_file!r} is not in the"
+                            " bundle — the egg's schema must ship with the egg"
+                        ),
+                    }
+                )
             from turbochickens.models import model_issues
 
             model_errors, warnings = model_issues(spec, self.providers, None)
@@ -1895,7 +2542,9 @@ class Daemon:
                 "event": "egg.candled",
                 "job_id": spec.job.name,
                 "spec_hash": f"sha256:{digest}",
-                "spec_path": str(spec_path),
+                # spec 32 (G17): the Headcount carries the data-dir-relative
+                # uploads path only — never a host absolute path
+                "spec_path": display_relpath(spec_path, self.settings.data_dir),
                 "size_bytes": total,
                 "n_files": len(decoded),
             }
@@ -1943,31 +2592,39 @@ class Daemon:
                 await writer.wait_closed()
 
     async def _cron_fire(self, job_id: str, spec_path: str, spec_hash: str) -> None:
-        """APScheduler callback: submit a cron-triggered run over the socket."""
+        """APScheduler callback: submit a cron-triggered run over the socket.
+        Spec 32/G24: the Rooster stamps its own `via` actor — both the enqueue
+        it sends and the crow/miss rows it appends."""
         assert self.audit is not None
-        try:
-            resp = await self._loopback_request(
-                "enqueue", spec_path=spec_path, spec_hash=spec_hash, trigger="cron"
-            )
-        except Exception as e:
-            self.audit.append(
-                {"event": "rooster.missed", "job_id": job_id, "error": f"{type(e).__name__}: {e}"}
-            )
-            return
-        if resp.get("ok"):
-            self.audit.append(
-                {
-                    "event": "rooster.crowed",
-                    "job_id": job_id,
-                    "run_id": resp.get("run_id"),
-                    "spec_hash": f"sha256:{spec_hash}",
-                    "trigger": "cron",
-                }
-            )
-        else:
-            self.audit.append(
-                {"event": "rooster.missed", "job_id": job_id, "error": resp.get("error", "enqueue failed")}
-            )
+        with audit_via("rooster"):
+            try:
+                resp = await self._loopback_request(
+                    "enqueue", spec_path=spec_path, spec_hash=spec_hash, trigger="cron", via="rooster"
+                )
+            except Exception as e:
+                self.audit.append(
+                    {
+                        "event": "rooster.missed",
+                        "job_id": job_id,
+                        # spec 32 (G17): redact any host path from the served row
+                        "error": redact_host_paths(f"{type(e).__name__}: {e}", self.settings.data_dir),
+                    }
+                )
+                return
+            if resp.get("ok"):
+                self.audit.append(
+                    {
+                        "event": "rooster.crowed",
+                        "job_id": job_id,
+                        "run_id": resp.get("run_id"),
+                        "spec_hash": f"sha256:{spec_hash}",
+                        "trigger": "cron",
+                    }
+                )
+            else:
+                self.audit.append(
+                    {"event": "rooster.missed", "job_id": job_id, "error": resp.get("error", "enqueue failed")}
+                )
 
     def _load_schedules(self) -> None:
         """Re-register every persisted schedule with APScheduler on daemon start."""
@@ -1976,12 +2633,16 @@ class Daemon:
         for job_id, spec_path, spec_hash, expr in rows:
             self.cron.add(job_id, spec_path, spec_hash, expr)
 
-    async def _schedule_add(self, req: dict[str, Any]) -> dict[str, Any]:
+    async def _schedule_add(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
         """Register a job's cron trigger (from its spec) with the scheduler."""
         spec_path_raw = req.get("spec_path")
         if not spec_path_raw:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "schedule_add requires spec_path"}
         spec_path = Path(str(spec_path_raw))
+        if caller is not None and caller.is_chicken and not self._spec_path_allowlisted(spec_path):
+            # spec 32 (ticket 02, G1): same allowlist as enqueue on a
+            # chicken-owned connection — before the file is ever read
+            return self._spec_path_refusal()
         try:
             spec = load_spec(spec_path)
         except SpecValidationError as e:
@@ -2090,10 +2751,47 @@ class Daemon:
 
 
 async def run_daemon(settings: Settings) -> None:
-    """Run the daemon until shutdown op, SIGINT, or SIGTERM."""
-    daemon = Daemon(settings)
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
-            loop.add_signal_handler(sig, daemon.request_stop)
-    await daemon.serve()
+    """Run the daemon until shutdown op, SIGINT, or SIGTERM.
+
+    Spec 32 (G11, the Fox): the daemon establishes a restrictive umask
+    (0o077) at start — before any state is created — so every file it ever
+    creates (db + journals, Headcount, socket at bind, workspaces, results,
+    quarantine, uploads, injected configs) is owner-only from creation: no
+    umask window on any created state file. The previous umask is restored
+    on exit (matters for in-process/thread callers)."""
+    prev_umask = fox.apply_restrictive_umask()
+    try:
+        harden_daemon_process()
+        daemon = Daemon(settings)
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.add_signal_handler(sig, daemon.request_stop)
+        await daemon.serve()
+    finally:
+        os.umask(prev_umask)
+
+
+def harden_daemon_process() -> bool:
+    """Review G9 (spec 32 ticket 12): coopd marks itself non-dumpable
+    (``PR_SET_DUMPABLE = 0``) so a same-uid spawned Chicken cannot read
+    ``/proc/<coopd>/environ`` (or any other ``/proc/<coopd>/*`` file) for the
+    ambient secrets — the files of a non-dumpable process are root-owned and
+    require ``CAP_SYS_PTRACE``. Exec'd children (the chickens) are dumpable
+    again, which is fine: their own environ carries only the per-run env with
+    the Scratch-pointed HOME/XDG. Best effort, Linux only; returns whether the
+    flag was set."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl.restype = ctypes.c_int
+        libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        PR_SET_DUMPABLE = 4
+        ctypes.set_errno(0)
+        rc = libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)
+        return rc == 0
+    except Exception:
+        return False

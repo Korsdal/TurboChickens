@@ -22,6 +22,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from turbochickens.util import display_relpath
+
 SETTINGS_ENVVAR = "TURBOCHICKENS_SETTINGS"
 DEFAULT_DATA_DIR = Path("~/.turbochickens").expanduser()
 
@@ -33,6 +35,25 @@ DEFAULT_DATA_DIR = Path("~/.turbochickens").expanduser()
 UPLOAD_MAX_BYTES = 10 * 1024 * 1024
 UPLOAD_MAX_HTTP_BODY = UPLOAD_MAX_BYTES * 4 // 3 + 2 * 1024 * 1024
 SOCKET_STREAM_LIMIT = UPLOAD_MAX_HTTP_BODY + 1024 * 1024
+
+#: spec 32 (review finding G20): the Fence — resource caps so a malicious
+#: Chicken or remote client cannot DoS coopd. Bounded keepalive, connection
+#: count, and per-handler time on both listeners; a per-chicken cap on stored
+#: run events (the table is append-only, so the cap is enforced at insert)
+#: with a bounded `runs_logs` tail; and a cap on collected/stored harness
+#: output (the Clutch), which is stored truncated with a `truncated` marker
+#: instead of growing memory/DB/disk without bound.
+COOP_KEEPALIVE_TIMEOUT_SEC = 30.0  # idle keep-alive connections on the coop listener
+COOP_MAX_CONNECTIONS = 32  # concurrent in-flight coop requests
+COOP_HANDLER_TIMEOUT_SEC = 30.0  # one coop HTTP handler may not run longer
+SOCKET_MAX_CONNECTIONS = 16  # concurrent unix-socket clients
+SOCKET_IDLE_TIMEOUT_SEC = 300.0  # an idle socket connection is closed (keepalive cap)
+SOCKET_HANDLER_TIMEOUT_SEC = 60.0  # one socket op may not run longer
+MAX_RUN_EVENTS = 5_000  # stored run_events per chicken
+RUN_EVENT_LINE_MAX_LEN = 4_000  # stored event line length
+RUNS_LOGS_TAIL_DEFAULT = 500  # `runs_logs` serves the last N events by default
+RUNS_LOGS_TAIL_MAX = 5_000  # ...and never more than this, whatever is asked
+OUTPUT_MAX_BYTES = 1_048_576  # harness output (clutch) collected/stored cap: 1 MiB
 
 
 class SettingsError(Exception):
@@ -67,9 +88,21 @@ class Settings(BaseModel):
     coop_port: int = Field(default=8737, gt=0, le=65535)
     coop_auth_token: str | None = Field(
         default=None,
-        description="Shared bearer token for the coop HTTP surface. Required when bound "
-        "non-loopback; when unset there, an ephemeral token is generated at startup and "
-        "printed once to stdout. Never written to the audit log.",
+        description="Shared bearer token for the coop HTTP surface. Required on every bind "
+        "unless coop_loopback_open opts a loopback bind out; when required and unset, an "
+        "ephemeral token is generated at startup and printed once to stdout. Never written "
+        "to the audit log.",
+    )
+    # spec 32 (review G3): the coop requires the bearer on every bind by default —
+    # "loopback + no token → open" is not a trust boundary. This key is the explicit
+    # opt-in that restores the old rule: set it and bind loopback with no
+    # coop_auth_token configured, and the HTTP surface is open. Default false.
+    # Read-only at runtime (not in MUTABLE_SETTINGS_FIELDS).
+    coop_loopback_open: bool = Field(
+        default=False,
+        description="Opt in to the old loopback-open rule: with this set, a loopback coop "
+        "bind and no coop_auth_token configured, the HTTP surface is open. Default false — "
+        "the bearer is required on every bind.",
     )
 
     # spec 26 (Farmhand): the MCP server over the farm's own socket ops —
@@ -137,19 +170,22 @@ class Settings(BaseModel):
 
         Every field except secrets: `coop_auth_token` is deliberately omitted —
         it is never served, printed (beyond the one-time startup line), logged,
-        or audited. Paths are included as strings so the payload is JSON-safe.
+        or audited. Paths are served data-dir-relative (spec 32, G17): the keys
+        are the settings fields, but the values never carry a host absolute
+        path, so a remote GUI user does not learn the host filesystem layout.
         """
+        d = self.data_dir
         return {
-            "data_dir": str(self.data_dir),
-            "socket_path": str(self.socket_path),
-            "db_path": str(self.db_path),
-            "audit_log_path": str(self.audit_log_path),
-            "results_dir": str(self.results_dir),
-            "quarantine_dir": str(self.quarantine_dir),
-            "seats_dir": str(self.seats_dir),
-            "uploads_dir": str(self.uploads_dir),
-            "providers_path": str(self.providers_path) if self.providers_path else None,
-            "connectors_path": str(self.connectors_path) if self.connectors_path else None,
+            "data_dir": display_relpath(d, d),
+            "socket_path": display_relpath(self.socket_path, d),
+            "db_path": display_relpath(self.db_path, d),
+            "audit_log_path": display_relpath(self.audit_log_path, d),
+            "results_dir": display_relpath(self.results_dir, d),
+            "quarantine_dir": display_relpath(self.quarantine_dir, d),
+            "seats_dir": display_relpath(self.seats_dir, d),
+            "uploads_dir": display_relpath(self.uploads_dir, d),
+            "providers_path": display_relpath(self.providers_path, d) if self.providers_path else None,
+            "connectors_path": display_relpath(self.connectors_path, d) if self.connectors_path else None,
             "weight_budget_override": self.weight_budget_override,
             "weight_budget": self.weight_budget,
             "audit_retention": self.audit_retention,
@@ -158,6 +194,7 @@ class Settings(BaseModel):
             "coop_host": self.coop_host,
             "coop_port": self.coop_port,
             "coop_url": self.coop_url,
+            "coop_loopback_open": self.coop_loopback_open,
             "farmhand_transport": self.farmhand_transport,
             "farmhand_https_path": self.farmhand_https_path,
         }

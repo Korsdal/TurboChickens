@@ -118,7 +118,9 @@ def test_jobs_upload_socket_valid_bundle_stored_and_enqueueable(coop_daemon, fak
     events = AuditLog(coop_daemon.settings.audit_log_path).read_all()
     uploaded = [e for e in events if e["event"] == "egg.candled"]
     assert len(uploaded) == 1 and uploaded[0]["job_id"] == "upload-job"
-    assert uploaded[0]["spec_path"] == resp["spec_path"] and uploaded[0]["size_bytes"] > 0
+    # spec 32 (G17): the Headcount row carries the data-dir-relative path only
+    assert uploaded[0]["spec_path"] == (upload_dir / "job.toml").resolve().relative_to(coop_daemon.settings.data_dir.resolve()).as_posix()
+    assert uploaded[0]["size_bytes"] > 0
 
 
 # --- socket op: invalid bundle → field-named errors, nothing stored -----------
@@ -325,7 +327,7 @@ def test_upload_endpoints_require_bearer_when_auth_required(auth_daemon, tmp_pat
 
 
 def test_upload_endpoints_daemon_down_payload_not_500(tmp_path, monkeypatch) -> None:
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     port = settings.coop_port
@@ -382,7 +384,7 @@ def test_spa_serves_jobs_upload_form_and_no_host_paths(coop_daemon, tmp_path) ->
 
 def test_e2e_create_run_and_read_job_entirely_over_http(tmp_path, monkeypatch) -> None:
     port = free_port()
-    f = write_settings(tmp_path, coop_port=port)  # `tc coop start` forces coop on
+    f = write_settings(tmp_path, coop_port=port, coop_loopback_open=True)  # `tc coop start` forces coop on; the opt-in keeps the loopback bind open
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     bin_path = tmp_path / "fake-vibe"
     bin_path.write_text(FAKE_VIBE)

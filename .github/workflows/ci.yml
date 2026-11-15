@@ -1,0 +1,59 @@
+# CI — spec 32 ticket 17 (review finding G13).
+#
+# The full test suite runs on every push and pull request across the two
+# supported Python versions. The suite is loopback-only and needs no Docker
+# daemon, so a test job is plain checkout + setup-uv + `uv sync --frozen` +
+# pytest. A separate audit job runs the dependency audit against the pinned
+# lock and diffs the image's dependencies against that lock (tests/test_ci.py
+# + tests/test_supply_chain.py — the supply-chain check from ticket 16).
+#
+# Actions are pinned by commit SHA (tag in the comment), not by floating tag.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up uv and Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Install dependencies from the frozen lock
+        run: uv sync --frozen
+      - name: Run the full test suite (no Docker daemon required)
+        run: .venv/bin/python -m pytest -q
+
+  audit:
+    name: dependency audit + image-vs-lock
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up uv and Python 3.13
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+      - name: Install dependencies from the frozen lock
+        run: uv sync --frozen
+      - name: Assert the lock is current with pyproject.toml
+        run: uv lock --check
+      - name: Audit pinned dependencies against public advisories
+        run: uv audit
+      - name: Diff image dependencies against the pinned lock
+        run: .venv/bin/python -m pytest -q tests/test_ci.py tests/test_supply_chain.py

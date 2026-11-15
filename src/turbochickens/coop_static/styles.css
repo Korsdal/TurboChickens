@@ -18,8 +18,10 @@
   --radius-l: 20px;
   --sidebar-w: 240px;
   --gut: clamp(20px, 4vw, 48px);
-  --font-sans: "Geist", system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* system font stack only — no third-party font fetch (no Referer leak,
+     no MITM surface on plain http) */
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
 
 * { box-sizing: border-box; }

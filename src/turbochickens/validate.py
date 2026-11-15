@@ -33,21 +33,31 @@ def _error_path(error: Any) -> str:
     return "/".join(str(p) for p in error.absolute_path) or "<root>"
 
 
-def validate_output(raw_output: str, schema_path: str | Path) -> OutputValidation:
+def validate_output(raw_output: str, schema_path: str | Path, schema_name: str | None = None) -> OutputValidation:
     """Validate `raw_output` against the JSON schema at `schema_path`.
 
     Draft 2020-12 with format assertions enabled (e.g. `format: date-time`).
     Each schema error is reported as ``<json path>: <message>``.
+
+    Spec 32 (G17): schema errors are served (results, run logs, Headcount), so
+    they report the schema by its spec-relative `schema_name` (default: the
+    file name) — never the host absolute path, which stays in coopd's own log.
     """
+    name = schema_name if schema_name is not None else Path(schema_path).name
     try:
         parsed = json.loads(raw_output)
     except ValueError as e:
         return OutputValidation(valid=False, schema_errors=[f"<output>: not valid JSON: {e}"])
     try:
         schema = json.loads(Path(schema_path).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
+    except OSError as e:
         return OutputValidation(
-            valid=False, schema_errors=[f"<schema>: cannot load schema from {schema_path}: {e}"]
+            valid=False,
+            schema_errors=[f"<schema>: cannot load schema {name!r}: {e.strerror or type(e).__name__}"],
+        )
+    except ValueError as e:
+        return OutputValidation(
+            valid=False, schema_errors=[f"<schema>: cannot load schema {name!r}: {e}"]
         )
     try:
         Draft202012Validator.check_schema(schema)  # raises on a broken schema (incl. UnknownType)

@@ -90,7 +90,7 @@ print(json.dumps({"message": "hello from fake vibe", "echo": prompt.strip()[:40]
 
 @pytest.fixture
 def coop_daemon(tmp_path, monkeypatch):
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     dt = DaemonThread(settings)
@@ -421,7 +421,7 @@ def test_workspace_endpoint_bearer_401_when_auth_required(auth_daemon, beak_vibe
 
 
 def test_workspace_endpoint_daemon_down_payload_not_500(tmp_path, monkeypatch) -> None:
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     port = settings.coop_port
@@ -475,7 +475,7 @@ def test_spa_serves_beak_tab_and_no_host_paths(coop_daemon, tmp_path) -> None:
 
 def test_e2e_peek_running_chicken_then_beak_closes_on_stop(tmp_path, monkeypatch) -> None:
     port = free_port()
-    f = write_settings(tmp_path, coop_port=port)  # `tc coop start` forces coop on
+    f = write_settings(tmp_path, coop_port=port, coop_loopback_open=True)  # `tc coop start` forces coop on; opt-in keeps the loopback bind open
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     bin_path = tmp_path / "fake-vibe-beak"
     bin_path.write_text(BEAK_VIBE)

@@ -22,13 +22,19 @@ Transports (settings ``farmhand_transport``, CLI ``--transport``):
   the 0600 daemon socket, so same-machine agents only.
 - ``https`` — streamable-HTTP at ``farmhand_https_path`` (default ``/mcp``)
   served from the coop process on the **existing listener**, behind the same
-  bearer middleware as ``/api/*`` (loopback + no token → open; non-loopback
-  or any configured token → 401 without ``Authorization: Bearer …``). The
+  bearer middleware as ``/api/*`` (bearer required on every bind by default;
+  loopback + no token → open only with the ``coop_loopback_open`` opt-in —
+  401 without ``Authorization: Bearer …``, compared in constant time). The
   SDK's Starlette app is mounted into the coop's aiohttp server through a
   small ASGI bridge (``asgi_request``), so no second server/port is needed.
 - ``both`` — the two at once (``tc farmhand serve --transport both`` runs the
   stdio server and the HTTPS endpoint in one process; a coopd with
   ``coop_enabled`` serves ``/mcp`` alongside the GUI).
+
+In every transport mode stdout stays protocol-only: all informational output —
+including the ephemeral coop-token notice — goes to stderr, so the stdio MCP
+channel stays clean in ``both`` mode and the bearer never lands in client-side
+logs.
 
 Secrecy: no tool result ever contains token/seat/device-code material — the
 socket ops already guarantee that (``settings_get`` omits ``coop_auth_token``,
@@ -62,9 +68,16 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import web
 from mcp.server.mcpserver import MCPServer
 
-from turbochickens import client
+from turbochickens import client, fox
 from turbochickens.client import DaemonUnreachable
-from turbochickens.settings import SOCKET_STREAM_LIMIT, UPLOAD_MAX_HTTP_BODY, Settings
+from turbochickens.settings import (
+    COOP_HANDLER_TIMEOUT_SEC,
+    COOP_KEEPALIVE_TIMEOUT_SEC,
+    COOP_MAX_CONNECTIONS,
+    SOCKET_STREAM_LIMIT,
+    UPLOAD_MAX_HTTP_BODY,
+    Settings,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from turbochickens.adapter import RunContext
@@ -112,7 +125,10 @@ def spec_bundle_b64(spec_path: Path) -> dict[str, str]:
 
 #: spec 27: tools a sub-chicken's Farmhand does NOT expose — schedule/auth/
 #: settings changes, bundle candling, and re-run are operator-side chores; a
-#: sub gets enqueue + read tools (plus the guarded run_stop)
+#: sub gets enqueue + read tools (plus the guarded run_stop). Spec 32 ticket 11
+#: (review G8 scope) enforces the same scope server-side: the daemon refuses
+#: these (and every other operator-only socket op) on any chicken-owned
+#: connection, so the narrowing does not rely on this client-side list alone.
 SUB_SCOPE_EXCLUDED = ("jobs_validate", "run_rerun", "schedule_add", "schedule_list", "schedule_rm", "settings_get")
 
 
@@ -207,19 +223,22 @@ def attach_farmhand_to_run(run: "RunContext", settings: Settings) -> dict[str, A
     Returns the manifest block describing the attachment."""
     command, args = farmhand_serve_command()
     vibe_dir = run.workspace / ".vibe"
-    vibe_dir.mkdir(parents=True, exist_ok=True)
+    # spec 32 (G11, the Fox): the injected harness config is written
+    # restrictive — .vibe 0700, config.toml and the farmhand settings file
+    # 0600 at creation (resolved secrets live in the merged config)
+    fox.ensure_dir(vibe_dir)
     config_path = vibe_dir / "config.toml"
-    config_path.write_text(
+    fox.write_text_0600(
+        config_path,
         "# spec 27 (ChickenSubs): the Farmhand attached to this chicken's harness\n"
         "# runtime over stdio — enqueue sub-eggs and read the flock through the\n"
         "# farm's own contract. Spawned by the harness with the run's env.\n"
         "[mcp_servers.farmhand]\n"
         f"command = {_toml_value(command)}\n"
         f"args = [{', '.join(_toml_value(a) for a in args)}]\n",
-        encoding="utf-8",
     )
     settings_path = run.workspace / ".tc-farmhand-settings.toml"
-    settings_path.write_text(settings_toml_for_farmhand(settings), encoding="utf-8")
+    fox.write_text_0600(settings_path, settings_toml_for_farmhand(settings))
     run.env["TURBOCHICKENS_SETTINGS"] = str(settings_path)
     if run.parent_run_id:
         run.env["TURBOCHICKENS_PARENT_RUN_ID"] = run.parent_run_id
@@ -251,12 +270,18 @@ def build_server(
     sub_scope = caller_parent_run_id is not None
 
     async def call(op: str, timeout: float = 10.0, **payload: Any) -> dict[str, Any]:
+        # spec 32 / review G24: the Headcount `via` actor is stamped by the
+        # Farmhand layer, outside the client-writable tool arguments — a
+        # `via` key smuggled into a tool payload is dropped, never forwarded
+        payload.pop("via", None)
         try:
-            return await asyncio.wait_for(client.request_async(socket_path, op, **payload), timeout)
+            # the round-trip timeout is enforced inside request_async (spec 32
+            # ticket 18), which maps its own timeout to DaemonUnreachable — so
+            # there is no separate TimeoutError branch to catch here (it was
+            # dead code after that refactor)
+            return await client.request_async(socket_path, op, timeout=timeout, via="farmhand", **payload)
         except DaemonUnreachable as e:
             return {"ok": False, "op": op, "daemon": {"up": False}, "error": str(e)}
-        except TimeoutError:
-            return {"ok": False, "op": op, "error": f"coopd did not answer {op!r} within {timeout}s"}
 
     server = MCPServer(
         name=FARMHAND_NAME,
@@ -456,6 +481,10 @@ async def asgi_request(app: Any, request: web.Request) -> web.StreamResponse:
                 for k, v in message.get("headers", [])
                 if k.lower() not in _HOP_BY_HOP
             ]
+            # spec 32 (G21): the streamed MCP response is built header-complete —
+            # the Fence's security headers included (a prepared StreamResponse
+            # can no longer take headers in a middleware)
+            headers.extend(fox.SECURITY_HEADERS.items())
             resp = web.StreamResponse(status=message["status"], headers=headers)
             await resp.prepare(request)
         elif message["type"] == "http.response.body":
@@ -471,16 +500,65 @@ async def asgi_request(app: Any, request: web.Request) -> web.StreamResponse:
     finally:
         disconnect.set()
     if resp is None:  # the app returned without responding — never a broken page
-        resp = web.StreamResponse(status=500)
+        resp = web.StreamResponse(status=500, headers=dict(fox.SECURITY_HEADERS))
         await resp.prepare(request)
         await resp.write_eof()
     return resp
 
 
+#: spec 32 (G20, the Fence) — in-flight requests on the standalone HTTPS
+#: runner, same cap as the coop listener (over the cap → 503)
+_active_https_requests = 0
+
+
+@web.middleware
+async def _caps_middleware(request: web.Request, handler):
+    """Spec 32 (reviewer finding): the standalone ``tc farmhand serve
+    --transport https`` runner gets the same Fence caps the coop listener
+    got (G20) — a connection-count cap (503) and a per-handler timeout
+    (504). The Farmhand MCP path itself (a long-lived SSE stream) is exempt
+    from the per-handler timeout, exactly like on the coop listener; it stays
+    bounded by the connection cap and the runner's shutdown_timeout."""
+    global _active_https_requests
+    if _active_https_requests >= COOP_MAX_CONNECTIONS:
+        return web.json_response(
+            {
+                "ok": False,
+                "error": (
+                    f"the fence is full: the farmhand serves at most {COOP_MAX_CONNECTIONS} requests"
+                    " at once — retry shortly"
+                ),
+            },
+            status=503,
+        )
+    _active_https_requests += 1
+    try:
+        mcp_path = request.app.get("farmhand_https_path") or "/mcp"
+        if request.path == mcp_path or request.path.startswith(mcp_path + "/"):
+            return await handler(request)  # SSE stream: no per-handler timeout
+        try:
+            async with asyncio.timeout(COOP_HANDLER_TIMEOUT_SEC):
+                return await handler(request)
+        except TimeoutError:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": (
+                        f"the Fox cut the request short after {COOP_HANDLER_TIMEOUT_SEC:g}s"
+                        " — the farmhand is swamped, retry"
+                    ),
+                },
+                status=504,
+            )
+    finally:
+        _active_https_requests -= 1
+
+
 class FarmhandHTTP:
     """The Farmhand's streamable-HTTP endpoint (spec 26): the MCP server's
     Starlette app mounted at ``farmhand_https_path`` on the coop listener,
-    behind the same bearer rule as ``/api/*`` (loopback + no token → open).
+    behind the same bearer rule as ``/api/*`` (bearer required on every bind
+    by default; loopback-open only via the ``coop_loopback_open`` opt-in).
 
     Used two ways: mounted into the coop's aiohttp app (``handler`` +
     ``wants``), or standalone as the HTTPS side of ``tc farmhand serve``
@@ -553,10 +631,13 @@ class FarmhandHTTP:
     @web.middleware
     async def auth_middleware(self, request: web.Request, handler):
         """The coop bearer rule for the Farmhand endpoint (standalone mode):
-        required when non-loopback or a token is configured; loopback + no
-        token → open, exactly like /api/*. The token is never logged."""
+        required on every bind by default; loopback + no token → open only
+        with the ``coop_loopback_open`` opt-in, exactly like /api/*. The
+        comparison is constant-time (review G19). The token is never logged."""
         if self.auth.required and self.wants(request.path):
-            if request.headers.get("Authorization", "") != f"Bearer {self.auth.token}":
+            from turbochickens.coop import bearer_matches
+
+            if not bearer_matches(request.headers.get("Authorization", ""), self.auth.token or ""):
                 return web.json_response(
                     {"ok": False, "error": "unauthorized: send Authorization: Bearer <token>"}, status=401
                 )
@@ -584,18 +665,29 @@ async def serve_https(settings: Settings) -> None:
     (coop_host:coop_port at farmhand_https_path), same bearer rule as /api/*."""
     farmhand = FarmhandHTTP(settings)
     await farmhand.start()
-    app = web.Application(middlewares=[farmhand.auth_middleware], client_max_size=UPLOAD_MAX_HTTP_BODY)
+    # spec 32 (G21): the Fence's security headers on every response of this
+    # listener too (the streamed MCP responses get them in asgi_request)
+    app = web.Application(
+        middlewares=[fox.security_headers_middleware, farmhand.auth_middleware, _caps_middleware],
+        client_max_size=UPLOAD_MAX_HTTP_BODY,
+    )
+    app["farmhand_https_path"] = farmhand.path
     app.router.add_route("*", farmhand.path, farmhand.handler)
     app.router.add_route("*", farmhand.path + "/", farmhand.handler)
     # shutdown_timeout bounds the handler drain at cleanup (a hung MCP SSE
-    # stream must never wedge the process)
-    runner = web.AppRunner(app, shutdown_timeout=15.0)
+    # stream must never wedge the process); spec 32 (G20): the keepalive cap
+    # matches the coop listener, so idle holds cannot pile up here either
+    runner = web.AppRunner(
+        app, shutdown_timeout=15.0, keepalive_timeout=COOP_KEEPALIVE_TIMEOUT_SEC
+    )
     await runner.setup()
     site = web.TCPSite(runner, settings.coop_host, settings.coop_port)
     await site.start()
     if farmhand.auth.required and farmhand.auth.ephemeral:
-        # printed exactly once, at startup; never logged or audited
-        print(f"coop auth token: {farmhand.auth.token}", flush=True)
+        # printed exactly once, at startup; never logged or audited. stderr
+        # only: stdout is the stdio MCP protocol channel in "both" mode, so the
+        # bearer must never land there (or in client-side logs of it)
+        print(f"coop auth token: {farmhand.auth.token}", file=sys.stderr, flush=True)
     try:
         await asyncio.Event().wait()
     finally:

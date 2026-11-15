@@ -120,7 +120,7 @@ def test_status_reports_up_empty_queue_zero_in_flight(daemon) -> None:
     assert resp["queue_depth"] == 0
     assert resp["in_flight"] == []
     assert resp["weight_budget"] == 4  # from the fixture's settings override
-    assert resp["socket"] == str(daemon.settings.socket_path)
+    assert resp["socket"] == "daemon.sock"  # spec 32 (G17): data-dir-relative, no host path
 
 
 def test_unknown_op_returns_error(daemon) -> None:
