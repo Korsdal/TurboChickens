@@ -19,12 +19,30 @@ registry tmp, seat sessions, results/quarantine artifacts, injected config
 files) are 0600. On a multi-user host other local users can no longer read
 Clutches, quarantine, the Headcount, or a live Chicken's resolved Gate
 secrets.
+
+Spec 32 / review finding G21 (security headers): **every response the Coop
+serves carries the Fence's security headers** — `Content-Security-Policy:
+default-src 'self'` (the SPA is fully self-contained; no third-party runtime
+fetches), `X-Frame-Options: DENY` (the Coop is never framed), and
+`X-Content-Type-Options: nosniff` — including error responses (401/403/404/
+413/503/504) and the streamed MCP responses of the Farmhand endpoint (those
+are built header-complete in `farmhand.asgi_request`, because a prepared
+streaming response can no longer take headers).
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+
+from aiohttp import web
+
+#: spec 32 (review G21): security headers on every Coop/Farmhand HTTP response
+SECURITY_HEADERS: dict[str, str] = {
+    "Content-Security-Policy": "default-src 'self'",
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+}
 
 #: umask established by the daemon at start: every created file/dir is
 #: owner-only from creation (0o777 & ~0o077 = 0o700 dirs, 0o666 & ~0o077 = 0o600 files)
@@ -92,3 +110,27 @@ def open_append_0600(path: str | Path, mode: int = FILE_MODE) -> int:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, mode)
     os.fchmod(fd, mode)
     return fd
+
+
+def apply_security_headers(resp: web.StreamResponse) -> None:
+    """Set the Fence's security headers on a response that is not yet prepared
+    (a prepared streaming response already went on the wire — it gets its
+    headers at construction, see `farmhand.asgi_request`)."""
+    if resp.prepared:
+        return
+    for key, value in SECURITY_HEADERS.items():
+        resp.headers[key] = value
+
+
+@web.middleware
+async def security_headers_middleware(request: web.Request, handler):
+    """aiohttp middleware (spec 32 / review G21): the security headers go on
+    **every** response — the handler's, an early middleware refusal (401/403/
+    503/504 …), and an HTTPException raised anywhere inside. Register it first
+    in the app's middleware list so it wraps everything."""
+    try:
+        resp = await handler(request)
+    except web.HTTPException as e:
+        resp = e
+    apply_security_headers(resp)
+    return resp

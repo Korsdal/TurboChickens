@@ -471,6 +471,10 @@ async def asgi_request(app: Any, request: web.Request) -> web.StreamResponse:
                 for k, v in message.get("headers", [])
                 if k.lower() not in _HOP_BY_HOP
             ]
+            # spec 32 (G21): the streamed MCP response is built header-complete —
+            # the Fence's security headers included (a prepared StreamResponse
+            # can no longer take headers in a middleware)
+            headers.extend(fox.SECURITY_HEADERS.items())
             resp = web.StreamResponse(status=message["status"], headers=headers)
             await resp.prepare(request)
         elif message["type"] == "http.response.body":
@@ -486,7 +490,7 @@ async def asgi_request(app: Any, request: web.Request) -> web.StreamResponse:
     finally:
         disconnect.set()
     if resp is None:  # the app returned without responding — never a broken page
-        resp = web.StreamResponse(status=500)
+        resp = web.StreamResponse(status=500, headers=dict(fox.SECURITY_HEADERS))
         await resp.prepare(request)
         await resp.write_eof()
     return resp
@@ -603,7 +607,12 @@ async def serve_https(settings: Settings) -> None:
     (coop_host:coop_port at farmhand_https_path), same bearer rule as /api/*."""
     farmhand = FarmhandHTTP(settings)
     await farmhand.start()
-    app = web.Application(middlewares=[farmhand.auth_middleware], client_max_size=UPLOAD_MAX_HTTP_BODY)
+    # spec 32 (G21): the Fence's security headers on every response of this
+    # listener too (the streamed MCP responses get them in asgi_request)
+    app = web.Application(
+        middlewares=[fox.security_headers_middleware, farmhand.auth_middleware],
+        client_max_size=UPLOAD_MAX_HTTP_BODY,
+    )
     app.router.add_route("*", farmhand.path, farmhand.handler)
     app.router.add_route("*", farmhand.path + "/", farmhand.handler)
     # shutdown_timeout bounds the handler drain at cleanup (a hung MCP SSE
