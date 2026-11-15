@@ -1,7 +1,10 @@
 """Load, validate, and hash TOML job specs.
 
 File references inside a spec (e.g. ``output.schema_file``) resolve relative
-to the directory containing the spec file.
+to the directory containing the spec file — and are contained to it: spec 32
+(G1) refuses at Candling any ref (`prompt_file`, plain `attachments`,
+`schema_file`) that would leave the egg's own directory (the Fence rule in
+``fence.py``).
 """
 
 from __future__ import annotations
@@ -14,6 +17,8 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from turbochickens.chaining import is_nestbox_uri
+from turbochickens.fence import UnsafeRefError, contained_ref
 from turbochickens.spec.model import JobSpec
 
 
@@ -62,9 +67,36 @@ def load_spec(path: str | Path) -> JobSpec:
 
 
 def _check_file_refs(spec_path: Path, spec: JobSpec) -> list[SpecIssue]:
+    """Candling-time containment (spec 32, G1): every file ref in the spec —
+    ``input.prompt_file``, each non-nestbox ``input.attachments`` entry, and
+    ``output.schema_file`` — must stay inside the egg's own directory. The
+    shared Fence rule applies (lexical safe-ref + resolved containment,
+    symlink-safe), so a ref can never name a host file outside the egg dir
+    (`..`, absolute paths, backslashes, and symlink escapes are all refused).
+    Refusals are field-named errors with Fox copy per ``docs/lexicon.md``.
+
+    This is validation only — it never alters the spec's fields, so the spec
+    hash (and the shipped example's ``sha256:18efbd8c…80b959``) is unchanged.
+    Nestbox ``nestbox://…`` attachments carry no host path and are skipped here.
+    """
     issues: list[SpecIssue] = []
-    schema = spec_path.parent / spec.output.schema_file
-    if not schema.is_file():
+    base = spec_path.parent
+    refs: list[tuple[str, str]] = [("input.prompt_file", spec.input.prompt_file)]
+    for att in spec.input.attachments:
+        # spec 25: a nestbox:// attachment is resolved from the nest box at
+        # provisioning — it names no host file, so the fence does not apply
+        if not is_nestbox_uri(att):
+            refs.append(("input.attachments", att))
+    refs.append(("output.schema_file", spec.output.schema_file))
+    refused: set[str] = set()
+    for field, ref in refs:
+        try:
+            contained_ref(base, ref, field)
+        except UnsafeRefError as e:
+            refused.add(field)
+            issues.append(SpecIssue(tuple(field.split(".")), e.fox))
+    schema = contained_ref(base, spec.output.schema_file, "output.schema_file") if "output.schema_file" not in refused else None
+    if schema is not None and not schema.is_file():
         issues.append(
             SpecIssue(
                 ("output", "schema_file"),

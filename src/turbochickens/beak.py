@@ -32,6 +32,11 @@ import os
 from pathlib import Path
 from typing import Any
 
+# spec 32 (G1): the path lock mechanics are the shared Fence idiom
+# (`fence.py`) — the Beak's lock was the reference implementation, so the
+# two names below delegate to it and stay byte-stable for callers.
+from turbochickens.fence import resolve_contained, safe_ref
+
 #: spec 29: cap on served bytes of one workspace file per peek
 WORKSPACE_PEEK_MAX_BYTES = 64 * 1024
 
@@ -51,15 +56,9 @@ BEAK_PRIVATE_FILES = frozenset({".tc-farmhand-settings.toml"})
 def safe_relpath(path: str) -> str | None:
     """Normalize one requested workspace path: relative, POSIX, no empty/'.'/'..'
     segments, no backslash or NUL, not absolute. Returns the normalized relative
-    path, or None when the request tries to leave the workspace."""
-    if not isinstance(path, str) or not path or path != path.strip():
-        return None
-    if path.startswith("/") or "\\" in path or "\x00" in path:
-        return None
-    parts = path.split("/")
-    if any(part in ("", ".", "..") for part in parts):
-        return None
-    return "/".join(parts)
+    path, or None when the request tries to leave the workspace.
+    (spec 32: delegates to the shared Fence rule in ``fence.py``.)"""
+    return safe_ref(path)
 
 
 def is_private_relpath(rel: str) -> bool:
@@ -76,14 +75,9 @@ def resolve_locked(root: Path, rel: str) -> Path | None:
     The request must first pass ``safe_relpath`` (no ``..``/absolute/backslash),
     and the resolved target must additionally stay inside the resolved root —
     symlink-safe: a link pointing out of the workspace resolves outside and is
-    refused. Returns the resolved path, or None on any escape."""
-    if safe_relpath(rel) != rel:
-        return None
-    root_resolved = root.resolve()
-    target = (root_resolved / rel).resolve()
-    if target == root_resolved or root_resolved in target.parents:
-        return target
-    return None
+    refused. Returns the resolved path, or None on any escape.
+    (spec 32: delegates to the shared Fence rule in ``fence.py``.)"""
+    return resolve_contained(root, rel)
 
 
 def workspace_tree(root: Path) -> dict[str, Any]:
