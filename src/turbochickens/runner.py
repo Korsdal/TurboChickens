@@ -877,16 +877,27 @@ class RunPipeline:
         result = await exec_task
         return result, None
 
-    async def cancel_queued(self, item: dict[str, Any]) -> None:
+    async def cancel_queued(
+        self,
+        item: dict[str, Any],
+        reason: str | None = None,
+        spec: JobSpec | None = None,
+    ) -> None:
         """Spec 22: terminal-cancel an egg that was still in the pecking order.
         It never hatches (no harness events, no `egg.hatched`), but it still
         gets a manifest and the abattoir's attestation exactly like any
         terminal state — nothing was spawned or provisioned, so the
-        attestation verifies that (1, 1, 1)."""
+        attestation verifies that (1, 1, 1).
+
+        Spec 32 ticket 20 (G16): the same attested path also cancels eggs
+        still queued at coopd shutdown and stale queued rows recovered at
+        startup — pass ``reason`` for those; pass ``spec`` when the egg file
+        may be gone (the stored ``spec_toml`` was already candled)."""
         run_id = item["run_id"]
-        reason = sanitize_log_line("cancelled while queued — the egg never hatched")
+        reason = sanitize_log_line(reason or "cancelled while queued — the egg never hatched")
         now = utcnow_iso()
-        spec = load_spec(item["spec_path"])
+        if spec is None:
+            spec = load_spec(item["spec_path"])
         manifest: dict[str, Any] = {
             "run_id": run_id,
             "job_id": item["job_id"],

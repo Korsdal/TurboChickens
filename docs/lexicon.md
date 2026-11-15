@@ -26,6 +26,7 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 | **Abattoir** | De-provisioning with attested, verifiable teardown | teardown / destruction |
 | **Compost** | Retention — old Clutches rot away; audit records stay forever | `retention.py` |
 | **Cancelled** | An Egg pulled from the Pecking Order before it hatches — terminal, never hatches, still abattoir-attested | `cancelled` run state / `run_stop` on a queued egg / `egg.cancelled` |
+| **Recovered** | A stale row left behind by a dead Coopd, re-resolved at startup — a queued Egg becomes `cancelled` with attestation exactly like `run_stop` (at shutdown the still-queued Eggs are cancelled the same way), and any non-terminal row the live Coopd does not own shows up in the status alerts | startup stale-row recovery / shutdown queue drain / Headcount `coopd.recovered` |
 | **Stopped** | A Chicken ended deliberately by the operator — SIGTERM, then hard kill, with the Abattoir's attested teardown | `stopped` run state / `run_stop` on a running chicken / `chicken.stopped` |
 | **Re-run** | Hatching the same Egg again as a fresh Chicken, new run ID, lineage recorded | `run_rerun` / manifest `rerun_of` |
 | **Chaining** | An Egg consuming an earlier Chicken's Clutch via a `nestbox://<run_id>/output.json` attachment — resolved from the Nest Box at provisioning, valid clutches only | `chaining.py`, manifest `chaining`, Headcount `clutch.consumed` |

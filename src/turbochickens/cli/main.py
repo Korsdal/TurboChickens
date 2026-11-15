@@ -279,7 +279,10 @@ def status(
     typer.echo(f"in_flight: {len(in_flight)}")
     alerts = resp.get("alerts", [])
     if alerts:
-        err_console.print(f"[bold red]alerts[/bold red]: {len(alerts)} terminal chicken(s) without an abattoir attestation: {', '.join(alerts)}")
+        err_console.print(
+            f"[bold red]alerts[/bold red]: {len(alerts)} chicken(s) needing attention"
+            f" (terminal without an abattoir attestation, or stranded non-terminal): {', '.join(alerts)}"
+        )
     else:
         typer.echo("alerts: 0")
     retention = resp.get("retention") or {}
