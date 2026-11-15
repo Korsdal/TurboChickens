@@ -37,6 +37,7 @@ from pathlib import Path
 import pytest
 
 from test_daemon import DaemonThread
+from test_run_e2e import upload_egg
 from turbochickens.client import request
 from turbochickens.runner import TERMINAL_STATES
 from turbochickens.settings import load_settings
@@ -274,11 +275,16 @@ def test_enqueue_lineage_forced_from_peer_not_client(daemon, tmp_path) -> None:
     sock = daemon.settings.socket_path
     egg = write_job(tmp_path, "plain-egg", prompt="Say hello")
     subs_egg = write_job(tmp_path, "subs-egg", prompt="Say hello", spawn_subs=True)
+    # spec 32 (ticket 02): a chicken-owned connection may only queue
+    # allowlisted spec paths — the operator registers the eggs in the coop
+    # uploads area first, and the chicken enqueues those stored paths
+    egg_up = upload_egg(sock, egg)
+    subs_up = upload_egg(sock, subs_egg)
     prompt = (
         f"PEERPROBE {sock}\n"
-        f"enqueue {egg}\n"
-        f"enqueue-forge {egg} run-forged\n"
-        f"enqueue {subs_egg}\n"
+        f"enqueue {egg_up}\n"
+        f"enqueue-forge {egg_up} run-forged\n"
+        f"enqueue {subs_up}\n"
     )
     prober = write_job(tmp_path, "prober", prompt=prompt)
     run_id = request(sock, "enqueue", spec_path=str(prober), timeout=5.0)["run_id"]
@@ -287,16 +293,16 @@ def test_enqueue_lineage_forced_from_peer_not_client(daemon, tmp_path) -> None:
 
     probes = probe_report(sock, run_id)
     # enqueue with NO lineage field from a chicken → forced from the peer
-    r1 = probes[f"enqueue {egg}"]
+    r1 = probes[f"enqueue {egg_up}"]
     assert r1["ok"] is True
     assert r1["parent_run_id"] == run_id
     # enqueue with a FORGED parent_run_id → ignored, forced from the peer
-    r2 = probes[f"enqueue-forge {egg} run-forged"]
+    r2 = probes[f"enqueue-forge {egg_up} run-forged"]
     assert r2["ok"] is True
     assert r2["parent_run_id"] == run_id
     assert r2["parent_run_id"] != "run-forged"
     # a spawn_subs egg from a non-sub chicken is allowed (depth cap = 1)
-    r3 = probes[f"enqueue {subs_egg}"]
+    r3 = probes[f"enqueue {subs_up}"]
     assert r3["ok"] is True
     assert r3["parent_run_id"] == run_id
 
@@ -332,7 +338,9 @@ def test_depth_cap_holds_against_direct_socket_caller(daemon, tmp_path) -> None:
     wait_terminal(sock, parent_id)
 
     subs_egg = write_job(tmp_path, "depth-egg", prompt="Say hello", spawn_subs=True)
-    prompt = f"PEERPROBE {sock}\nenqueue-forge {subs_egg} run-forged\n"
+    # spec 32 (ticket 02): the chicken queues the allowlisted (uploaded) path
+    subs_up = upload_egg(sock, subs_egg)
+    prompt = f"PEERPROBE {sock}\nenqueue-forge {subs_up} run-forged\n"
     sub = write_job(tmp_path, "depth-sub", prompt=prompt)
     # the operator enqueues the sub with lineage (legit path still works)
     sr = request(sock, "enqueue", spec_path=str(sub), parent_run_id=parent_id, timeout=5.0)
@@ -342,7 +350,7 @@ def test_depth_cap_holds_against_direct_socket_caller(daemon, tmp_path) -> None:
     assert run["status"] == "succeeded"
 
     probes = probe_report(sock, sub_id)
-    resp = probes[f"enqueue-forge {subs_egg} run-forged"]
+    resp = probes[f"enqueue-forge {subs_up} run-forged"]
     # the sub-chicken (itself a sub) cannot queue a spawn_subs egg — the
     # refusal keys off the peer-forced parent (the sub itself), not the
     # forged client-sent value, and nothing is queued
@@ -396,7 +404,9 @@ def test_ancestor_stop_refusal_holds_against_direct_socket_caller(daemon, tmp_pa
 def test_chicken_cannot_enqueue_without_lineage(daemon, tmp_path) -> None:
     sock = daemon.settings.socket_path
     egg = write_job(tmp_path, "no-lineage-egg", prompt="Say hello")
-    prompt = f"PEERPROBE {sock}\nenqueue {egg}\nping\n"
+    # spec 32 (ticket 02): the queued path is the allowlisted (uploaded) one
+    egg_up = upload_egg(sock, egg)
+    prompt = f"PEERPROBE {sock}\nenqueue {egg_up}\nping\n"
     prober = write_job(tmp_path, "no-lineage-prober", prompt=prompt)
     run_id = request(sock, "enqueue", spec_path=str(prober), timeout=5.0)["run_id"]
     wait_terminal(sock, run_id)
@@ -405,7 +415,7 @@ def test_chicken_cannot_enqueue_without_lineage(daemon, tmp_path) -> None:
     # ping answers on the chicken-owned connection (identity read, not a refusal)
     assert probes["ping"]["ok"] is True
     # enqueue without any lineage field still gets the peer-forced lineage
-    resp = probes[f"enqueue {egg}"]
+    resp = probes[f"enqueue {egg_up}"]
     assert resp["ok"] is True
     assert resp["parent_run_id"] == run_id
     row = next(
