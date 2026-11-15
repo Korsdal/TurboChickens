@@ -1015,7 +1015,8 @@
   }
 
   function isBeakPrivate(path) {
-    return path.split("/")[0] === ".vibe" || path === ".tc-farmhand-settings.toml";
+    const top = path.split("/")[0];
+    return top === ".vibe" || top === ".tc-home" || path === ".tc-farmhand-settings.toml";
   }
 
   function renderBeakPane(run, logs, ws, wsFile) {

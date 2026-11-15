@@ -61,6 +61,12 @@ connection and resolves the peer pid (the chicken itself or one of its
 descendants) to the owning run through that registry, so lineage
 (`parent_run_id` / `caller_run_id`) is forced from the authenticated peer —
 client-sent lineage fields are ignored on chicken-owned connections.
+
+Spec 32 ticket 12 (review G9, spawn isolation) provisions the chicken's
+Scratch: `adapter.prepare` materializes `.tc-home/` inside the workspace and
+points the per-run HOME/TMPDIR/XDG_*/VIBE_HOME at it, with only a sanitized
+vibe profile in it — nothing the chicken plants in its "home" survives the
+abattoir's teardown, and the operator's real $HOME stays out of reach.
 """
 
 from __future__ import annotations
@@ -74,6 +80,7 @@ from pathlib import Path
 from typing import Any
 
 from turbochickens.adapter import (
+    SCRATCH_HOME_DIRNAME,
     HarnessResult,
     RunContext,
     TeardownReport,
@@ -575,6 +582,16 @@ class RunPipeline:
                 prepared = adapter.prepare(ctx)
                 harness = prepared.harness
                 auth = prepared.auth or auth
+                # spec 32 ticket 12 (review G9): the chicken's HOME/XDG/TMPDIR
+                # point at its Scratch inside the workspace — the operator's
+                # real $HOME and coopd's /proc environ stay out of reach
+                await self._event(
+                    run_id,
+                    "supervisor",
+                    "info",
+                    f"scratch home prepared at {SCRATCH_HOME_DIRNAME}/ inside the chicken's workspace"
+                    " — HOME/XDG/TMPDIR point there, with only a sanitized vibe profile",
+                )
                 if isinstance(harness.get("farmhand"), dict):
                     # spec 27 (ChickenSubs): the Farmhand is attached to this
                     # chicken's harness runtime over stdio

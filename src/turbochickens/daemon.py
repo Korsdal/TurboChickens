@@ -134,6 +134,13 @@ depth cap and the ancestor-stop refusal hold even against a direct socket
 caller. ``runs_list`` rows and the manifest's harness block carry the
 chicken's ``pid``. Trust model: socket and Coop HTTP access mean operator;
 Chickens are not operators (see ``docs/lexicon.md``).
+
+Spec 32 ticket 12 (review G9, spawn isolation) hardens coopd itself and the
+spawn env: at startup coopd marks itself non-dumpable
+(``harden_daemon_process``) so a same-uid chicken cannot read
+``/proc/<coopd>/environ`` for ambient secrets, and every chicken's per-run env
+points HOME/TMPDIR/XDG_*/VIBE_HOME at its own Scratch (``.tc-home/`` inside
+its workspace) holding only a sanitized vibe profile — see ``adapter.py``.
 """
 
 from __future__ import annotations
@@ -149,6 +156,7 @@ import signal
 import socket
 import sqlite3
 import struct
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -2216,9 +2224,35 @@ class Daemon:
 
 async def run_daemon(settings: Settings) -> None:
     """Run the daemon until shutdown op, SIGINT, or SIGTERM."""
+    harden_daemon_process()
     daemon = Daemon(settings)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
             loop.add_signal_handler(sig, daemon.request_stop)
     await daemon.serve()
+
+
+def harden_daemon_process() -> bool:
+    """Review G9 (spec 32 ticket 12): coopd marks itself non-dumpable
+    (``PR_SET_DUMPABLE = 0``) so a same-uid spawned Chicken cannot read
+    ``/proc/<coopd>/environ`` (or any other ``/proc/<coopd>/*`` file) for the
+    ambient secrets — the files of a non-dumpable process are root-owned and
+    require ``CAP_SYS_PTRACE``. Exec'd children (the chickens) are dumpable
+    again, which is fine: their own environ carries only the per-run env with
+    the Scratch-pointed HOME/XDG. Best effort, Linux only; returns whether the
+    flag was set."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl.restype = ctypes.c_int
+        libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        PR_SET_DUMPABLE = 4
+        ctypes.set_errno(0)
+        rc = libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)
+        return rc == 0
+    except Exception:
+        return False

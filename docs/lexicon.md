@@ -63,7 +63,8 @@ is not an operator*.
 | **Coop** | The management GUI / container | `coop.py`, `coop_static/` |
 | **Coopd** | The always-on supervisor daemon | `daemon.py` |
 | **Farmhand** | The MCP — a hired helper who does chores through the farm's tools | MCP (future) |
-| **Beak** | The read-only live view into a running Chicken — workspace file tree + single-file peek + log tail (`workspace_peek` socket op, `GET /api/runs/{id}/workspace`, the Beak tab in the coop). The Beak is honest about ephemerality: it is open only while the workspace exists (in-flight chickens); once the Abattoir tears the chicken down, the Beak is closed. It never serves the chicken's private harness config (`.vibe/`, the farmhand settings file) — resolved gate/env secrets live there | `beak.py`, `workspace_peek`, the Beak tab |
+| **Beak** | The read-only live view into a running Chicken — workspace file tree + single-file peek + log tail (`workspace_peek` socket op, `GET /api/runs/{id}/workspace`, the Beak tab in the coop). The Beak is honest about ephemerality: it is open only while the workspace exists (in-flight chickens); once the Abattoir tears the chicken down, the Beak is closed. It never serves the chicken's private harness config (`.vibe/`, the farmhand settings file, the Scratch) — resolved gate/env secrets live there | `beak.py`, `workspace_peek`, the Beak tab |
+| **Scratch** | The Chicken's per-run scratch home (`.tc-home/` inside its own workspace): HOME, TMPDIR, XDG_* and VIBE_HOME all point there, and only a sanitized vibe profile (browser-auth fields only) is materialized in it — so a Chicken cannot read or write the operator's real `$HOME` or coopd's `/proc/<pid>/environ`, and nothing it plants in its home survives the Abattoir (the workspace — Scratch included — is removed at teardown) | per-run env in `adapter.py`, `.tc-home/` in the workspace |
 
 ## Reserved
 
