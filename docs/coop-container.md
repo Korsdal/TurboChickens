@@ -14,9 +14,9 @@ comes from `docs/lexicon.md` — eggs, chickens, clutches, the rooster, the
 perch, the headcount.
 
 ```
-Dockerfile            # python:3.12-slim, pip install ., ships docker/settings.toml
+Dockerfile            # python:3.12-slim pinned by digest; deps from the hash-pinned uv.lock; ships docker/settings.toml
 docker/settings.toml  # default container settings → /etc/turbochickens/settings.toml
-docker/compose.yaml   # compose example (build + named volume + published port)
+docker/compose.yaml   # compose example (build + named volume + loopback-published port)
 ```
 
 ## Build
@@ -28,31 +28,61 @@ docker build -t coop .
 ```
 
 The build context is kept minimal by `.dockerignore` (only `pyproject.toml`,
-`src/`, and `docker/settings.toml` are sent). The image sets
-`TURBOCHICKENS_SETTINGS=/etc/turbochickens/settings.toml`, so every `tc`
-command inside the container — the CMD included — uses the shipped settings.
+`uv.lock`, `src/`, and `docker/settings.toml` are sent — local state and secret
+files such as `data/`, `.env*`, and the root `providers.toml` /
+`connectors.toml` / `settings.toml` stay out of the context and the image). The
+image sets `TURBOCHICKENS_SETTINGS=/etc/turbochickens/settings.toml`, so every
+`tc` command inside the container — the CMD included — uses the shipped
+settings.
+
+### Supply chain (spec 32 ticket 16 / G22)
+
+The image cannot drift from the tested dependency graph:
+
+- the **base image is pinned by digest** — `FROM python:3.12-slim@sha256:…` (no
+  floating tag);
+- **dependencies are installed only from the hash-pinned `uv.lock`**: the
+  Dockerfile exports the frozen runtime graph with hashes
+  (`uv export --frozen --no-dev --no-emit-project`) and installs it with
+  `--require-hashes`, so any package or build not in the lock fails the build;
+- the **installer uv is pulled by digest** from `ghcr.io/astral-sh/uv:…@sha256:…`,
+  and the **build backend is pinned** (`hatchling==1.33.0` in
+  `pyproject.toml` `[build-system]`);
+- CI enforces it: the audit job runs `uv lock --check`, `uv audit`, and the
+  image-vs-lock diff (`tests/test_ci.py` + `tests/test_supply_chain.py`), and
+  the full suite pins the Dockerfile/compose contract.
 
 ## Run
 
 ```sh
-docker run --name coop -d -p 8737:8737 -v coop-data:/data coop
+docker run --name coop -d -p 127.0.0.1:8737:8737 -v coop-data:/data coop
 ```
 
 Then open <http://localhost:8737> and log in with the token from the logs
-(see below). Equivalent one-liner from the spec:
+(see below). The port is published on the host's **loopback only** (`127.0.0.1:8737:8737`),
+exactly like `docker/compose.yaml`: the bearer token is the only auth on the
+published port, so the default must not expose the GUI on every host interface.
+To publish on all interfaces deliberately, use `-p 8737:8737` and put a TLS
+reverse proxy in front (see below). Equivalent one-liner from the spec:
 
 ```sh
-docker run -p 8737:8737 -v coop-data:/data coop
+docker run -p 127.0.0.1:8737:8737 -v coop-data:/data coop
 ```
 
 ## Compose
 
 `docker/compose.yaml` is a ready example (builds from the repo root, publishes
-8737, keeps state in the named volume `coop-data`):
+8737 **on 127.0.0.1 only**, keeps state in the named volume `coop-data`):
 
 ```sh
 docker compose -f docker/compose.yaml up -d --build
 ```
+
+It also carries a **commented fixed-token mount**: copy `docker/settings.toml`
+to `./coop-settings.toml`, set `coop_auth_token = "…"` in the copy, uncomment
+the `- ./coop-settings.toml:/etc/turbochickens/settings.toml:ro` line under
+`volumes:`, and the GUI uses that fixed bearer instead of the ephemeral one
+from the logs.
 
 ## Non-root, hardened runtime (spec 32 / G12)
 
@@ -64,7 +94,7 @@ runtime hardening on top — the same properties you get with plain
 `docker run` flags:
 
 ```sh
-docker run --name coop -d -p 8737:8737 -v coop-data:/data \
+docker run --name coop -d -p 127.0.0.1:8737:8737 -v coop-data:/data \
   --user 10001:10001 \
   --cap-drop ALL \
   --security-opt no-new-privileges:true \
@@ -141,7 +171,9 @@ The shipped settings bind `coop_host = "0.0.0.0"` with **no** configured
   other `/api/*` route requires the bearer.
 - To pin a fixed token instead of the ephemeral one, mount your own settings
   file over `/etc/turbochickens/settings.toml` (or set
-  `TURBOCHICKENS_SETTINGS` to a mounted path) with `coop_auth_token = "…"`.
+  `TURBOCHICKENS_SETTINGS` to a mounted path) with `coop_auth_token = "…"` —
+  `docker/compose.yaml` shows exactly this mount, commented out, next to the
+  `/data` volume.
 - Loopback-only deployments may set `coop_host = "127.0.0.1"` with no token **and**
   `coop_loopback_open = true` — then the GUI is open on the loopback bind (the one
   deliberate opening in the Fence). Without that opt-in the bearer is required on
@@ -168,7 +200,7 @@ port to match.
 so the cleanest override is a bind mount over that file:
 
 ```sh
-docker run -p 8737:8737 \
+docker run -p 127.0.0.1:8737:8737 \
   -v coop-data:/data \
   -v $PWD/my-settings.toml:/etc/turbochickens/settings.toml \
   coop
@@ -197,7 +229,7 @@ the CMD is just `tc daemon start` with the shipped settings):
 
 ```sh
 docker build -t coop .
-docker run --name coop -d -p 8737:8737 -v coop-data:/data coop
+docker run --name coop -d -p 127.0.0.1:8737:8737 -v coop-data:/data coop
 
 # 0. the container runs non-root and hardened
 docker exec coop id -u                            # 10001
@@ -220,7 +252,7 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8737/api/status      
 # 4. state survives container replacement on the same volume
 docker exec coop tc schedule list               # after adding a crow
 docker rm -f coop
-docker run --name coop -d -p 8737:8737 -v coop-data:/data coop
+docker run --name coop -d -p 127.0.0.1:8737:8737 -v coop-data:/data coop
 docker exec coop tc schedule list               # same crow
 docker exec coop tc runs list                   # same chickens
 docker logs coop | grep -c "coop auth token:"   # 1 again (new ephemeral token)

@@ -1,6 +1,14 @@
-# Keep the build context to what the image needs: pyproject.toml + src/
-# (pip install .) and docker/settings.toml (the shipped default settings).
-# Everything below stays out of the context and the image layers.
+# Keep the build context to what the image needs: pyproject.toml + uv.lock
+# (dependencies are installed from the hash-pinned lock — the image must not
+# drift from the tested dependency graph) + src/ (the project, built by the
+# pinned hatchling backend) + docker/settings.toml (the shipped default
+# settings). Everything below stays out of the context and the image layers.
+#
+# Local state and secret files are excluded explicitly (spec 32 ticket 16 /
+# G22): the data dir, .env files, and the root-level providers / connectors /
+# settings TOML files, which may hold feeder credentials, gate refs, or a
+# fixed coop token. They are root-anchored so docker/settings.toml (shipped
+# into the image on purpose) still matches.
 .git
 .venv
 .uv
@@ -14,4 +22,8 @@ specs
 examples
 docs
 STATUS.md
-uv.lock
+data
+.env*
+/providers.toml
+/connectors.toml
+/settings.toml

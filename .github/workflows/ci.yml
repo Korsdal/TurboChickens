@@ -4,8 +4,8 @@
 # supported Python versions. The suite is loopback-only and needs no Docker
 # daemon, so a test job is plain checkout + setup-uv + `uv sync --frozen` +
 # pytest. A separate audit job runs the dependency audit against the pinned
-# lock and diffs the image's dependencies against that lock (the check
-# consumed by ticket 16's supply-chain work).
+# lock and diffs the image's dependencies against that lock (tests/test_ci.py
+# + tests/test_supply_chain.py — the supply-chain check from ticket 16).
 #
 # Actions are pinned by commit SHA (tag in the comment), not by floating tag.
 
@@ -56,4 +56,4 @@ jobs:
       - name: Audit pinned dependencies against public advisories
         run: uv audit
       - name: Diff image dependencies against the pinned lock
-        run: .venv/bin/python -m pytest -q tests/test_ci.py
+        run: .venv/bin/python -m pytest -q tests/test_ci.py tests/test_supply_chain.py
