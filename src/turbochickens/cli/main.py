@@ -733,7 +733,8 @@ def _parse_kv_pairs(pairs: list[str] | None, flag: str) -> dict[str, str]:
 def connectors_list(
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """List the registered gates (connectors) with non-secret summaries — never env values."""
+    """List the registered gates (connectors) with non-secret summaries — env key
+    names and header refs only, never literal values."""
     resp = _request_or_exit(settings_path, "connectors_list")
     if not resp["connectors"]:
         typer.echo("no gates registered")
@@ -757,12 +758,13 @@ def connectors_add(
     env: list[str] | None = typer.Option(None, "--env", help="stdio: KEY=VALUE (repeatable); values may be $ENV refs."),
     url: str | None = typer.Option(None, "--url", help="https: the MCP endpoint URL."),
     headers: list[str] | None = typer.Option(
-        None, "--header", help="https: NAME=REF (repeatable), e.g. --header 'Authorization=Bearer $TOKEN'."
+        None, "--header", help="https: NAME=$REF (repeatable), e.g. --header 'Authorization=Bearer $TOKEN' — literal secrets are refused."
     ),
     settings_path: Path | None = _settings_opt(),
 ) -> None:
-    """Register (or replace) a gate in connectors.toml. Env/header values may be
-    $ENV refs — they stay references everywhere the platform serves them."""
+    """Register (or replace) a gate in connectors.toml. Env values may be literals
+    or $ENV refs (only key names are ever served); https header values must be
+    $ENV refs — a literal header secret is refused with a field-named error."""
     payload: dict = {"transport": transport}
     if command is not None:
         payload["command"] = command
