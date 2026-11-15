@@ -30,6 +30,7 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 | **Re-run** | Hatching the same Egg again as a fresh Chicken, new run ID, lineage recorded | `run_rerun` / manifest `rerun_of` |
 | **Chaining** | An Egg consuming an earlier Chicken's Clutch via a `nestbox://<run_id>/output.json` attachment — resolved from the Nest Box at provisioning, valid clutches only | `chaining.py`, manifest `chaining`, Headcount `clutch.consumed` |
 | **ChickenSub** | A sub-chicken — a Chicken spawned by another Chicken through its attached Farmhand (stdio), enqueued as an ordinary Egg in the same Pecking Order with lineage `parent_run_id`, depth capped at 1, and a narrower Farmhand tool set (enqueue + read only; it cannot stop its ancestors) | `harness.spawn_subs`, `runs.parent_run_id`, `farmhand.py` |
+| **Uploads** | The Coop uploads area (`uploads/<job>-<spec_hash>/`) — where a bundled Egg is candled and stored so it is enqueueable by its in-container path. A Coop-uploaded bundle must carry its own `schema_file` as a bundle member, and on a chicken-owned connection `spec_path` on enqueue / re-run / schedule must resolve inside the Uploads (or be an already-registered Egg path) — the Fox refuses anything else with a field-named `spec_path` error, so `spec_path` is never a host-file existence or read oracle | `uploads_dir`, `jobs_upload`, the spec-path allowlist in `daemon.py` |
 | **Gate** | A registered external MCP connector — an opening in the fence to an outside tool service. The platform only *registers* gates (connectors.toml, CRUD via `connectors_*` ops, Headcount `gate.registered`/`gate.removed`/`gate.rejected`); it never provisions or pays for the third party. A Chicken opts in per egg via `[harness] connectors = ["name", …]` and gets the chosen gates injected into its harness runtime's MCP config. Env/header values are secrets: refs (`$VAR`) stay refs in every served payload, values never appear in any response, audit row, or manifest. An https header value must be a ref — a literal (non-`$ref`) header secret is refused at registration with a field-named `connectors.<name>.headers` error, and a literal at rest in a hand-edited registry is withheld (`<withheld>`) from every listing (the Fox keeps gate credentials out of the Coop, the Gates view, and the Headcount) | `connectors.toml`, `connectors.py`, `harness.connectors` |
 
 ## Support Cast
@@ -53,7 +54,11 @@ pid at hatch, and resolves the peer pid to the owning Chicken — so on a chicke
 connection, lineage (`parent_run_id` / `caller_run_id`) is forced from the authenticated
 peer and client-sent lineage fields are ignored. A Chicken connecting directly gets only
 the narrowed sub-chicken op set, can never enqueue without lineage, and cannot stop its
-ancestors. Security refusals in this vocabulary say so plainly: *the Fox refuses — a chicken
+ancestors. On a chicken-owned connection, `spec_path` on `enqueue`, `run_rerun`, and
+`schedule_add` is allowlisted to the **Uploads** area plus already-registered Egg paths —
+the Fox refuses anything else with a field-named `spec_path` error before the file is
+ever read, so a Chicken cannot use `spec_path` as a host-file existence or read oracle.
+Security refusals in this vocabulary say so plainly: *the Fox refuses — a chicken
 is not an operator*.
 
 ## The Interface Layer

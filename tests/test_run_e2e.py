@@ -10,6 +10,7 @@ network — the adapter genuinely spawns a subprocess pinned to the workspace.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -138,6 +139,20 @@ def run_id_of(result) -> str:
     m = re.search(r"egg queued (run-[0-9a-f]+)", result.output)
     assert m, f"no run id in output: {result.output}"
     return m.group(1)
+
+
+def upload_egg(sock, spec: Path, timeout: float = 15.0) -> str:
+    """Spec 32 (ticket 02): register an egg directory in the coop uploads
+    area via `jobs_upload` and return the stored spec_path — the only kind of
+    `spec_path` a chicken-owned connection is allowed to queue."""
+    files = {
+        str(p.relative_to(spec.parent)): base64.b64encode(p.read_bytes()).decode()
+        for p in sorted(spec.parent.rglob("*"))
+        if p.is_file()
+    }
+    resp = request(sock, "jobs_upload", files=files, timeout=timeout)
+    assert resp.get("ok") is True, resp
+    return resp["spec_path"]
 
 
 def wait_terminal(socket_path, run_id: str, timeout: float = 30.0) -> dict:

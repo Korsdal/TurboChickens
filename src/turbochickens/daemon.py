@@ -135,6 +135,16 @@ caller. ``runs_list`` rows and the manifest's harness block carry the
 chicken's ``pid``. Trust model: socket and Coop HTTP access mean operator;
 Chickens are not operators (see ``docs/lexicon.md``).
 
+Spec 32 (ticket 02, review finding G1 entry points) adds the spec-path
+allowlist: on a chicken-owned connection, ``spec_path`` on ``enqueue``,
+``run_rerun``, and ``schedule_add`` must resolve inside the coop uploads
+area or be an already-registered egg path — anything else is refused with a
+field-named ``spec_path`` error before the file is ever read, so
+``spec_path`` is never a host-file existence/read oracle from a ChickenSub.
+``jobs_upload`` additionally requires the egg's ``schema_file`` to be a
+bundle member, so candling of an uploaded bundle cannot be aimed at a host
+file and cannot silently pass-everything.
+
 Spec 32 ticket 12 (review G9, spawn isolation) hardens coopd itself and the
 spawn env: at startup coopd marks itself non-dumpable
 (``harden_daemon_process``) so a same-uid chicken cannot read
@@ -158,6 +168,7 @@ import sqlite3
 import struct
 import sys
 import time
+import tomllib
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -176,6 +187,7 @@ from turbochickens.adapter import (
 )
 from turbochickens.audit import VIA_ACTORS, AuditLog, audit_via, current_via
 from turbochickens.chaining import is_nestbox_uri
+from turbochickens.fence import safe_ref
 from turbochickens.connectors import (
     ConnectorsConfig,
     ConnectorsError,
@@ -522,6 +534,45 @@ class Daemon:
         pid, uid, gid = _peer_credentials(writer)
         return CallerIdentity(pid=pid, uid=uid, gid=gid, run_id=self._caller_run_id(pid))
 
+    def _spec_path_allowlisted(self, spec_path: Path) -> bool:
+        """Spec 32 (ticket 02, review finding G1): the spec-path allowlist — a
+        `spec_path` is allowlisted when it resolves inside the coop uploads
+        area (a Coop-uploaded egg bundle, `uploads/<job>-<spec_hash>/`) or is
+        an already-registered egg path (`job_specs.spec_path`). The check
+        only resolves paths — it never stats, opens, or reads the target — so
+        a refused path yields the identical refusal whether or not the host
+        file exists: `spec_path` cannot be used as a file-existence oracle."""
+        try:
+            resolved = spec_path.resolve()
+        except OSError:
+            return False
+        uploads = self.settings.uploads_dir.resolve()
+        if resolved == uploads or uploads in resolved.parents:
+            return True
+        if self.db is not None:
+            row = self.db.execute(
+                "SELECT 1 FROM job_specs WHERE spec_path = ?", (str(resolved),)
+            ).fetchone()
+            return row is not None
+        return False
+
+    def _spec_path_refusal(self) -> dict[str, Any]:
+        """Spec 32 (ticket 02, G1): the field-named Fox refusal for a
+        non-allowlisted `spec_path` on a chicken-owned connection. The copy
+        never echoes the caller's path (G17: no host absolute paths are
+        served back)."""
+        msg = (
+            "spec_path: the fox refuses — a chicken is not an operator: only registered egg paths"
+            " inside the coop uploads area can be queued, re-run, or scheduled over a chicken's"
+            " connection; the fence holds"
+        )
+        return {
+            "ok": False,
+            "protocol": PROTOCOL_VERSION,
+            "error": msg,
+            "errors": [{"field": "spec_path", "message": msg}],
+        }
+
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
@@ -639,7 +690,7 @@ class Daemon:
         if op == "run_stop":
             return await self._run_stop(req, caller)
         if op == "run_rerun":
-            return await self._run_rerun(req)
+            return await self._run_rerun(req, caller)
         if op == "results_get":
             return self._results_get(req)
         if op == "stats_list":
@@ -649,7 +700,7 @@ class Daemon:
         if op == "retention_sweep":
             return self._retention_sweep()
         if op == "schedule_add":
-            return await self._schedule_add(req)
+            return await self._schedule_add(req, caller)
         if op == "schedule_list":
             return self._schedule_list()
         if op == "schedule_rm":
@@ -771,6 +822,12 @@ class Daemon:
             # authenticated peer; any client-sent parent_run_id is ignored,
             # so the depth cap holds even against a direct socket caller
             parent_run_id = caller.run_id
+            # spec 32 (ticket 02, G1): on a chicken-owned connection the
+            # spec path must be allowlisted (uploads area / registered egg) —
+            # checked before the file is ever read, so `spec_path` is never a
+            # host-file existence/read oracle from a ChickenSub's Farmhand
+            if not self._spec_path_allowlisted(spec_path):
+                return self._spec_path_refusal()
         try:
             spec = load_spec(spec_path)
         except SpecValidationError as e:
@@ -1398,7 +1455,7 @@ class Daemon:
             "reason": reason,
         }
 
-    async def _run_rerun(self, req: dict[str, Any]) -> dict[str, Any]:
+    async def _run_rerun(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
         """Spec 22: enqueue the same egg as a fresh run (new run_id), with the
         lineage recorded (`rerun_of` on the queue item → manifest + the
         `egg.queued` Headcount row). The new run goes through the normal
@@ -1421,7 +1478,11 @@ class Daemon:
                 "protocol": PROTOCOL_VERSION,
                 "error": f"no spec path recorded for egg {job_id!r}; queue it again with `tc run <job.toml>`",
             }
-        resp = await self._enqueue({"spec_path": spec_path, "trigger": "rerun", "rerun_of": run_id})
+        if caller is not None and caller.is_chicken and not self._spec_path_allowlisted(Path(spec_path)):
+            # spec 32 (ticket 02, G1): the re-run path is allowlisted like any
+            # other spec_path on a chicken-owned connection
+            return self._spec_path_refusal()
+        resp = await self._enqueue({"spec_path": spec_path, "trigger": "rerun", "rerun_of": run_id}, caller)
         if resp.get("ok"):
             resp["op"] = "run_rerun"
             resp["rerun_of"] = run_id
@@ -2016,7 +2077,8 @@ class Daemon:
         Validation reuses the existing spec loader, so errors come back
         field-named exactly like ``tc jobs validate`` (``trigger.schedule: …``);
         the bundle must additionally contain the files the spec references
-        (prompt, plain attachments — the loader itself checks the schema file;
+        (prompt, plain attachments, and — spec 32 ticket 02 — the schema file
+        as a bundle member, so candling cannot be aimed at a host file;
         spec 25 `nestbox://` attachments are resolved from the nest box at
         provisioning, not shipped in the bundle). The
         total decoded size is capped at ``UPLOAD_MAX_BYTES``. Invalid bundles
@@ -2103,6 +2165,38 @@ class Daemon:
                 dest = staging / rel
                 fox.ensure_dir(dest.parent)
                 fox.write_bytes_0600(dest, blob)
+            # spec 32 (ticket 02, G1): bundle schema membership — a
+            # Coop-uploaded egg must carry its own `schema_file` as a bundle
+            # member, checked before candling, so candling cannot be aimed at
+            # a host file and cannot silently pass-everything. A lexically
+            # unsafe ref is left to the loader's fence refusal below.
+            try:
+                _raw = tomllib.loads((staging / "job.toml").read_text(encoding="utf-8"))
+                _schema_ref = _raw.get("output", {}).get("schema_file")
+            except Exception:
+                _schema_ref = None  # unreadable TOML is reported by the loader
+            if (
+                isinstance(_schema_ref, str)
+                and safe_ref(_schema_ref) == _schema_ref
+                and _schema_ref not in decoded
+            ):
+                errors = [
+                    {
+                        "field": "output.schema_file",
+                        "message": (
+                            f"output.schema_file: schema file {_schema_ref!r} is not in the bundle —"
+                            " the egg's schema must ship with the egg; candling cannot be aimed at a"
+                            " host file"
+                        ),
+                    }
+                ]
+                self._audit_upload_rejected(errors)
+                return {
+                    "ok": False,
+                    "valid": False,
+                    "protocol": PROTOCOL_VERSION,
+                    "errors": errors,
+                }
             try:
                 spec = load_spec(staging / "job.toml")
             except SpecValidationError as e:
@@ -2138,6 +2232,20 @@ class Daemon:
                             "message": f"input.attachments: attachment {att!r} is not in the bundle",
                         }
                     )
+            if spec.output.schema_file not in decoded:
+                # spec 32 (ticket 02, G1): bundle schema membership — the
+                # schema file must ship with the egg (defense in depth next to
+                # the pre-candling check above; the loader already guarantees
+                # it exists inside the staged bundle)
+                errors.append(
+                    {
+                        "field": "output.schema_file",
+                        "message": (
+                            f"output.schema_file: schema file {spec.output.schema_file!r} is not in the"
+                            " bundle — the egg's schema must ship with the egg"
+                        ),
+                    }
+                )
             from turbochickens.models import model_issues
 
             model_errors, warnings = model_issues(spec, self.providers, None)
@@ -2259,12 +2367,16 @@ class Daemon:
         for job_id, spec_path, spec_hash, expr in rows:
             self.cron.add(job_id, spec_path, spec_hash, expr)
 
-    async def _schedule_add(self, req: dict[str, Any]) -> dict[str, Any]:
+    async def _schedule_add(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
         """Register a job's cron trigger (from its spec) with the scheduler."""
         spec_path_raw = req.get("spec_path")
         if not spec_path_raw:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "schedule_add requires spec_path"}
         spec_path = Path(str(spec_path_raw))
+        if caller is not None and caller.is_chicken and not self._spec_path_allowlisted(spec_path):
+            # spec 32 (ticket 02, G1): same allowlist as enqueue on a
+            # chicken-owned connection — before the file is ever read
+            return self._spec_path_refusal()
         try:
             spec = load_spec(spec_path)
         except SpecValidationError as e:
