@@ -96,6 +96,11 @@ class RunContext:
     # spec 27 (ChickenSubs): the parent chicken when this run is a sub-chicken
     # enqueued through a spawn_subs chicken's Farmhand (lineage parent_run_id)
     parent_run_id: str | None = None
+    # spec 32 (ticket 10): the harness process pid, recorded at spawn; the
+    # daemon maps a socket peer pid back to this run through `on_spawn`, so
+    # lineage is forced from the peer credentials, never from client fields
+    pid: int | None = None
+    on_spawn: Callable[[int], None] | None = None
 
 
 @dataclass
@@ -325,6 +330,12 @@ class VibeCLIAdapter:
         except OSError as e:
             return HarnessResult(exit_code=None, raw_output="", usage={}, error=f"cannot spawn {self.bin}: {e}")
         run.proc = proc
+        # spec 32 (ticket 10): record the chicken's pid at spawn and notify
+        # the pipeline, so the daemon can map a socket peer pid back to this
+        # run (peer-credential identity)
+        run.pid = proc.pid
+        if run.on_spawn is not None:
+            run.on_spawn(proc.pid)
         stdout_chunks: list[str] = []
 
         async def _pump(stream: asyncio.StreamReader, level: str, collect: bool) -> None:

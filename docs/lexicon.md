@@ -41,6 +41,20 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 | **Fence** | The security boundary the Fox enforces — the Coop's network perimeter (bearer required on **every** bind unless the operator opts in via `coop_loopback_open`), filesystem containment (an Egg's file refs and a Chicken's workspace paths must stay inside their own directory; absolute, `..`-crossing, backslashed, or symlink-escaping refs are refused at the fence), and resource limits (connection, log, and output caps) | `fence.py` (the shared safe-ref rule), `beak.py` path lock, spec-loader ref checks, coop/farmhand bearer middleware, cap constants in `settings.py` |
 | **Perch** | Seat-based auth — a seat is a perch | `seat.py` |
 | **Headcount** | Audit log — a farmer's headcount | `audit.py` |
+| **Operator** | The human on the other end of the Coopd socket or the Coop HTTP API — socket/HTTP access means operator | CLI / coop user |
+
+## The Fence — trust model
+
+The **Fence** is the trust boundary the **Fox** watches. Access to the Coopd unix socket
+(0600, peer credentials read on every connection) and to the Coop HTTP API (bearer when
+required) means **Operator**. A **Chicken** is **not an operator**: the daemon reads the
+kernel's peer credentials (SO_PEERCRED) on every socket connection, records each Chicken's
+pid at hatch, and resolves the peer pid to the owning Chicken — so on a chicken-owned
+connection, lineage (`parent_run_id` / `caller_run_id`) is forced from the authenticated
+peer and client-sent lineage fields are ignored. A Chicken connecting directly gets only
+the narrowed sub-chicken op set, can never enqueue without lineage, and cannot stop its
+ancestors. Security refusals in this vocabulary say so plainly: *the Fox refuses — a chicken
+is not an operator*.
 
 ## The Interface Layer
 
