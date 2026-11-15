@@ -135,6 +135,15 @@ caller. ``runs_list`` rows and the manifest's harness block carry the
 chicken's ``pid``. Trust model: socket and Coop HTTP access mean operator;
 Chickens are not operators (see ``docs/lexicon.md``).
 
+Spec 32 (ticket 11, the G8 scope half): the ChickenSub op scope is enforced
+server-side on every chicken-owned connection — ``_dispatch_op`` serves only
+``CHICKEN_OPS_ALLOWED`` (enqueue + the read ops + the guarded ``run_stop``,
+plus ``ping``/``workspace_peek``) and refuses every other op (shutdown,
+settings, gates, auth, upload, re-run, schedule, retention, farmhand info,
+unknown ops) with a field-named Fox refusal (:func:`_chicken_op_refusal`).
+The narrowing therefore exists in the daemon, not only in the Farmhand's
+client-side tool list.
+
 Spec 32 ticket 12 (review G9, spawn isolation) hardens coopd itself and the
 spawn env: at startup coopd marks itself non-dumpable
 (``harden_daemon_process``) so a same-uid chicken cannot read
@@ -246,6 +255,50 @@ class CallerIdentity:
     @property
     def is_chicken(self) -> bool:
         return self.run_id is not None
+
+
+#: Spec 32 (ticket 11, review finding G8 scope): the ops a chicken-owned
+#: connection may use — the narrowed sub-chicken op set: ``enqueue`` + the
+#: read ops + the guarded ``run_stop`` (plus ``ping`` and the Beak's
+#: ``workspace_peek``). Everything else — shutdown, settings, gates,
+#: auth, upload, re-run, schedule, retention, farmhand info — is
+#: operator-only and refused server-side, so the narrowing no longer
+#: lives only in the Farmhand's client-side tool list.
+CHICKEN_OPS_ALLOWED = frozenset(
+    {
+        "ping",
+        "status",
+        "jobs_list",
+        "enqueue",
+        "runs_list",
+        "runs_show",
+        "runs_logs",
+        "workspace_peek",
+        "run_stop",
+        "results_get",
+        "stats_list",
+        "stats_show",
+        "audit_tail",
+    }
+)
+
+
+def _chicken_op_refusal(op: Any, caller: CallerIdentity) -> dict[str, Any]:
+    """Spec 32 (ticket 11, G8 scope): refuse an operator-only op on a
+    chicken-owned connection. Field-named like every other refusal — the
+    field names the refused op — with the Fox copy from docs/lexicon.md."""
+    msg = (
+        f"the fox refuses op {op!r} — a chicken is not an operator: this connection"
+        f" belongs to chicken {caller.run_id!r}, and coopd serves a chicken-owned"
+        " connection only the sub-chicken op set (enqueue + read ops + the guarded"
+        " run_stop)"
+    )
+    return {
+        "ok": False,
+        "protocol": PROTOCOL_VERSION,
+        "error": msg,
+        "errors": [{"field": str(op), "message": msg}],
+    }
 
 
 def _peer_credentials(writer: asyncio.StreamWriter) -> tuple[int | None, int | None, int | None]:
@@ -614,6 +667,19 @@ class Daemon:
 
     async def _dispatch_op(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
         op = req.get("op")
+        # spec 32 (ticket 11, review G8 scope): a chicken-owned connection
+        # (SO_PEERCRED peer pid resolved to a live chicken, ticket 10) gets
+        # only the sub-chicken op set — enforced here in the daemon, not only
+        # in the Farmhand's client-side tool list. Operator-only ops
+        # (shutdown, settings, gates, auth, upload, re-run, schedule,
+        # retention, farmhand info — and any unknown op) are refused with a
+        # field-named error before any handler runs.
+        if (
+            caller is not None
+            and caller.is_chicken
+            and (not isinstance(op, str) or op not in CHICKEN_OPS_ALLOWED)
+        ):
+            return _chicken_op_refusal(op, caller)
         if op == "ping":
             return {
                 "ok": True,

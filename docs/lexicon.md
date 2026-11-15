@@ -53,8 +53,11 @@ pid at hatch, and resolves the peer pid to the owning Chicken — so on a chicke
 connection, lineage (`parent_run_id` / `caller_run_id`) is forced from the authenticated
 peer and client-sent lineage fields are ignored. A Chicken connecting directly gets only
 the narrowed sub-chicken op set, can never enqueue without lineage, and cannot stop its
-ancestors. Security refusals in this vocabulary say so plainly: *the Fox refuses — a chicken
-is not an operator*.
+ancestors. That scope is enforced **server-side** in Coopd on every chicken-owned
+connection: operator-only ops — shutdown, settings, gates, auth, upload, re-run, schedule,
+retention, Farmhand info — are refused before any handler runs, with a field-named error
+whose field names the refused op. Security refusals in this vocabulary say so plainly:
+*the Fox refuses — a chicken is not an operator*.
 
 ## The Interface Layer
 
