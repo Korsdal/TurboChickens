@@ -1957,14 +1957,32 @@ class Daemon:
 
     def _auth_logout(self, req: dict[str, Any]) -> dict[str, Any]:
         """Release a provider's stored perch seat (tokens removed, not
-        revoked) and audit `perch.released` — provider + mode only."""
+        revoked) and audit `perch.released` — provider + mode only. Spec 32
+        (review finding G2): the provider is validated against the provider
+        registry and the session path is contained inside the data dir
+        before any unlink (seat.py), so an unregistered or traversal
+        provider name is refused with a field-named `provider` error,
+        touches no file, and never records a `perch.released` row — the
+        Headcount only ever records a truthful release."""
         provider = str(req.get("provider", ""))
         if not provider:
-            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "auth_logout requires provider"}
+            msg = "auth_logout requires provider"
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": msg,
+                "errors": [{"field": "provider", "message": msg}],
+            }
         try:
             self._seat_broker().logout(provider)
         except SeatError as e:
-            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": str(e)}
+            msg = str(e)
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": msg,
+                "errors": [{"field": "provider", "message": msg}],
+            }
         assert self.audit is not None
         self.audit.append({"event": "perch.released", "provider": provider, "mode": "seat"})
         return {"ok": True, "op": "auth_logout", "protocol": PROTOCOL_VERSION, "provider": provider}

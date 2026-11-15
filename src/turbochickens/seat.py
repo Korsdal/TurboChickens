@@ -31,6 +31,7 @@ from typing import Any, Callable
 import httpx
 
 from turbochickens.adapter import DEFAULT_CREDENTIAL_ALLOWLIST, RunContext
+from turbochickens.fence import UnsafeRefError, containment_detail, resolve_contained
 from turbochickens.providers import (
     ProviderProfile,
     ProvidersConfig,
@@ -122,13 +123,32 @@ class SeatSession:
 
 class SeatStore:
     """On-disk seat sessions under ``<data_dir>/seats/`` — one 0600 JSON file
-    per provider. This is the only place tokens are stored."""
+    per provider. This is the only place tokens are stored.
+
+    Spec 32 (review finding G2): every session path is *contained* — the
+    provider name is joined onto the seats dir as one relative ref and the
+    resolved path must stay under the resolved seats dir (the shared Fence
+    rule, :func:`turbochickens.fence.resolve_contained`), so a crafted
+    provider name like ``/etc/anything`` or ``../../x`` is refused before any
+    filesystem touch and can never name — let alone unlink — a ``*.json``
+    file outside the data dir."""
 
     def __init__(self, data_dir: Path) -> None:
         self.dir = Path(data_dir) / "seats"
 
     def _path(self, provider: str) -> Path:
-        return self.dir / f"{provider}.json"
+        """The contained session-file path for `provider` (spec 32, G2).
+        Raises a field-named :class:`SeatError` (``provider: the fox refuses
+        …``) when the name would escape the seats dir — lexically (absolute,
+        ``..``, backslash, NUL) or after resolving (a symlink pointing out)."""
+        ref = f"{provider}.json"
+        target = resolve_contained(self.dir, ref)
+        if target is None:
+            detail = containment_detail(self.dir, ref) or "it resolves outside the seats dir"
+            raise SeatError(
+                str(UnsafeRefError("provider", provider, detail, area="the perch — the seats dir inside the data dir"))
+            )
+        return target
 
     def _ensure_dir(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -158,6 +178,10 @@ class SeatStore:
             raise SeatError(f"perch seat for provider {provider!r} is unreadable ({path}): {e}; run `tc auth login {provider}` again") from e
 
     def delete(self, provider: str) -> bool:
+        """Unlink the provider's session file — only after `_path` has
+        contained it inside the seats dir (spec 32, G2), so no provider name
+        can delete a file outside the data dir. True when a session was
+        actually removed."""
         path = self._path(provider)
         if path.exists():
             path.unlink()
@@ -453,8 +477,21 @@ class SeatBroker:
         raise SeatError(f"device login for provider {provider_name!r} timed out (device code expired)")
 
     def logout(self, provider_name: str) -> None:
+        """Release a provider's stored perch seat (tokens removed, not
+        revoked) — spec 32, review finding G2: the provider must be a
+        *registered* provider name (validated against providers.toml), and
+        the session path is contained inside the data dir before any unlink
+        (see :meth:`SeatStore.delete`), so a crafted provider name like
+        ``/etc/anything`` can neither delete a ``*.json`` file outside the
+        data dir nor be audited as a release. Refusals are field-named
+        (``provider: …``)."""
+        if provider_name not in self.providers.providers:
+            raise SeatError(
+                f"provider: unknown provider {provider_name!r}; "
+                f"known providers: {', '.join(sorted(self.providers.providers)) or '(none)'}"
+            )
         if not self.store.delete(provider_name):
-            raise SeatError(f"no perch seat stored for provider {provider_name!r}")
+            raise SeatError(f"provider: no perch seat stored for provider {provider_name!r}")
 
     def status(self) -> list[dict[str, Any]]:
         """Non-secret overview for `tc auth status`: each provider's auth mode
