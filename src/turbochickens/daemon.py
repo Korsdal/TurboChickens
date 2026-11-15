@@ -166,7 +166,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from turbochickens import __version__, beak
+from turbochickens import __version__, beak, fox
 from turbochickens.adapter import (
     BASE_ENV_KEYS,
     DEFAULT_CREDENTIAL_ALLOWLIST,
@@ -344,7 +344,11 @@ class Daemon:
 
     async def serve(self) -> None:
         s = self.settings
-        s.data_dir.mkdir(parents=True, exist_ok=True)
+        # spec 32 (G11, the Fox): the data dir is created restrictive (0700)
+        # and a pre-existing looser dir is tightened — all state under it
+        # (db, Headcount, socket, workspaces, results, quarantine, uploads,
+        # seats, registry) is owner-only
+        fox.ensure_dir(s.data_dir)
         self.db = init_db(s.db_path)
         self.audit = AuditLog(s.audit_log_path)
         self.providers = load_providers(s.providers_path, s.data_dir)
@@ -393,6 +397,9 @@ class Daemon:
         self._server = await asyncio.start_unix_server(
             self._handle_client, path=str(s.socket_path), limit=SOCKET_STREAM_LIMIT
         )
+        # spec 32 (G11, the Fox): the socket is created 0600 at bind (the
+        # daemon's restrictive umask); this explicit chmod also covers a
+        # pre-existing socket file and in-process callers
         os.chmod(s.socket_path, 0o600)
         serve_task = asyncio.create_task(self._server.serve_forever())
         stop_task = asyncio.create_task(self._stop.wait())
@@ -1956,13 +1963,16 @@ class Daemon:
             }
         # stage the bundle, validate with the existing loader, store on success
         uploads = self.settings.uploads_dir
+        # spec 32 (G11, the Fox): uploads are created restrictive — dirs 0700,
+        # files 0600 at creation (no umask window)
+        fox.ensure_dir(uploads)
         staging = uploads / f".staging-{uuid.uuid4().hex[:12]}"
         try:
-            staging.mkdir(parents=True, exist_ok=True)
+            fox.ensure_dir(staging)
             for rel, blob in decoded.items():
                 dest = staging / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(blob)
+                fox.ensure_dir(dest.parent)
+                fox.write_bytes_0600(dest, blob)
             try:
                 spec = load_spec(staging / "job.toml")
             except SpecValidationError as e:
@@ -2223,14 +2233,25 @@ class Daemon:
 
 
 async def run_daemon(settings: Settings) -> None:
-    """Run the daemon until shutdown op, SIGINT, or SIGTERM."""
-    harden_daemon_process()
-    daemon = Daemon(settings)
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
-            loop.add_signal_handler(sig, daemon.request_stop)
-    await daemon.serve()
+    """Run the daemon until shutdown op, SIGINT, or SIGTERM.
+
+    Spec 32 (G11, the Fox): the daemon establishes a restrictive umask
+    (0o077) at start — before any state is created — so every file it ever
+    creates (db + journals, Headcount, socket at bind, workspaces, results,
+    quarantine, uploads, injected configs) is owner-only from creation: no
+    umask window on any created state file. The previous umask is restored
+    on exit (matters for in-process/thread callers)."""
+    prev_umask = fox.apply_restrictive_umask()
+    try:
+        harden_daemon_process()
+        daemon = Daemon(settings)
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.add_signal_handler(sig, daemon.request_stop)
+        await daemon.serve()
+    finally:
+        os.umask(prev_umask)
 
 
 def harden_daemon_process() -> bool:

@@ -10,6 +10,7 @@ JSONL file in audit.py. Trajectory tables are deliberately absent (post-MVP).
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -114,6 +115,10 @@ def init_db(path: str | Path) -> sqlite3.Connection:
     Idempotent: safe to call on every daemon start.
     """
     conn = sqlite3.connect(str(path))
+    # spec 32 (G11, the Fox): the db is state at rest — always 0600, also
+    # tightening a db file left looser by an older version (the daemon's
+    # restrictive umask keeps the sidecar journal files owner-only too)
+    os.chmod(path, 0o600)
     conn.execute("PRAGMA foreign_keys = ON")
     for stmt in _TABLES:
         conn.execute(stmt)

@@ -57,6 +57,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator, model_validator
 
+from turbochickens import fox
+
 CONNECTORS_ENVVAR = "TURBOCHICKENS_CONNECTORS"
 DEFAULT_DATA_DIR = Path("~/.turbochickens").expanduser()
 
@@ -337,12 +339,12 @@ def dump_registry_toml(raw: dict[str, Any]) -> str:
 def save_registry(path: Path | None, raw: dict[str, Any], data_dir: Path) -> Path:
     """Atomically write the registry file, always 0600 — it may hold literal
     secret env values (refs are fine, literals are the operator's at-rest
-    secret). Returns the written path."""
+    secret). The tmp file is created 0600 at creation (spec 32/G11, the Fox —
+    no umask window before the atomic rename). Returns the written path."""
     target = path if path is not None else data_dir / "connectors.toml"
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + f".tmp-{uuid.uuid4().hex[:8]}")
-    tmp.write_text(dump_registry_toml(raw), encoding="utf-8")
-    os.chmod(tmp, 0o600)
+    fox.write_text_0600(tmp, dump_registry_toml(raw))
     os.replace(tmp, target)
     return target
 
@@ -417,7 +419,9 @@ def attach_connectors_to_run(run: Any, settings: Any, names: list[str] | None = 
             )
         entries.append((name, mcp_config_entry(name, entry)))
     vibe_dir = run.workspace / ".vibe"
-    vibe_dir.mkdir(parents=True, exist_ok=True)
+    # spec 32 (G11, the Fox): the injected harness config holds resolved gate
+    # secrets — the .vibe dir is 0700 and config.toml 0600 at creation
+    fox.ensure_dir(vibe_dir)
     config_path = vibe_dir / "config.toml"
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     lines = ["", "# spec 28: gates (registered connectors) this chicken opted into via harness.connectors", ""]
@@ -429,5 +433,5 @@ def attach_connectors_to_run(run: Any, settings: Any, names: list[str] | None = 
     text = existing
     if text and not text.endswith("\n"):
         text += "\n"
-    config_path.write_text(text + "\n".join(lines), encoding="utf-8")
+    fox.write_text_0600(config_path, text + "\n".join(lines))
     return names
