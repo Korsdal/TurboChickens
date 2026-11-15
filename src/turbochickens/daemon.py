@@ -174,7 +174,7 @@ from turbochickens.adapter import (
     ProviderConfigError,
     run_weight,
 )
-from turbochickens.audit import AuditLog
+from turbochickens.audit import VIA_ACTORS, AuditLog, audit_via, current_via
 from turbochickens.chaining import is_nestbox_uri
 from turbochickens.connectors import (
     ConnectorsConfig,
@@ -272,6 +272,40 @@ def _ppid_of(pid: int) -> int | None:
         return int(data.rsplit(")", 1)[1].split()[1])
     except (OSError, ValueError, IndexError):
         return None
+
+
+#: spec 32 / review G24 — the Headcount `via` actor. `via` values an
+#: in-process forwarder may stamp: the coop web layer (`http`), the
+#: scheduler's loopback (`rooster`), and the mounted Farmhand (`farmhand`)
+#: all connect to this daemon's own socket from this very process, which
+#: SO_PEERCRED verifies (peer pid == our pid).
+_INPROC_VIA = ("http", "farmhand", "rooster")
+
+
+def _peer_runs_farmhand(pid: int) -> bool:
+    """Best-effort check that the peer process is a `… farmhand serve …`
+    server (its /proc cmdline), so a standalone Farmhand process is
+    attributed correctly. Linux-only; any failure means False."""
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        return b"farmhand" in argv and b"serve" in argv
+    except Exception:
+        return False
+
+
+def _resolve_via(sent_via: Any, peer_pid: int | None) -> str:
+    """Resolve the `via` actor for one socket request. A client-sent `via`
+    in the request body is honored only when the peer is verifiably trusted:
+    an in-process forwarder (peer pid == our pid, SO_PEERCRED-verified) or a
+    `farmhand serve` process. Every other caller is the plain `socket`
+    surface, whatever it claims."""
+    if not isinstance(sent_via, str) or sent_via not in VIA_ACTORS:
+        return "socket"
+    if peer_pid is not None and peer_pid == os.getpid():
+        return sent_via if sent_via in _INPROC_VIA else "socket"
+    if sent_via == "farmhand" and peer_pid is not None and _peer_runs_farmhand(peer_pid):
+        return "farmhand"
+    return "socket"
 
 
 def _safe_bundle_relpath(key: str) -> str | None:
@@ -570,6 +604,15 @@ class Daemon:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"{type(e).__name__}: {e}"}
 
     async def _dispatch(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
+        # spec 32 / review G24: the Headcount `via` actor is resolved from the
+        # SO_PEERCRED-verified peer, never trusted from the client-writable
+        # request body (`via` is popped here) — every row written while this
+        # request is handled carries the resolved actor
+        via = _resolve_via(req.pop("via", None), caller.pid if caller is not None else None)
+        with audit_via(via):
+            return await self._dispatch_op(req, caller)
+
+    async def _dispatch_op(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
         op = req.get("op")
         if op == "ping":
             return {
@@ -852,6 +895,9 @@ class Daemon:
             "trigger": trigger,
             "weight": weight,
             "started_at": started_at,
+            # spec 32/G24: the Headcount `via` actor travels with the queue
+            # item so the Hatchery's rows for this chicken carry it too
+            "via": current_via(),
         }
         if rerun_of:
             item["rerun_of"] = str(rerun_of)
@@ -923,23 +969,27 @@ class Daemon:
         `run_stop` — terminal `cancelled`, never hatched, still attested."""
         self._cancel_requested.discard(item["run_id"])
         assert self.pipeline is not None
-        await self.pipeline.cancel_queued(item)
+        with audit_via(str(item.get("via", "socket"))):
+            await self.pipeline.cancel_queued(item)
 
     async def _run_item(self, item: dict[str, Any]) -> None:
         run_id = item["run_id"]
-        try:
-            assert self.pipeline is not None
-            await self.pipeline.execute(item)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # the pipeline guarantees teardown+attestation itself; this is a
-            # last-resort guard so a run never disappears from in_flight
-            with contextlib.suppress(Exception):
+        # spec 32/G24: the Hatchery's Headcount rows for this chicken carry
+        # the `via` actor the egg was queued through
+        with audit_via(str(item.get("via", "socket"))):
+            try:
                 assert self.pipeline is not None
-                await self.pipeline.execute_guard(run_id)
-        finally:
-            self.in_flight.pop(run_id, None)
+                await self.pipeline.execute(item)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # the pipeline guarantees teardown+attestation itself; this is a
+                # last-resort guard so a run never disappears from in_flight
+                with contextlib.suppress(Exception):
+                    assert self.pipeline is not None
+                    await self.pipeline.execute_guard(run_id)
+            finally:
+                self.in_flight.pop(run_id, None)
 
     # --- run inspection ops --------------------------------------------------
 
@@ -2168,36 +2218,39 @@ class Daemon:
                 await writer.wait_closed()
 
     async def _cron_fire(self, job_id: str, spec_path: str, spec_hash: str) -> None:
-        """APScheduler callback: submit a cron-triggered run over the socket."""
+        """APScheduler callback: submit a cron-triggered run over the socket.
+        Spec 32/G24: the Rooster stamps its own `via` actor — both the enqueue
+        it sends and the crow/miss rows it appends."""
         assert self.audit is not None
-        try:
-            resp = await self._loopback_request(
-                "enqueue", spec_path=spec_path, spec_hash=spec_hash, trigger="cron"
-            )
-        except Exception as e:
-            self.audit.append(
-                {
-                    "event": "rooster.missed",
-                    "job_id": job_id,
-                    # spec 32 (G17): redact any host path from the served row
-                    "error": redact_host_paths(f"{type(e).__name__}: {e}", self.settings.data_dir),
-                }
-            )
-            return
-        if resp.get("ok"):
-            self.audit.append(
-                {
-                    "event": "rooster.crowed",
-                    "job_id": job_id,
-                    "run_id": resp.get("run_id"),
-                    "spec_hash": f"sha256:{spec_hash}",
-                    "trigger": "cron",
-                }
-            )
-        else:
-            self.audit.append(
-                {"event": "rooster.missed", "job_id": job_id, "error": resp.get("error", "enqueue failed")}
-            )
+        with audit_via("rooster"):
+            try:
+                resp = await self._loopback_request(
+                    "enqueue", spec_path=spec_path, spec_hash=spec_hash, trigger="cron", via="rooster"
+                )
+            except Exception as e:
+                self.audit.append(
+                    {
+                        "event": "rooster.missed",
+                        "job_id": job_id,
+                        # spec 32 (G17): redact any host path from the served row
+                        "error": redact_host_paths(f"{type(e).__name__}: {e}", self.settings.data_dir),
+                    }
+                )
+                return
+            if resp.get("ok"):
+                self.audit.append(
+                    {
+                        "event": "rooster.crowed",
+                        "job_id": job_id,
+                        "run_id": resp.get("run_id"),
+                        "spec_hash": f"sha256:{spec_hash}",
+                        "trigger": "cron",
+                    }
+                )
+            else:
+                self.audit.append(
+                    {"event": "rooster.missed", "job_id": job_id, "error": resp.get("error", "enqueue failed")}
+                )
 
     def _load_schedules(self) -> None:
         """Re-register every persisted schedule with APScheduler on daemon start."""

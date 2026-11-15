@@ -417,9 +417,14 @@ class CoopServer:
         """One socket op over the transport seam. Returns (resp, None), or
         (None, down_response) when the daemon socket is unreachable — the SPA
         renders a clear empty state/banner instead of a broken page (spec 11,
-        story 24)."""
+        story 24).
+
+        Spec 32 / review G24: the Headcount `via` actor is stamped here, by
+        the coop layer, outside the client-writable HTTP body — a `via` key
+        in a POST body is dropped, never forwarded."""
+        payload.pop("via", None)
         try:
-            return await self.transport.request(op, **payload), None
+            return await self.transport.request(op, via="http", **payload), None
         except DaemonUnreachable as e:
             return None, web.json_response(
                 {"ok": False, "op": op, "daemon": {"up": False}, "error": str(e)}

@@ -260,8 +260,14 @@ def build_server(
     sub_scope = caller_parent_run_id is not None
 
     async def call(op: str, timeout: float = 10.0, **payload: Any) -> dict[str, Any]:
+        # spec 32 / review G24: the Headcount `via` actor is stamped by the
+        # Farmhand layer, outside the client-writable tool arguments — a
+        # `via` key smuggled into a tool payload is dropped, never forwarded
+        payload.pop("via", None)
         try:
-            return await asyncio.wait_for(client.request_async(socket_path, op, **payload), timeout)
+            return await asyncio.wait_for(
+                client.request_async(socket_path, op, via="farmhand", **payload), timeout
+            )
         except DaemonUnreachable as e:
             return {"ok": False, "op": op, "daemon": {"up": False}, "error": str(e)}
         except TimeoutError:
