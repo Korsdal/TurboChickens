@@ -3,7 +3,7 @@ tools are thin wrappers over the daemon's existing socket ops via
 `client.request_async`, served over stdio (`tc farmhand serve --transport
 stdio`, gated by the 0600 daemon socket) and over HTTPS (streamable-HTTP at
 `farmhand_https_path` on the coop listener, behind the same bearer middleware
-as /api/*, loopback-open rule included).
+as /api/* — bearer by default, the loopback-open opt-in included).
 
 Seams: a real daemon on a temp socket (thread daemon for the stdio tests, a
 real `tc coop start` subprocess for the HTTPS tests), driven by a real MCP
@@ -552,9 +552,9 @@ def test_https_on_coop_listener_bearer_required_and_mcp_parity(tmp_path, monkeyp
 
 
 def test_https_loopback_open_without_token_and_stdio_transport_not_mounted(tmp_path, monkeypatch, fake_vibe) -> None:
-    # loopback + no token → open, exactly like /api/*
+    # loopback + no token + the coop_loopback_open opt-in → open, exactly like /api/*
     port = free_port()
-    f = write_settings(tmp_path, coop_port=port)
+    f = write_settings(tmp_path, coop_port=port, coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     SOCKET[0] = settings.socket_path
@@ -670,8 +670,10 @@ def test_https_non_loopback_ephemeral_token_gates_mcp(tmp_path, monkeypatch, fak
 def test_farmhand_serve_both_transports_simultaneously(tmp_path, monkeypatch, fake_vibe) -> None:
     port = free_port()
     f = tmp_path / "settings.toml"
-    # loopback + no token → the standalone https side is open like /api/*
-    f.write_text(f'data_dir = "{tmp_path / "data"}"\nweight_budget_override = 4\ncoop_port = {port}\n')
+    # loopback + no token + the coop_loopback_open opt-in → the standalone https side is open like /api/*
+    f.write_text(
+        f'data_dir = "{tmp_path / "data"}"\nweight_budget_override = 4\ncoop_port = {port}\ncoop_loopback_open = true\n'
+    )
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     SOCKET[0] = settings.socket_path
@@ -696,7 +698,7 @@ def test_farmhand_serve_both_transports_simultaneously(tmp_path, monkeypatch, fa
                 assert res["ok"] is True and res["output"]["message"] == "hello from fake vibe"
 
                 # while the stdio session is open, the same process's HTTPS
-                # endpoint answers MCP too (loopback open, no token)
+                # endpoint answers MCP too (loopback open via the opt-in, no token)
                 def drive_https(session2: ClientSession):
                     async def go2():
                         tools2 = await session2.list_tools()

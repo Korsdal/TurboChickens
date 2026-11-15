@@ -38,7 +38,7 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 |---|---|---|
 | **Rooster** | Cron-style scheduler — it wakes the jobs up | `scheduler.py` |
 | **Fox** | Security module — foxes eat Eggs *and* Chickens | security (future) |
-| **Fence** | The containment boundary the Fox enforces — a spec file ref (`prompt_file`, plain `attachments`, `schema_file`) must stay inside the Egg's own directory, and a workspace path inside the Chicken's workspace; anything absolute, `..`-crossing, backslashed, or resolving out through a symlink is refused at the fence | `fence.py` (the shared safe-ref rule), `beak.py` path lock, spec-loader ref checks |
+| **Fence** | The security boundary the Fox enforces — the Coop's network perimeter (bearer required on **every** bind unless the operator opts in via `coop_loopback_open`), filesystem containment (an Egg's file refs and a Chicken's workspace paths must stay inside their own directory; absolute, `..`-crossing, backslashed, or symlink-escaping refs are refused at the fence), and resource limits (connection, log, and output caps) | `fence.py` (the shared safe-ref rule), `beak.py` path lock, spec-loader ref checks, coop/farmhand bearer middleware, cap constants in `settings.py` |
 | **Perch** | Seat-based auth — a seat is a perch | `seat.py` |
 | **Headcount** | Audit log — a farmer's headcount | `audit.py` |
 

@@ -292,7 +292,7 @@ def test_schedule_endpoints_require_bearer_when_auth_required(auth_daemon, tmp_p
 
 
 def test_schedule_endpoints_daemon_down_payload_not_500(tmp_path, monkeypatch) -> None:
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     port = settings.coop_port
@@ -348,7 +348,7 @@ def test_spa_serves_schedules_view_and_no_host_paths(coop_daemon, tmp_path) -> N
 
 def test_e2e_schedule_add_list_rm_over_http_subprocess(tmp_path, monkeypatch) -> None:
     port = free_port()
-    f = write_settings(tmp_path, coop_port=port)  # `tc coop start` forces coop on
+    f = write_settings(tmp_path, coop_port=port, coop_loopback_open=True)  # `tc coop start` forces coop on; the opt-in keeps the loopback bind open
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     bin_path = tmp_path / "fake-vibe"
     bin_path.write_text(FAKE_VIBE)

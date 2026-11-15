@@ -38,7 +38,7 @@ CLI), and ``POST /api/auth/logout`` — all thin mirrors of the new socket ops
 over the transport seam, 422 on a refusal, 400 on a malformed body, and the
 structured daemon-down payload (200) when the socket is dead. They sit behind
 the bearer middleware like every other ``/api/*`` op, so auth-mutating ops
-require the coop token whenever the server is bound non-loopback.
+require the coop token on every bind by default (spec 32).
 
 Spec 30 (GUI lifecycle controls & hatchery knobs) adds the lifecycle mirrors
 ``POST /api/runs/{run_id}/stop`` and ``POST /api/runs/{run_id}/rerun`` (the
@@ -60,12 +60,16 @@ never opens the SQLite DB or artifact files directly, so the GUI cannot bypass
 queueing, admission, validation, quarantine, attestation, or the append-only
 stores.
 
-Auth rule: bound to loopback with no token configured → open (same trust domain
-as the socket). Bound non-loopback (the container case) — or a token configured
-on any bind — a bearer token is required: the configured ``coop_auth_token``
-wins, else an ephemeral token is generated at startup and printed exactly once
-to stdout. 401 without ``Authorization: Bearer …``; the SPA shows a login card.
-``/api/ping`` stays unauthenticated for the container healthcheck. No cookies;
+Auth rule (spec 32, review G3): the bearer token is required on **every** bind by
+default — "loopback + no token → open" is not a trust boundary (any local user
+shares 127.0.0.1). The old loopback-open behavior is an explicit opt-in:
+``coop_loopback_open = true`` **and** a loopback bind **and** no
+``coop_auth_token`` configured → open. A configured token wins on any bind;
+when auth is required and no token is configured, an ephemeral token is
+generated at startup and printed exactly once to stdout. 401 without
+``Authorization: Bearer …`` (compared in constant time — the bearer is the sole
+network credential, review G19); the SPA shows a login card. ``/api/ping`` stays
+unauthenticated for the container healthcheck. No cookies;
 the browser keeps the token in sessionStorage only. The token is never written
 to the audit log.
 
@@ -73,7 +77,7 @@ Spec 26 (the Farmhand): when ``farmhand_transport`` includes ``"https"``, this
 same listener also serves the Farmhand MCP endpoint — streamable-HTTP at
 ``farmhand_https_path`` (default ``/mcp``), mounted via a small ASGI bridge
 into this aiohttp app and behind the same bearer middleware as ``/api/*``
-(loopback-open rule included).
+(the bearer-by-default rule with the ``coop_loopback_open`` opt-in included).
 
 Spec 31 (the Farmhand & Connectors GUI views) adds ``GET /api/farmhand`` — a
 thin mirror of the new ``farmhand_info`` socket op (active transport(s), the
@@ -95,6 +99,7 @@ transport through ``settings_set``.
 from __future__ import annotations
 
 import contextlib
+import hmac
 import ipaddress
 import json
 import secrets
@@ -141,11 +146,25 @@ class CoopAuth:
     ephemeral: bool  # True when generated at startup, not configured
 
 
+def bearer_matches(authorization_header: str, token: str) -> bool:
+    """Constant-time bearer comparison (review G19): the coop bearer is the sole
+    network credential, so it is never compared with ``==`` / ``!=``. Both
+    sides are encoded to bytes first — ``hmac.compare_digest`` rejects
+    non-ASCII ``str`` and would otherwise raise on a crafted header."""
+    try:
+        given = authorization_header.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return hmac.compare_digest(given, f"Bearer {token}".encode("utf-8"))
+
+
 def coop_auth(settings: Settings) -> CoopAuth:
-    """Loopback + no token → open. Non-loopback (or any configured token) →
-    bearer required; configured token wins, else an ephemeral one is minted."""
+    """Bearer required on every bind by default (spec 32, review G3). Open only
+    when ``coop_loopback_open`` is set AND the bind is loopback AND no token is
+    configured — the explicit opt-in. A configured token always wins (required
+    on any bind); otherwise an ephemeral one is minted."""
     configured = settings.coop_auth_token
-    if configured is None and is_loopback(settings.coop_host):
+    if configured is None and settings.coop_loopback_open and is_loopback(settings.coop_host):
         return CoopAuth(required=False, token=None, ephemeral=False)
     if configured is not None:
         return CoopAuth(required=True, token=configured, ephemeral=False)
@@ -309,7 +328,7 @@ class CoopServer:
         if self.farmhand is not None and self.farmhand.wants(request.path):
             protected = True
         if self.auth.required and protected:
-            if request.headers.get("Authorization", "") != f"Bearer {self.auth.token}":
+            if not bearer_matches(request.headers.get("Authorization", ""), self.auth.token or ""):
                 return web.json_response(
                     {"ok": False, "error": "unauthorized: send Authorization: Bearer <token>"}, status=401
                 )
@@ -752,7 +771,7 @@ class CoopServer:
         no stored session), 400 on a malformed body, and the structured
         daemon-down payload (200) when the socket is dead — never a 500. All
         of these sit behind the bearer middleware like every /api/* op, so
-        they require the coop token whenever the server is non-loopback."""
+        they require the coop token on every bind by default (spec 32)."""
         provider, err = await self._api_auth_login_body(request, op)
         if err is not None:
             return err

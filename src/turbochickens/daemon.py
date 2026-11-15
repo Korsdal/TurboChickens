@@ -36,9 +36,10 @@ in-container path. Invalid bundles are never stored and never register a job.
 Spec 12 (coop): when ``coop_enabled`` is set, the same process also serves the
 TurboChickens GUI over HTTP (aiohttp, same event loop) — static SPA at ``/``
 and ``/api/ping`` + ``/api/status`` under ``/api``, thin mirrors of the socket
-ops called over the daemon's own socket. Loopback + no token → open;
-non-loopback (or any configured token) → bearer required, with an ephemeral
-token printed once at startup when none is configured.
+ops called over the daemon's own socket. The bearer token is required on every
+bind by default (spec 32, review G3); loopback + no token is open only with the
+``coop_loopback_open`` opt-in, and a configured token (or an ephemeral one
+printed once at startup) is required otherwise.
 
 Spec 19 (auth & access management in the GUI) adds the ops behind the Auth
 view: ``auth_providers`` (each provider's auth mode + perch seat expiry via
@@ -184,7 +185,9 @@ AUDIT_TAIL_MAX = 1000
 UPLOAD_MAX_FILES = 200
 
 #: spec 31 `settings_set`: the settings mutable at runtime from the GUI (the
-#: Farmhand view's transport switch). Everything else stays read-only there.
+#: Farmhand view's transport switch). Everything else stays read-only there —
+#: including ``coop_loopback_open`` (spec 32): the loopback-open opt-in is a
+#: startup setting, never flippable from the GUI.
 MUTABLE_SETTINGS_FIELDS = ("farmhand_transport",)
 
 PROTOCOL_VERSION = 1

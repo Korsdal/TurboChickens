@@ -67,9 +67,21 @@ class Settings(BaseModel):
     coop_port: int = Field(default=8737, gt=0, le=65535)
     coop_auth_token: str | None = Field(
         default=None,
-        description="Shared bearer token for the coop HTTP surface. Required when bound "
-        "non-loopback; when unset there, an ephemeral token is generated at startup and "
-        "printed once to stdout. Never written to the audit log.",
+        description="Shared bearer token for the coop HTTP surface. Required on every bind "
+        "unless coop_loopback_open opts a loopback bind out; when required and unset, an "
+        "ephemeral token is generated at startup and printed once to stdout. Never written "
+        "to the audit log.",
+    )
+    # spec 32 (review G3): the coop requires the bearer on every bind by default —
+    # "loopback + no token → open" is not a trust boundary. This key is the explicit
+    # opt-in that restores the old rule: set it and bind loopback with no
+    # coop_auth_token configured, and the HTTP surface is open. Default false.
+    # Read-only at runtime (not in MUTABLE_SETTINGS_FIELDS).
+    coop_loopback_open: bool = Field(
+        default=False,
+        description="Opt in to the old loopback-open rule: with this set, a loopback coop "
+        "bind and no coop_auth_token configured, the HTTP surface is open. Default false — "
+        "the bearer is required on every bind.",
     )
 
     # spec 26 (Farmhand): the MCP server over the farm's own socket ops —
@@ -158,6 +170,7 @@ class Settings(BaseModel):
             "coop_host": self.coop_host,
             "coop_port": self.coop_port,
             "coop_url": self.coop_url,
+            "coop_loopback_open": self.coop_loopback_open,
             "farmhand_transport": self.farmhand_transport,
             "farmhand_https_path": self.farmhand_https_path,
         }
