@@ -493,9 +493,12 @@ def test_e2e_exfil_attempt_at_candling_fails_closed_feeder_silent(api_daemon, fa
 def test_e2e_exfil_swap_at_hatch_fails_closed_feeder_silent(api_daemon, fake_api, tmp_path, monkeypatch) -> None:
     """Defense in depth: even if an egg passes Candling and is queued, a spec
     whose ref escapes at hatch time (here simulated by the loader handing the
-    Hatchery a ref that crosses the fence) fails closed at provisioning —
-    attested teardown, no clutch, no feeder request, secret never in any
-    served payload."""
+    Hatchery a ref that crosses the fence) fails closed at hatch — attested
+    teardown, no clutch, no feeder request, secret never in any served
+    payload. Spec 32 ticket 21 (G18): the swapped spec no longer candles to
+    the enqueue-time pin, so the hatch-time hash re-verification refuses it
+    first (the Fence re-check at provisioning remains the second layer for
+    hash-preserving escapes, covered by the `test_hatchery_recheck_*` tests)."""
     secret = write_host_secret(tmp_path)
     spec_path = write_egg(tmp_path, name="swap", adapter="mistral-api")  # legit refs on disk
     sock = api_daemon.settings.socket_path
@@ -515,7 +518,7 @@ def test_e2e_exfil_swap_at_hatch_fails_closed_feeder_silent(api_daemon, fake_api
     run = wait_terminal(sock, run_id)
     assert run["status"] == "failed"
     reason = run["manifest"]["status_reason"]
-    assert "provisioning failed" in reason and "input.prompt_file" in reason and "the fox refuses" in reason, reason
+    assert "fox refuses" in reason and "hash mismatch" in reason and "swapped egg" in reason, reason
 
     # nothing shipped to the feeder, nothing stored, teardown attested (1,1,1)
     assert fake_api.requests == []

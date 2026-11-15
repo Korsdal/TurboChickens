@@ -67,6 +67,12 @@ Scratch: `adapter.prepare` materializes `.tc-home/` inside the workspace and
 points the per-run HOME/TMPDIR/XDG_*/VIBE_HOME at it, with only a sanitized
 vibe profile in it — nothing the chicken plants in its "home" survives the
 abattoir's teardown, and the operator's real $HOME stays out of reach.
+
+Spec 32 ticket 21 (review finding G18) re-verifies the spec hash at hatch:
+the hash pinned when the egg was queued is recomputed when the egg is loaded
+at hatch, and a mismatch (an egg swapped between enqueue and hatch) fails
+closed — the run ends terminal `failed` with the abattoir's attestation, and
+nothing is provisioned or sent to the feeder under the stale hash.
 """
 
 from __future__ import annotations
@@ -109,7 +115,7 @@ from turbochickens.settings import (
     RUN_EVENT_LINE_MAX_LEN,
     Settings,
 )
-from turbochickens.spec.loader import load_spec
+from turbochickens.spec.loader import load_spec, spec_hash
 from turbochickens.spec.model import JobSpec
 from turbochickens.stats import rollup_usage
 from turbochickens.util import display_relpath, redact_host_paths, sanitize_log_line, utcnow_iso
@@ -151,6 +157,11 @@ def cost_cap_exceeded(usage: dict[str, Any], max_cost_usd: float | None) -> bool
     if isinstance(cost, bool) or not isinstance(cost, (int, float)):
         return False
     return float(cost) > float(max_cost_usd)
+
+
+class _HatchHashMismatch(Exception):
+    """Spec 32 ticket 21 (review G18): the egg loaded at hatch no longer
+    candles to the hash pinned at enqueue — the egg was swapped in between."""
 
 
 class RunPipeline:
@@ -518,6 +529,20 @@ class RunPipeline:
         attestation and audit rows."""
         run_id = item["run_id"]
         spec = load_spec(item["spec_path"])
+        # spec 32 ticket 21 (review G18): the hash pinned at enqueue is
+        # re-verified at hatch — the egg is loaded again here, and if it no
+        # longer candles to the pinned hash it was swapped between enqueue
+        # and hatch, so the run fails closed below (Fox refusal copy): nothing
+        # is provisioned and nothing is sent to the feeder under the stale hash
+        recomputed_hash = spec_hash(spec)
+        hash_mismatch: str | None = None
+        if recomputed_hash != item["spec_hash"]:
+            hash_mismatch = (
+                "the fox refuses to hatch a swapped egg — hash mismatch at hatch: the egg was queued"
+                f" pinned as sha256:{item['spec_hash']} but the egg on disk now candles to"
+                f" sha256:{recomputed_hash}; the egg changed after enqueue, so nothing was"
+                " provisioned and nothing was sent to the feeder"
+            )
         adapter = make_adapter(
             spec, credential_provider=self.credential_provider, providers=self.providers, settings=self.settings
         )
@@ -591,7 +616,13 @@ class RunPipeline:
                 }
             )
             provision_error: str | None = None
+            injected_bytes = 0
             try:
+                if hash_mismatch is not None:
+                    # spec 32 ticket 21 (G18): fail closed at hatch — the egg
+                    # on disk was swapped after enqueue; nothing is provisioned
+                    # or sent to the feeder under the stale pinned hash
+                    raise _HatchHashMismatch(hash_mismatch)
                 injected_bytes, chaining = self._provision(ctx)
                 budget["injected_context_bytes"] = injected_bytes
                 # spec 25: lineage in the Headcount + run log — this chicken
@@ -631,9 +662,22 @@ class RunPipeline:
                     "error",
                     sanitize_log_line(redact_host_paths(reason, *self._path_roots(ctx))),
                 )
+            except _HatchHashMismatch as e:
+                # spec 32 ticket 21 (G18): a swapped egg fails closed at hatch —
+                # terminal `failed` with the Fox refusal as the reason, before
+                # any harness work; the abattoir attestation lands in _finalize
+                # exactly like any provisioning failure
+                provision_error = str(e)
+                status, reason = "failed", str(e)
+                await self._event(
+                    run_id,
+                    "supervisor",
+                    "error",
+                    sanitize_log_line(redact_host_paths(reason, *self._path_roots(ctx))),
+                )
             cap_bytes = spec.resources.max_context_mb * 1024 * 1024
             if provision_error is not None:
-                pass  # chaining resolution failed — status/reason set above
+                pass  # swapped egg (G18) / chaining resolution failed — status/reason set above
             elif injected_bytes > cap_bytes:
                 # spec 07: hard cap on injected context, enforced at
                 # provisioning — the run fails before any harness work
