@@ -41,6 +41,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from turbochickens.cli.main import app
@@ -153,7 +154,9 @@ def test_shipped_settings_file_carries_container_defaults() -> None:
 
 def test_dockerfile_contract() -> None:
     text = DOCKERFILE.read_text()
-    assert re.search(r"^FROM python:3\.12-slim$", text, re.M)
+    # base image pinned by digest (spec 32 ticket 16 / G22) — the deep pin
+    # contract lives in tests/test_supply_chain.py
+    assert re.search(r"^FROM python:3\.12-slim@sha256:[0-9a-f]{64}$", text, re.M)
     assert re.search(r"^EXPOSE 8737$", text, re.M)
     assert re.search(r'^VOLUME \["/data"\]', text, re.M)
     # settings shipped into the image and picked up via the env var
@@ -170,14 +173,20 @@ def test_dockerfile_contract() -> None:
 
 def test_dockerignore_trims_build_context() -> None:
     entries = {l.strip() for l in DOCKERIGNORE.read_text().splitlines() if l.strip() and not l.startswith("#")}
-    for heavy in (".git", ".venv", "__pycache__", ".pytest_cache", "tests", "specs", "uv.lock"):
+    for heavy in (".git", ".venv", "__pycache__", ".pytest_cache", "tests", "specs"):
         assert any(heavy in e for e in entries), heavy
+    # spec 32 ticket 16 / G22: uv.lock must STAY in the context (the image
+    # installs from the hash-pinned lock) — pinned by tests/test_supply_chain.py
+    assert not any(e in ("uv.lock", "*.lock", "*") for e in entries)
 
 
 def test_compose_example() -> None:
     text = COMPOSE.read_text()
     assert "image: coop" in text
-    assert '"8737:8737"' in text
+    # spec 32 ticket 16 / G23: published on loopback only by default
+    assert '"127.0.0.1:8737:8737"' in text
+    ports = yaml.safe_load(text)["services"]["coop"]["ports"]
+    assert ports == ["127.0.0.1:8737:8737"], ports
     assert "coop-data:/data" in text
     assert "coop-data:" in text  # named volume declared
 
@@ -185,7 +194,7 @@ def test_compose_example() -> None:
 def test_docs_cover_build_run_compose_token_proxy_smoke() -> None:
     text = DOCS.read_text()
     assert "docker build -t coop ." in text
-    assert "docker run -p 8737:8737 -v coop-data:/data coop" in text
+    assert "docker run -p 127.0.0.1:8737:8737 -v coop-data:/data coop" in text
     assert "docker compose -f docker/compose.yaml" in text
     assert "coop auth token:" in text  # ephemeral token handling
     assert "/api/ping" in text and "HEALTHCHECK" in text

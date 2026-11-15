@@ -19,4 +19,5 @@ coop_port = 8737
 # an ephemeral token at startup and prints it exactly once to stdout — grab it
 # with `docker logs <container>`. To pin a fixed token instead, mount your own
 # settings file over /etc/turbochickens/settings.toml (or point
-# TURBOCHICKENS_SETTINGS at a mounted file) with coop_auth_token = "...".
+# TURBOCHICKENS_SETTINGS at a mounted file) with coop_auth_token = "..." —
+# docker/compose.yaml shows this mount commented out next to the /data volume.

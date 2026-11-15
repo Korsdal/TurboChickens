@@ -20,7 +20,9 @@ dependencies = [
 tc = "turbochickens.cli.main:app"
 
 [build-system]
-requires = ["hatchling"]
+# Pinned exactly (spec 32 ticket 16 / review G22): the container builds the
+# wheel through this backend, so it must not float either.
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
