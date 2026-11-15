@@ -26,10 +26,12 @@ artifact/context caps of spec 07.
 from __future__ import annotations
 
 import copy
+import ipaddress
 import os
 import tomllib
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -42,6 +44,60 @@ DEFAULT_PROVIDER = "mistral"
 
 class ProvidersError(Exception):
     """providers.toml missing, unreadable, or invalid."""
+
+
+def url_scheme(url: str) -> str:
+    """The lowercased scheme of `url` ("" when unparseable/schemeless)."""
+    try:
+        return (urlsplit(url).scheme or "").lower()
+    except ValueError:
+        return ""
+
+
+def url_host(url: str) -> str:
+    """The lowercased host of `url` ("" when absent/unparseable)."""
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def is_loopback_host(host: str) -> bool:
+    """True for `localhost` (RFC 6761) and any loopback IP (127.0.0.0/8, ::1).
+    Loopback http is a secure context (like browsers) and stays allowed for
+    hermetic local testing; it never leaves the host."""
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def oauth_endpoint_scheme_error(url: str) -> str | None:
+    """None when `url` is acceptable as a Feeder OAuth endpoint; otherwise a
+    refusal message. OAuth device/token endpoints must be https — plain http
+    is allowed only on loopback hosts (never across the network), and no other
+    scheme (javascript:, data:, ftp:, …) is accepted, so a misconfigured or
+    hostile auth server cannot be aimed at a non-TLS or scriptable target."""
+    scheme, host = url_scheme(url), url_host(url)
+    if scheme == "https":
+        return None
+    if scheme == "http" and is_loopback_host(host):
+        return None
+    return f"must be an https URL (http allowed only on loopback hosts, e.g. 127.0.0.1); got scheme {scheme!r} host {host!r}"
+
+
+def verification_uri_scheme_error(uri: str) -> str | None:
+    """None when `uri` may be relayed to an operator as the device-flow
+    verification link; otherwise a refusal message. The verification URI is
+    rendered as a link in the coop, so only https is accepted — a hostile or
+    misconfigured auth server must not be able to inject a `javascript:` (or
+    any other non-https) URI that would execute in the coop origin."""
+    scheme = url_scheme(uri)
+    if scheme == "https":
+        return None
+    return f"scheme {scheme!r} is not https — only https verification links are relayed"
 
 
 class ModelProfile(BaseModel):
@@ -65,7 +121,9 @@ class ProviderProfile(BaseModel):
     access tokens, and injects the token under the same `api_key_env` name, so
     adapters need no seat-specific code. The `oauth_*` fields locate the
     provider's device-authorization and token endpoints and are required for
-    `auth = "seat"`, rejected for `auth = "api-key"`.
+    `auth = "seat"`, rejected for `auth = "api-key"`. Both OAuth endpoints must
+    be https — plain http is accepted only on loopback hosts (hermetic local
+    testing); any other scheme is refused (spec 32, review finding G7).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -90,6 +148,14 @@ class ProviderProfile(BaseModel):
             present = [f for f in oauth_fields if getattr(self, f)]
             if present:
                 raise ValueError(f"{', '.join(present)} only valid with auth='seat' (this provider is auth='api-key')")
+        # spec 32 (G7): OAuth endpoints are https-only — http only on loopback
+        # (hermetic local testing), never any other scheme. Field-named.
+        for f in ("oauth_device_url", "oauth_token_url"):
+            url = getattr(self, f)
+            if url:
+                err = oauth_endpoint_scheme_error(url)
+                if err:
+                    raise ValueError(f"{f} {err}: {url!r}")
         return self
 
 

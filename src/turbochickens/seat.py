@@ -31,7 +31,12 @@ from typing import Any, Callable
 import httpx
 
 from turbochickens.adapter import DEFAULT_CREDENTIAL_ALLOWLIST, RunContext
-from turbochickens.providers import ProviderProfile, ProvidersConfig, ProvidersError
+from turbochickens.providers import (
+    ProviderProfile,
+    ProvidersConfig,
+    ProvidersError,
+    verification_uri_scheme_error,
+)
 from turbochickens.settings import Settings
 
 #: refresh a token this many seconds before its stated expiry
@@ -59,7 +64,10 @@ class DeviceGrant:
     is the grant credential — it stays server-side (daemon memory), it is
     never returned to a caller or written to the audit log. Only the
     user-facing `user_code` + `verification_uri` leave the broker (CLI
-    prints them; the GUI relays them to the browser)."""
+    prints them; the GUI relays them to the browser) — and the
+    `verification_uri` is https-only, scheme-validated when the grant is
+    accepted (`start_device_flow`), so no scriptable URI ever leaves the
+    perch."""
 
     provider: str
     device_code: str
@@ -362,6 +370,16 @@ class SeatBroker:
             expires_in = float(dev.get("expires_in", 1800) or 1800)
             if not device_code or not verification_uri:
                 raise SeatError(f"device endpoint for provider {provider_name!r} returned an incomplete device grant")
+            # spec 32 (G7): the verification URI is ingested here, before it is
+            # relayed anywhere — only https links may leave the perch, so a
+            # hostile/misconfigured auth server cannot inject a javascript:
+            # (or any non-https) URI that would execute in the coop origin.
+            scheme_err = verification_uri_scheme_error(verification_uri)
+            if scheme_err:
+                raise SeatError(
+                    f"the Fox refuses the device grant from provider {provider_name!r}: "
+                    f"verification_uri {scheme_err}"
+                )
             return DeviceGrant(
                 provider=provider_name,
                 device_code=str(device_code),
