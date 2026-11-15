@@ -26,7 +26,7 @@ and the manifest records the resolved sources (`chaining`) plus a
 `clutch.consumed` Headcount row.
 
 Spec 23 (Free-Range) adds `resources.free_range`: a Free-Range chicken has no
-fence — the hard wall-clock kill is removed (`timeout_sec` is optional in the
+wall-clock cap — the hard wall-clock kill is removed (`timeout_sec` is optional in the
 egg, and never enforced as a kill for a free-range chicken) — so it dies only
 via `run_stop` (spec 22) or daemon shutdown, both ending in the same attested
 `stopped` teardown as any terminal state.
@@ -90,12 +90,12 @@ from typing import Any
 from turbochickens.adapter import (
     SCRATCH_HOME_DIRNAME,
     HarnessResult,
+    PreparedRun,
     RunContext,
     TeardownReport,
     auth_telemetry_of,
     make_adapter,
     reap_process_group,
-    sanitize_log_line,
     signal_process_group,
 )
 from turbochickens import fox
@@ -118,7 +118,7 @@ from turbochickens.settings import (
 from turbochickens.spec.loader import load_spec, spec_hash
 from turbochickens.spec.model import JobSpec
 from turbochickens.stats import rollup_usage
-from turbochickens.util import display_relpath, redact_host_paths, sanitize_log_line, utcnow_iso
+from turbochickens.util import cap_text_bytes, display_relpath, redact_host_paths, sanitize_log_line, utcnow_iso
 from turbochickens.validate import OutputValidation, validate_output
 
 #: coopd's own log (stderr of the daemon process) — the full, unredacted detail
@@ -190,14 +190,20 @@ class RunPipeline:
         # actively driving; `request_stop` sets the event and the run ends
         # `stopped` (SIGTERM, then hard kill) instead of collecting output
         self._active: dict[str, asyncio.Event] = {}
-        # spec 23: the active Free-Range chickens (no fence — they die only via
-        # `run_stop` or daemon shutdown), so shutdown can ask them to stop
+        # spec 23: the active Free-Range chickens (no wall-clock cap — they die
+        # only via `run_stop` or daemon shutdown), so shutdown can ask them to stop
         self._active_free_range: set[str] = set()
         # spec 32 (ticket 10): chicken pid → run_id registry shared with the
         # daemon — the daemon reads SO_PEERCRED on every socket connection and
         # resolves the peer pid (a chicken or one of its descendants) to the
         # owning run, so lineage is forced from the peer, never client-sent
         self._pid_registry = pid_registry
+        # spec 32 (G17): run_id → the path roots redacted from every stored
+        # run-event line of that chicken (the data dir + the egg's own dir) —
+        # harness-streamed lines can echo the chicken's absolute HOME (the
+        # Scratch inside its workspace), so the redaction happens at the
+        # single _event choke point, not per call site
+        self._run_path_roots: dict[str, tuple[Path, ...]] = {}
 
     def _register_chicken_pid(self, run_id: str, pid: int) -> None:
         """Spec 32 (ticket 10): a chicken's harness process pid is registered
@@ -244,6 +250,13 @@ class RunPipeline:
         # at this single choke point — supervisor-authored lines included — so
         # a hostile Feeder's error bytes can never reach `tc runs logs` raw
         # (no ANSI/OSC escape sequences).
+        # spec 32 (G17): the same choke point also redacts host paths — a
+        # harness-streamed line can echo the chicken's absolute HOME (the
+        # Scratch inside its workspace) or the egg's host directory, and none
+        # of that may reach runs_logs
+        roots = self._run_path_roots.get(run_id)
+        if roots:
+            line = redact_host_paths(line, *roots)
         # spec 32 (G20, the Fence): the line is also length-capped here, and
         # the per-chicken run-event log itself is capped at MAX_RUN_EVENTS
         # rows (the table is append-only, so the cap is enforced at insert —
@@ -305,7 +318,7 @@ class RunPipeline:
                     contained_ref(spec_dir, att, "input.attachments"),
                     attachment_workspace_name(att),
                 )
-        ws.mkdir(parents=True, exist_ok=True)
+        # (fox.ensure_dir(ws) above already created the workspace — no extra mkdir)
         shutil.copyfile(prompt_src, ws / "prompt.txt")
         injected = prompt_src.stat().st_size
         chaining: list[dict[str, Any]] = []
@@ -557,6 +570,9 @@ class RunPipeline:
             # spec 27 (ChickenSubs): sub-chicken lineage
             parent_run_id=item.get("parent_run_id"),
         )
+        # spec 32 (G17): from here on, every run-event line of this chicken is
+        # host-path-redacted against these roots at the _event choke point
+        self._run_path_roots[run_id] = self._path_roots(ctx)
         # spec 32 (ticket 10): the spawn hook records the chicken's pid in
         # the shared registry at hatch/spawn, so the daemon can force lineage
         # from the socket peer's credentials
@@ -575,8 +591,8 @@ class RunPipeline:
             "connectors": list(spec.harness.connectors),
         }
         budget: dict[str, Any] = {
-            # spec 23: a Free-Range chicken has no fence — timeout_sec is the
-            # declared value (possibly None) and no hard kill is enforced
+            # spec 23: a Free-Range chicken has no wall-clock cap — timeout_sec
+            # is the declared value (possibly None) and no hard kill is enforced
             "free_range": spec.resources.free_range,
             "timeout_sec": spec.resources.timeout_sec,
             "max_context_mb": spec.resources.max_context_mb,
@@ -748,9 +764,12 @@ class RunPipeline:
             # as well as at collection in the adapter — defense in depth, so no
             # path can store unbounded raw output in memory, the DB, or on disk;
             # the manifest budget records `truncated`
-            if result is not None and len(result.raw_output) > OUTPUT_MAX_BYTES:
-                result.raw_output = result.raw_output[:OUTPUT_MAX_BYTES]
-                result.truncated = True
+            if result is not None:
+                # reviewer finding: the cap counts encoded bytes, not characters
+                capped, was_capped = cap_text_bytes(result.raw_output, OUTPUT_MAX_BYTES)
+                if was_capped:
+                    result.raw_output = capped
+                    result.truncated = True
             if result is not None and result.truncated:
                 budget["output_truncated"] = True
                 budget["output_cap_bytes"] = OUTPUT_MAX_BYTES
@@ -833,6 +852,7 @@ class RunPipeline:
         finally:
             self._active.pop(run_id, None)
             self._active_free_range.discard(run_id)
+            self._run_path_roots.pop(run_id, None)
             # spec 32 (ticket 10): the chicken is gone — drop its pid from the
             # peer-identity registry so a reused pid is never attributed to it
             self._unregister_chicken_pids(run_id)
@@ -907,12 +927,21 @@ class RunPipeline:
                     reason = f"{reason}; harness output discarded (pipes still held after the group kill)"
             else:
                 # no live subprocess to signal (e.g. an HTTP adapter) — cancel
-                # the in-flight call itself, with a bounded await
+                # the in-flight call itself, with a bounded await. The
+                # cancelled task raises CancelledError (not TimeoutError)
+                # through the shield, so both are caught here — otherwise a
+                # stopped proc-less chicken would end failed/internal error
+                # instead of `stopped`
                 exec_task.cancel()
                 try:
                     await asyncio.wait_for(asyncio.shield(exec_task), timeout=POST_KILL_AWAIT_SEC)
                 except asyncio.TimeoutError:
                     pass
+                except asyncio.CancelledError:
+                    # re-raise only when OUR task was cancelled (not the inner one)
+                    task = asyncio.current_task()
+                    if task is not None and task.cancelling() > 0:
+                        raise
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await exec_task
                 result = HarnessResult(exit_code=None, raw_output="", usage={}, error="stopped by operator")

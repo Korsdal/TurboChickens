@@ -39,6 +39,7 @@ from turbochickens.providers import (
     verification_uri_scheme_error,
 )
 from turbochickens.settings import Settings
+from turbochickens.util import redact_host_paths
 from turbochickens.util import http_error_detail
 
 #: refresh a token this many seconds before its stated expiry
@@ -175,7 +176,16 @@ class SeatStore:
             data = json.loads(path.read_text(encoding="utf-8"))
             return SeatSession.from_dict(data)
         except (OSError, ValueError, KeyError, TypeError) as e:
-            raise SeatError(f"perch seat for provider {provider!r} is unreadable ({path}): {e}; run `tc auth login {provider}` again") from e
+            # spec 32 (G17, reviewer finding): the served message carries only
+            # the seats/<provider>.json form — never the host path (an OSError
+            # string embeds it). The message surfaces via auth_providers'
+            # session_error and status_reason, so the host path is redacted
+            # here; the full detail stays in coopd's own log.
+            detail = redact_host_paths(str(e), self.dir)
+            raise SeatError(
+                f"perch seat for provider {provider!r} is unreadable (seats/{provider}.json): {detail};"
+                f" run `tc auth login {provider}` again"
+            ) from e
 
     def delete(self, provider: str) -> bool:
         """Unlink the provider's session file — only after `_path` has

@@ -409,3 +409,136 @@ print(json.dumps({"message": "hello from probe vibe"}))
             _stop_quietly(sock, rid)
     finally:
         dt.stop()
+
+
+# --- reviewer finding: the proc-less (HTTP-adapter) stop path -------------------
+
+
+class _ProcLessAdapter:
+    """A proc-less harness adapter (the mistral-api class): `execute` hangs
+    until cancelled and `ctx.proc` stays None, so `run_stop` takes the
+    cancel branch of the stop path, not the signal branch."""
+
+    name = "proc-less-fake"
+
+    def prepare(self, run):
+        from turbochickens.adapter import PreparedRun
+
+        run.env = dict(run.env)
+        return PreparedRun(
+            context=run,
+            harness={
+                "adapter": self.name,
+                "model": run.spec.harness.model,
+                "temperature": run.spec.harness.temperature,
+            },
+            auth={"mode": "none", "token_expires_at": None},
+        )
+
+    async def execute(self, prepared, event_sink, timeout_sec):
+        import asyncio
+
+        await event_sink("harness", "info", "proc-less harness in flight")
+        await asyncio.Event().wait()  # hangs forever — only cancellation ends it
+
+    async def teardown(self, run):
+        import shutil
+
+        from turbochickens.adapter import TeardownReport
+
+        if run.workspace.exists():
+            shutil.rmtree(run.workspace, ignore_errors=True)
+        run.env.clear()
+        return TeardownReport(
+            process_reaped=True, workspace_removed=not run.workspace.exists(), env_cleared=True
+        )
+
+
+def test_stop_of_proc_less_adapter_ends_stopped_not_failed(tmp_path, monkeypatch, settings_file) -> None:
+    """Reviewer finding (runner stop path, proc-less branch): `exec_task.cancel()`
+    then awaiting the shielded task raises CancelledError, not TimeoutError —
+    pre-fix that escaped the `except TimeoutError` and the stopped chicken ended
+    failed/internal error instead of `stopped`."""
+    monkeypatch.setattr(runner_mod, "make_adapter", lambda *a, **k: _ProcLessAdapter())
+    monkeypatch.setattr(runner_mod, "POST_KILL_AWAIT_SEC", 1.0, raising=False)
+    dt = _daemon(settings_file, None)
+    try:
+        settings = dt.settings
+        sock = settings.socket_path
+        job = write_job(tmp_path, name="procless-egg", prompt="Say hello")
+        rid = request(sock, "enqueue", spec_path=str(job), timeout=5.0)["run_id"]
+        wait_status(sock, rid, ("running",))
+        resp = request(sock, "run_stop", run_id=rid, timeout=30.0)
+        assert resp["ok"] is True, resp
+        # positive: the proc-less chicken ends `stopped` (not failed/internal error)
+        assert resp["status"] == "stopped" and resp["run_id"] == rid
+        assert "stopped by operator" in resp["reason"]
+        run = request(sock, "runs_show", run_id=rid, timeout=2.0)["run"]
+        assert run["status"] == "stopped", run["status"]
+        assert run["manifest"]["status"] == "stopped"
+        assert "in-flight harness call cancelled" in run["manifest"]["status_reason"]
+        # attested teardown (1,1,1) exactly like the signal branch
+        assert db_row(settings, ATT_SQL, (rid,)) == (1, 1, 1)
+        assert not (settings.data_dir / "workspaces" / rid).exists()
+        audit = AuditLog(settings.audit_log_path).read_all()
+        assert any(r.get("event") == "chicken.stopped" and r.get("run_id") == rid for r in audit)
+        assert rid not in request(sock, "status", timeout=2.0)["alerts"]
+    finally:
+        _stop_quietly(sock, rid)
+        dt.stop()
+
+
+# --- reviewer finding: harness-streamed lines are host-path redacted ------------
+
+
+FAKE_VIBE_ECHO_HOME = '''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+if "--version" in args:
+    print("vibe 9.9.9-fake")
+    sys.exit(0)
+prompt_file = args[args.index("--prompt-file") + 1] if "--prompt-file" in args else ""
+print("HOME=" + os.environ.get("HOME", ""), file=sys.stderr)
+print("PROMPT=" + prompt_file, file=sys.stderr)
+print("CWD=" + os.getcwd(), file=sys.stderr)
+out_dir = args[args.index("--output-dir") + 1] if "--output-dir" in args else None
+if out_dir:
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "export.json"), "w") as f:
+        json.dump({"usage": {"input_tokens": 12, "output_tokens": 34}}, f)
+print(json.dumps({"message": "hello from echo fake vibe"}))
+'''
+
+
+def test_harness_lines_echoing_home_are_host_path_redacted_in_runs_logs(
+    tmp_path, monkeypatch, settings_file
+) -> None:
+    """Reviewer finding (G17, _event choke point): run-event lines are
+    sanitized but must also be host-path-redacted — a harness-streamed line
+    can echo the chicken's absolute HOME (the Scratch inside its workspace).
+    Pre-fix the absolute path landed in runs_logs."""
+    bin_path = tmp_path / "fake-vibe-echo"
+    bin_path.write_text(FAKE_VIBE_ECHO_HOME)
+    bin_path.chmod(0o755)
+    monkeypatch.setenv("TURBOCHICKENS_VIBE_BIN", str(bin_path))
+    dt = _daemon(settings_file, bin_path)
+    try:
+        settings = dt.settings
+        sock = settings.socket_path
+        job = write_job(tmp_path, name="echo-egg", prompt="Say hello")
+        rid = request(sock, "enqueue", spec_path=str(job), timeout=5.0)["run_id"]
+        run = wait_terminal(sock, rid)
+        assert run["status"] == "succeeded", run["manifest"].get("status_reason")
+        events = request(sock, "runs_logs", run_id=rid, timeout=2.0)["events"]
+        lines = [e["line"] for e in events]
+        # positive: the harness's HOME line was captured (sanitized, stored)
+        home_lines = [ln for ln in lines if "HOME=" in ln]
+        assert home_lines, lines
+        # negative: no stored line carries the host paths (data dir / egg dir)
+        for ln in lines:
+            assert str(settings.data_dir) not in ln, ln
+            assert str(tmp_path) not in ln, ln
+        # positive: the redaction kept the root-relative form
+        assert any(".tc-home" in ln for ln in home_lines), home_lines
+    finally:
+        dt.stop()

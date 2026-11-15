@@ -70,7 +70,14 @@ from mcp.server.mcpserver import MCPServer
 
 from turbochickens import client, fox
 from turbochickens.client import DaemonUnreachable
-from turbochickens.settings import SOCKET_STREAM_LIMIT, UPLOAD_MAX_HTTP_BODY, Settings
+from turbochickens.settings import (
+    COOP_HANDLER_TIMEOUT_SEC,
+    COOP_KEEPALIVE_TIMEOUT_SEC,
+    COOP_MAX_CONNECTIONS,
+    SOCKET_STREAM_LIMIT,
+    UPLOAD_MAX_HTTP_BODY,
+    Settings,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from turbochickens.adapter import RunContext
@@ -268,13 +275,13 @@ def build_server(
         # `via` key smuggled into a tool payload is dropped, never forwarded
         payload.pop("via", None)
         try:
-            return await asyncio.wait_for(
-                client.request_async(socket_path, op, via="farmhand", **payload), timeout
-            )
+            # the round-trip timeout is enforced inside request_async (spec 32
+            # ticket 18), which maps its own timeout to DaemonUnreachable — so
+            # there is no separate TimeoutError branch to catch here (it was
+            # dead code after that refactor)
+            return await client.request_async(socket_path, op, timeout=timeout, via="farmhand", **payload)
         except DaemonUnreachable as e:
             return {"ok": False, "op": op, "daemon": {"up": False}, "error": str(e)}
-        except TimeoutError:
-            return {"ok": False, "op": op, "error": f"coopd did not answer {op!r} within {timeout}s"}
 
     server = MCPServer(
         name=FARMHAND_NAME,
@@ -499,6 +506,54 @@ async def asgi_request(app: Any, request: web.Request) -> web.StreamResponse:
     return resp
 
 
+#: spec 32 (G20, the Fence) — in-flight requests on the standalone HTTPS
+#: runner, same cap as the coop listener (over the cap → 503)
+_active_https_requests = 0
+
+
+@web.middleware
+async def _caps_middleware(request: web.Request, handler):
+    """Spec 32 (reviewer finding): the standalone ``tc farmhand serve
+    --transport https`` runner gets the same Fence caps the coop listener
+    got (G20) — a connection-count cap (503) and a per-handler timeout
+    (504). The Farmhand MCP path itself (a long-lived SSE stream) is exempt
+    from the per-handler timeout, exactly like on the coop listener; it stays
+    bounded by the connection cap and the runner's shutdown_timeout."""
+    global _active_https_requests
+    if _active_https_requests >= COOP_MAX_CONNECTIONS:
+        return web.json_response(
+            {
+                "ok": False,
+                "error": (
+                    f"the fence is full: the farmhand serves at most {COOP_MAX_CONNECTIONS} requests"
+                    " at once — retry shortly"
+                ),
+            },
+            status=503,
+        )
+    _active_https_requests += 1
+    try:
+        mcp_path = request.app.get("farmhand_https_path") or "/mcp"
+        if request.path == mcp_path or request.path.startswith(mcp_path + "/"):
+            return await handler(request)  # SSE stream: no per-handler timeout
+        try:
+            async with asyncio.timeout(COOP_HANDLER_TIMEOUT_SEC):
+                return await handler(request)
+        except TimeoutError:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": (
+                        f"the Fox cut the request short after {COOP_HANDLER_TIMEOUT_SEC:g}s"
+                        " — the farmhand is swamped, retry"
+                    ),
+                },
+                status=504,
+            )
+    finally:
+        _active_https_requests -= 1
+
+
 class FarmhandHTTP:
     """The Farmhand's streamable-HTTP endpoint (spec 26): the MCP server's
     Starlette app mounted at ``farmhand_https_path`` on the coop listener,
@@ -613,14 +668,18 @@ async def serve_https(settings: Settings) -> None:
     # spec 32 (G21): the Fence's security headers on every response of this
     # listener too (the streamed MCP responses get them in asgi_request)
     app = web.Application(
-        middlewares=[fox.security_headers_middleware, farmhand.auth_middleware],
+        middlewares=[fox.security_headers_middleware, farmhand.auth_middleware, _caps_middleware],
         client_max_size=UPLOAD_MAX_HTTP_BODY,
     )
+    app["farmhand_https_path"] = farmhand.path
     app.router.add_route("*", farmhand.path, farmhand.handler)
     app.router.add_route("*", farmhand.path + "/", farmhand.handler)
     # shutdown_timeout bounds the handler drain at cleanup (a hung MCP SSE
-    # stream must never wedge the process)
-    runner = web.AppRunner(app, shutdown_timeout=15.0)
+    # stream must never wedge the process); spec 32 (G20): the keepalive cap
+    # matches the coop listener, so idle holds cannot pile up here either
+    runner = web.AppRunner(
+        app, shutdown_timeout=15.0, keepalive_timeout=COOP_KEEPALIVE_TIMEOUT_SEC
+    )
     await runner.setup()
     site = web.TCPSite(runner, settings.coop_host, settings.coop_port)
     await site.start()

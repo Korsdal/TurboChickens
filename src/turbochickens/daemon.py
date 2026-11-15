@@ -372,17 +372,30 @@ def _peer_runs_farmhand(pid: int) -> bool:
         return False
 
 
-def _resolve_via(sent_via: Any, peer_pid: int | None) -> str:
+def _resolve_via(
+    sent_via: Any, caller: CallerIdentity | None, chicken_pids: dict[int, str] | None = None
+) -> str:
     """Resolve the `via` actor for one socket request. A client-sent `via`
     in the request body is honored only when the peer is verifiably trusted:
     an in-process forwarder (peer pid == our pid, SO_PEERCRED-verified) or a
     `farmhand serve` process. Every other caller is the plain `socket`
-    surface, whatever it claims."""
+    surface, whatever it claims.
+
+    Reviewer finding (hardening): on a chicken-owned connection the /proc
+    cmdline check alone is not enough — a chicken process can fake its argv,
+    so the `farmhand` label is pinned only when the peer is a strict
+    *descendant* of a registered chicken (the attached Farmhand serve
+    process), never the chicken process itself."""
     if not isinstance(sent_via, str) or sent_via not in VIA_ACTORS:
         return "socket"
+    peer_pid = caller.pid if caller is not None else None
     if peer_pid is not None and peer_pid == os.getpid():
         return sent_via if sent_via in _INPROC_VIA else "socket"
     if sent_via == "farmhand" and peer_pid is not None and _peer_runs_farmhand(peer_pid):
+        if caller is not None and caller.is_chicken and (chicken_pids or {}).get(peer_pid) == caller.run_id:
+            # the peer IS the chicken process itself faking a farmhand argv —
+            # pin the honest `socket` label
+            return "socket"
         return "farmhand"
     return "socket"
 
@@ -545,8 +558,8 @@ class Daemon:
         try:
             await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            # spec 23: a Free-Range chicken has no fence — daemon shutdown is
-            # one of its two attested death paths, so ask every active one to
+            # spec 23: a Free-Range chicken has no wall-clock cap — daemon
+            # shutdown is one of its two attested death paths, so ask every active one to
             # stop via the spec-22 stop path (SIGTERM → hard kill → `stopped`)
             # instead of waiting out the bounded drain below
             if self.pipeline is not None:
@@ -716,9 +729,21 @@ class Daemon:
                     break
                 if not line:
                     break
+                # per-handler cap: one op may not wedge the supervision loop.
+                # spec 32 (reviewer finding): the dispatch runs shielded, so on
+                # timeout the caller gets the Fox error below while the
+                # mutating op itself still runs to completion (it is never
+                # cancelled mid-flight) — the client simply retries/reads the
+                # outcome afterwards
+                dispatch_task = asyncio.create_task(self._respond(line, caller))
+                # consume a late exception so it is never logged as unretrieved
+                dispatch_task.add_done_callback(
+                    lambda t: None if t.cancelled() else t.exception()
+                )
                 try:
-                    # per-handler cap: one op may not wedge the supervision loop
-                    resp = await asyncio.wait_for(self._respond(line, caller), timeout=SOCKET_HANDLER_TIMEOUT_SEC)
+                    resp = await asyncio.wait_for(
+                        asyncio.shield(dispatch_task), timeout=SOCKET_HANDLER_TIMEOUT_SEC
+                    )
                 except TimeoutError:
                     resp = {
                         "ok": False,
@@ -738,6 +763,17 @@ class Daemon:
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
+    def _redaction_roots(self) -> tuple[Path, ...]:
+        """spec 32 (G17): the path roots redacted from every served error of
+        this daemon — the data dir (socket, db, workspaces, uploads, seats
+        all live under it) and the socket's own directory when configured
+        elsewhere."""
+        roots = [self.settings.data_dir]
+        sock_parent = self.settings.socket_path.parent
+        if sock_parent != self.settings.data_dir:
+            roots.append(sock_parent)
+        return tuple(roots)
+
     async def _respond(self, line: bytes, caller: CallerIdentity | None = None) -> dict[str, Any]:
         try:
             req = json.loads(line.decode("utf-8"))
@@ -748,14 +784,21 @@ class Daemon:
         try:
             return await self._dispatch(req, caller)
         except Exception as e:  # never let one bad request kill the connection loop
-            return {"ok": False, "protocol": PROTOCOL_VERSION, "error": f"{type(e).__name__}: {e}"}
+            # spec 32 (G17, reviewer finding): the catch-all error is served
+            # verbatim, so it is run through the host-path redactor with the
+            # daemon's path roots (an OSError str embeds host paths)
+            return {
+                "ok": False,
+                "protocol": PROTOCOL_VERSION,
+                "error": redact_host_paths(f"{type(e).__name__}: {e}", *self._redaction_roots()),
+            }
 
     async def _dispatch(self, req: dict[str, Any], caller: CallerIdentity | None = None) -> dict[str, Any]:
         # spec 32 / review G24: the Headcount `via` actor is resolved from the
         # SO_PEERCRED-verified peer, never trusted from the client-writable
         # request body (`via` is popped here) — every row written while this
         # request is handled carries the resolved actor
-        via = _resolve_via(req.pop("via", None), caller.pid if caller is not None else None)
+        via = _resolve_via(req.pop("via", None), caller, self._chicken_pids)
         with audit_via(via):
             return await self._dispatch_op(req, caller)
 

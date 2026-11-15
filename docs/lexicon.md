@@ -17,7 +17,7 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 | **Pecking Order** | The queue of Eggs waiting to hatch | queue |
 | **Hatchery** | Agent provisioning — hatches an Egg into a Chicken | provisioning / `runner.py` |
 | **Chicken** | A running agent instance | run / agent process |
-| **Free-Range** | "No max TTL" mode in the Hatchery — a Chicken with no fence | max-TTL toggle |
+| **Free-Range** | "No max TTL" mode in the Hatchery — a Chicken with no wall-clock cap (the Fence is the security boundary, not the clock) | max-TTL toggle |
 | **Feeders** | Model providers — who feeds the Chickens | `providers.py` |
 | **Feed Budget** | Per-run budgets: timeout, context cap, cost | run budgets / `budget.outcome` |
 | **Feed Ledger** | The per-egg rollup of what the flock was actually fed — tokens in/out, expected feed per Chicken | `stats.py`, the Feed view |

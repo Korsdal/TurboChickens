@@ -63,7 +63,11 @@ async def request_async(
     try:
         return await asyncio.wait_for(_round_trip(socket_path, op, **payload), timeout=timeout)
     except asyncio.TimeoutError as e:
-        raise DaemonUnreachable(f"no coopd at {socket_path}: timed out after {timeout}s") from e
+        # spec 32 (G17): path-free like the OSError branch below — this
+        # message is served by the coop's dead-socket 200/503 payloads, so it
+        # never carries the host socket path (the local CLI knows the
+        # configured path from its own settings)
+        raise DaemonUnreachable(f"no coopd answering on the daemon socket: timed out after {timeout}s") from e
     except DaemonUnreachable:
         raise
     except OSError as e:
@@ -84,8 +88,7 @@ def request(
     async def _go() -> dict[str, Any]:
         return await request_async(socket_path, op, timeout=timeout, **payload)
 
-    try:
-        return asyncio.run(_go())
-    except asyncio.TimeoutError as e:
-        # spec 32 (G17): path-free — this error is served by the coop layer too
-        raise DaemonUnreachable(f"no coopd answering on the daemon socket: timed out after {timeout}s") from e
+    # request_async already maps every failure mode — including its own
+    # round-trip timeout — to DaemonUnreachable, so no TimeoutError can
+    # escape asyncio.run here (spec 32 / ticket 18)
+    return asyncio.run(_go())

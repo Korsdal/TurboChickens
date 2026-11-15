@@ -371,7 +371,12 @@ def test_e2e_chicken_gets_scratch_home_and_no_proc_or_real_home_access(
     # the hook the chicken planted in its $HOME landed in the scratch (inside the
     # workspace), never in the operator's real home
     assert facts["hook_landed_in_ws"] is True
-    assert facts["hook_path"].startswith(str(settings.data_dir / "workspaces" / run_id))
+    # spec 32 (G17): the served ENVFACT log line is host-path redacted at the
+    # _event choke point — the hook path appears in its data-dir-relative form
+    # only, never as a host absolute path (hook_landed_in_ws above is computed
+    # inside the chicken from the real env, so it still proves placement)
+    assert facts["hook_path"] == f"workspaces/{run_id}/.tc-home/.vibe/hook.toml", facts["hook_path"]
+    assert not facts["hook_path"].startswith(str(settings.data_dir))
 
     # nothing survives teardown: the workspace — scratch included — is gone
     assert not (settings.data_dir / "workspaces" / run_id).exists()

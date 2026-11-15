@@ -16,10 +16,12 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import tomllib
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
@@ -30,7 +32,7 @@ from turbochickens.chaining import attachment_workspace_name
 from turbochickens.providers import ProvidersConfig, ProvidersError, load_providers
 from turbochickens.settings import OUTPUT_MAX_BYTES
 from turbochickens.spec.model import JobSpec
-from turbochickens.util import http_error_detail, sanitize_log_line  # sanitize_log_line re-exported for callers
+from turbochickens.util import cap_text_bytes, http_error_detail, sanitize_log_line
 
 ADAPTER_WEIGHTS: dict[str, float] = {"mistral-api": 0.25, "vibe-cli": 1.0}
 
@@ -76,9 +78,42 @@ SCRATCH_ENV_KEYS = (
     "VIBE_HOME",
 )
 
+#: the Scratch subpath each SCRATCH_ENV_KEYS entry points at (HOME is the
+#: Scratch root itself)
+_SCRATCH_SUBPATHS = {
+    "HOME": "",
+    "TMPDIR": "tmp",
+    "XDG_CONFIG_HOME": "config",
+    "XDG_DATA_HOME": "data",
+    "XDG_CACHE_HOME": "cache",
+    "VIBE_HOME": "vibe",
+}
+
 #: Default credential allowlist: names that may be injected per-run from the
 #: daemon's environment. The extension point is the CredentialProvider below.
 DEFAULT_CREDENTIAL_ALLOWLIST = ("MISTRAL_API_KEY",)
+
+#: a URL inside free text — transport-error strings can embed the provider URL
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _url_scrubbed(url: str) -> str:
+    """The URL without any userinfo (``user:pass@host``) — a provider
+    ``base_url`` may embed credentials, and neither a streamed log line nor a
+    served error may carry them (reviewer finding: userinfo leak)."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "<url withheld by the fox>"
+    if parts.username is None and parts.password is None:
+        return url
+    host = parts.hostname or ""
+    try:
+        if parts.port:
+            host = f"{host}:{parts.port}"
+    except ValueError:
+        pass
+    return urllib.parse.urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
 
 
 class AdapterNotImplemented(Exception):
@@ -228,16 +263,10 @@ def auth_telemetry_of(provider: CredentialProvider, run: RunContext) -> dict[str
 
 def scratch_home_env(workspace: Path) -> dict[str, str]:
     """The HOME/XDG/TMPDIR/VIBE_HOME mapping of the per-run Scratch: every one
-    of them resolves inside the chicken's own workspace (review G9)."""
+    of them resolves inside the chicken's own workspace (review G9). Built
+    from SCRATCH_ENV_KEYS so the key list has a single source of truth."""
     scratch = workspace / SCRATCH_HOME_DIRNAME
-    return {
-        "HOME": str(scratch),
-        "TMPDIR": str(scratch / "tmp"),
-        "XDG_CONFIG_HOME": str(scratch / "config"),
-        "XDG_DATA_HOME": str(scratch / "data"),
-        "XDG_CACHE_HOME": str(scratch / "cache"),
-        "VIBE_HOME": str(scratch / "vibe"),
-    }
+    return {key: str(scratch / _SCRATCH_SUBPATHS[key]) for key in SCRATCH_ENV_KEYS}
 
 
 def _operator_vibe_config_text() -> str | None:
@@ -735,7 +764,7 @@ class MistralAPIAdapter:
         await event_sink(
             "harness",
             "info",
-            f"POST {url} model={self.model} json_mode={str(self.model_profile.json_mode).lower()}",
+            f"POST {_url_scrubbed(url)} model={self.model} json_mode={str(self.model_profile.json_mode).lower()}",
         )
         delay = self.backoff_base_sec
         attempt = 0
@@ -747,7 +776,9 @@ class MistralAPIAdapter:
                 resp = await client.post(url, json=body, headers=headers)
                 status = resp.status_code
             except httpx.TransportError as e:
-                err = f"{type(e).__name__}: {e}"
+                # reviewer finding: a transport error's text can embed the
+                # provider URL (userinfo leak) — strip every URL from it
+                err = f"{type(e).__name__}: {_URL_RE.sub('<url withheld by the fox>', str(e))}"
             if resp is not None and status == 200:
                 return await self._on_success(resp, event_sink)
             retryable = status is None or status == 429 or status >= 500
@@ -825,12 +856,10 @@ class MistralAPIAdapter:
             "harness", "info", f"provider http 200: tokens_in={tokens_in} tokens_out={tokens_out}"
         )
         content = content or ""
-        truncated = False
-        if len(content) > OUTPUT_MAX_BYTES:
-            # spec 32 (G20): a hostile/huge provider response is capped, not
-            # buffered whole — the clutch is stored truncated
-            content = content[:OUTPUT_MAX_BYTES]
-            truncated = True
+        # spec 32 (G20, reviewer finding): the cap is on ENCODED BYTE length,
+        # not characters — a hostile/huge provider response is capped, not
+        # buffered whole — the clutch is stored truncated
+        content, truncated = cap_text_bytes(content, OUTPUT_MAX_BYTES)
         return HarnessResult(exit_code=0, raw_output=content, usage=usage, truncated=truncated)
 
     async def teardown(self, run: RunContext) -> TeardownReport:

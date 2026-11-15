@@ -80,8 +80,26 @@ _BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def is_env_ref(value: str) -> bool:
-    """True when the value carries at least one `$VAR` / `${VAR}` env ref."""
-    return bool(_REF_RE.search(value))
+    """True when the value full-matches the ref grammar: literal segments plus
+    *complete* `$VAR` / `${VAR}` refs only — every `$` in the value must start
+    a whole ref that is not glued onto a preceding word character. The old
+    substring heuristic let partial literals like ``prefix$TOKEN`` (or a secret
+    that merely contains a `$`, e.g. ``sk$abc123``) pass registration and be
+    served verbatim; those are literals, not refs, and are refused/withheld."""
+    pos = 0
+    found = False
+    while pos < len(value):
+        m = _REF_RE.match(value, pos)
+        if m is not None:
+            if pos > 0 and (value[pos - 1].isalnum() or value[pos - 1] == "_"):
+                return False  # glued to a word char: part of a literal, not a ref boundary
+            found = True
+            pos = m.end()
+        elif value[pos] == "$":
+            return False  # a `$` that does not start a complete ref
+        else:
+            pos += 1
+    return found
 
 
 class ConnectorsError(Exception):

@@ -79,6 +79,17 @@ def display_relpath(path: str | Path, base: str | Path) -> str:
         return p.name
 
 
+def cap_text_bytes(text: str, max_bytes: int) -> tuple[str, bool]:
+    """Cap `text` at `max_bytes` of *encoded* (UTF-8) length — byte caps such
+    as OUTPUT_MAX_BYTES count bytes, not characters, so a multibyte-heavy
+    output is capped on its real size. Returns (capped_text, truncated); the
+    slice is decoded leniently so a cut multibyte tail never raises."""
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text, False
+    return data[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
 def redact_host_paths(text: str, *roots: str | Path) -> str:
     """Replace absolute path prefixes rooted at any of `roots` in free text
     (error messages, run-event log lines) with their root-relative remainder,

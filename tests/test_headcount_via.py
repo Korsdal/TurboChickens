@@ -442,3 +442,47 @@ def test_rooster_origin_rows_carry_via_rooster(budget1_settings, tmp_path, fake_
         assert {x["event"] for x in rows} >= {"egg.queued", "egg.hatched", "chicken.finished"}
     finally:
         dt.stop()
+
+
+# --- reviewer finding: via=farmhand is not honored from the /proc cmdline alone
+
+
+def test_resolve_via_farmhand_requires_a_verified_peer(monkeypatch) -> None:
+    """The `farmhand` actor is honored for an in-process forwarder or a real
+    `farmhand serve` process — but on a chicken-owned connection the peer must
+    be a strict descendant of the chicken (the attached Farmhand), never the
+    chicken process itself faking its argv."""
+    import turbochickens.daemon as daemon_mod
+    from turbochickens.daemon import CallerIdentity, _resolve_via
+
+    monkeypatch.setattr(daemon_mod, "_peer_runs_farmhand", lambda pid: True)
+
+    # negative: unknown/absent actor claims stay `socket`
+    assert _resolve_via(None, CallerIdentity(pid=4242, uid=1, gid=1)) == "socket"
+    assert _resolve_via("bogus", CallerIdentity(pid=4242, uid=1, gid=1)) == "socket"
+    assert _resolve_via("farmhand", None) == "socket"
+
+    # positive: in-process forwarders keep their actors (peer pid == coopd pid)
+    me = os.getpid()
+    for actor in ("http", "farmhand", "rooster"):
+        assert _resolve_via(actor, CallerIdentity(pid=me, uid=1, gid=1)) == actor
+    assert _resolve_via("socket", CallerIdentity(pid=me, uid=1, gid=1)) == "socket"
+
+    # positive: a standalone farmhand serve process (operator-run, not a
+    # chicken) is still attributed farmhand
+    assert _resolve_via("farmhand", CallerIdentity(pid=4242, uid=1, gid=1), {}) == "farmhand"
+
+    # positive: the attached Farmhand — a strict descendant of a registered
+    # chicken (peer pid 5556, chicken pid 5555 in the registry) — is
+    # attributed farmhand on the chicken-owned connection
+    registry = {5555: "run-1"}
+    descendant = CallerIdentity(pid=5556, uid=1, gid=1, run_id="run-1")
+    assert _resolve_via("farmhand", descendant, registry) == "farmhand"
+
+    # negative: the chicken process itself faking a farmhand argv is pinned
+    # to the honest `socket` label
+    assert _resolve_via("farmhand", CallerIdentity(pid=5555, uid=1, gid=1, run_id="run-1"), registry) == "socket"
+    # negative: a non-farmhand cmdline never grants the label
+    monkeypatch.setattr(daemon_mod, "_peer_runs_farmhand", lambda pid: False)
+    assert _resolve_via("farmhand", CallerIdentity(pid=4242, uid=1, gid=1), {}) == "socket"
+    assert _resolve_via("farmhand", descendant, registry) == "socket"

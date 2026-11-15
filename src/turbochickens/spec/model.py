@@ -8,7 +8,7 @@ Any extra key (including ``max_tokens``) is rejected with a field-named error.
 Spec 25 (chaining) adds ``nestbox://<run_id>/output.json`` URIs as valid
 ``[input].attachments`` entries — shape-checked here, resolved at provisioning.
 Spec 23 (Free-Range) adds ``resources.free_range``: a Free-Range chicken has
-no fence — no hard wall-clock kill — so ``timeout_sec`` becomes optional and
+no wall-clock cap — no hard wall-clock kill — so ``timeout_sec`` becomes optional and
 the pairing is validated here (``free_range = false`` requires
 ``timeout_sec > 0``; ``free_range = true`` allows it absent).
 Spec 27 (ChickenSubs) adds ``harness.spawn_subs``: a chicken with
@@ -95,8 +95,8 @@ class HarnessSection(_StrictModel):
 
 
 class ResourcesSection(_StrictModel):
-    # spec 23 (Free-Range): a Free-Range chicken has no fence — the hard
-    # wall-clock kill is removed and `timeout_sec` is optional. The pairing
+    # spec 23 (Free-Range): a Free-Range chicken has no wall-clock cap — the
+    # hard wall-clock kill is removed and `timeout_sec` is optional. The pairing
     # is enforced below: free_range = false (the default, pre-23 behavior)
     # still requires timeout_sec > 0; free_range = true allows it absent (a
     # present value must still be positive, and is then not enforced as a

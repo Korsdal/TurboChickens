@@ -36,6 +36,7 @@ from pathlib import Path
 import pytest
 
 from test_daemon import DaemonThread
+from test_run_e2e import upload_egg
 from turbochickens.client import request
 from turbochickens.runner import TERMINAL_STATES
 from turbochickens.settings import load_settings
@@ -298,6 +299,10 @@ def test_sub_chicken_ops_still_work_on_chicken_owned_connection(daemon, tmp_path
     wait_status(sock, victim_id, {"running"})
 
     egg = write_job(tmp_path, "sub-egg", prompt="Say hello")
+    # spec 32 (G1 allowlist): a chicken-owned connection may only queue egg
+    # paths inside the coop uploads area (or already-registered egg paths),
+    # so the probe enqueues the uploads-area copy of the egg
+    egg_up = upload_egg(sock, egg)
     read_ops: list[tuple[str, dict | None]] = [
         ("ping", None),
         ("status", None),
@@ -312,8 +317,8 @@ def test_sub_chicken_ops_still_work_on_chicken_owned_connection(daemon, tmp_path
         ("workspace_peek", {"run_id": "SELFRUN"}),
     ]
     extra: list[tuple[str, dict | None]] = [
-        ("enqueue", {"spec_path": str(egg)}),
-        ("enqueue", {"spec_path": str(egg), "parent_run_id": "run-forged"}),
+        ("enqueue", {"spec_path": str(egg_up)}),
+        ("enqueue", {"spec_path": str(egg_up), "parent_run_id": "run-forged"}),
         ("run_stop", {"run_id": victim_id}),
     ]
     lines = [scenario_line(op, p) for op, p in read_ops + extra]
@@ -334,10 +339,10 @@ def test_sub_chicken_ops_still_work_on_chicken_owned_connection(daemon, tmp_path
 
     # enqueue without a lineage field: lineage is forced from the peer — the
     # chicken cannot enqueue without lineage
-    r1 = probes[scenario_line("enqueue", {"spec_path": str(egg)})]
+    r1 = probes[scenario_line("enqueue", {"spec_path": str(egg_up)})]
     assert r1["ok"] is True and r1["parent_run_id"] == run_id
     # enqueue with a forged parent_run_id: ignored, still forced from the peer
-    r2 = probes[scenario_line("enqueue", {"spec_path": str(egg), "parent_run_id": "run-forged"})]
+    r2 = probes[scenario_line("enqueue", {"spec_path": str(egg_up), "parent_run_id": "run-forged"})]
     assert r2["ok"] is True and r2["parent_run_id"] == run_id
     assert "run-forged" not in json.dumps(r2)
     rows = request(sock, "runs_list", timeout=2.0)["runs"]
@@ -360,6 +365,9 @@ def test_sub_cannot_stop_ancestors_or_reach_admin_ops_over_direct_socket(daemon,
     wait_status(sock, parent_id, {"running"})
 
     egg = write_job(tmp_path, "attack-egg", prompt="Say hello")
+    # G1 allowlist: a chicken-owned connection can only queue uploads-area
+    # (or registered) egg paths, so the attack probes enqueue the uploaded copy
+    egg_up = upload_egg(sock, egg)
     scenarios = [
         ("run_stop", {"run_id": parent_id}),  # no caller field — forced from peer
         ("run_stop", {"run_id": parent_id, "caller_run_id": "run-forged"}),
@@ -370,7 +378,7 @@ def test_sub_cannot_stop_ancestors_or_reach_admin_ops_over_direct_socket(daemon,
         ("jobs_upload", {"files": {"job.toml": "e30="}}),
         ("run_rerun", {"run_id": parent_id}),
         ("schedule_add", {"spec_path": str(egg)}),
-        ("enqueue", {"spec_path": str(egg), "parent_run_id": "run-forged"}),
+        ("enqueue", {"spec_path": str(egg_up), "parent_run_id": "run-forged"}),
     ]
     lines = [scenario_line(op, p) for op, p in scenarios]
     prompt = f"PEERPROBE {sock}\n" + "\n".join(lines) + "\n"
@@ -394,7 +402,7 @@ def test_sub_cannot_stop_ancestors_or_reach_admin_ops_over_direct_socket(daemon,
         assert resp["ok"] is False and resp["errors"][0]["field"] == op, (op, resp)
         assert "not an operator" in resp["error"], (op, resp)
     # enqueue lineage still forced from the peer even with a forged parent
-    resp = probes[scenario_line("enqueue", {"spec_path": str(egg), "parent_run_id": "run-forged"})]
+    resp = probes[scenario_line("enqueue", {"spec_path": str(egg_up), "parent_run_id": "run-forged"})]
     assert resp["ok"] is True and resp["parent_run_id"] == sub_id, resp
 
     # the parent is still running — none of the attacks landed

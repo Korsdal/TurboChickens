@@ -559,3 +559,83 @@ def test_example_spec_hash_unchanged() -> None:
     spec = load_spec(root / "examples" / "weekly-incidents-digest" / "job.toml")
     h = spec_hash(spec)
     assert h.startswith("18efbd8c") and h.endswith("80b959")
+
+
+# --- reviewer findings: the _respond catch-all is redacted, and the handler
+# --- timeout shields the op instead of cancelling it mid-flight --------------
+
+
+def test_respond_catch_all_error_is_host_path_redacted(tmp_path, monkeypatch) -> None:
+    """The daemon's catch-all `error` field is served verbatim — pre-fix it
+    carried `type(e).__name__: str(e)` raw, and an OSError str embeds the host
+    path. Now it runs through redact_host_paths with the daemon's roots."""
+    import turbochickens.daemon as daemon_mod
+    from turbochickens.daemon import Daemon
+    from turbochickens.storage import init_db
+
+    f = write_settings(tmp_path)  # plain daemon, coop disabled
+    monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
+    settings = load_settings(f)
+    d = Daemon(settings)
+    d.db = init_db(tmp_path / "unit.db")
+
+    # a path under the daemon's own data dir — the roots it redacts against
+    boom = settings.data_dir / "workspaces" / "gone.txt"
+
+    async def explode(req, caller=None):
+        raise OSError(f"cannot read {boom}: no such file")
+
+    monkeypatch.setattr(d, "_dispatch", explode)
+
+    async def go() -> dict:
+        return await d._respond(b'{"op": "ping", "protocol": 1}')
+
+    resp = asyncio.run(go())
+    assert resp["ok"] is False
+    assert "OSError" in resp["error"]
+    # negative: no host path in the served catch-all error
+    assert_no_host_paths(resp["error"], settings.data_dir, tmp_path)
+    assert str(boom) not in resp["error"]
+    # positive: the root-relative remainder survives (the redaction is not a lossy wipe)
+    assert "gone.txt" in resp["error"] or "cannot read" in resp["error"]
+    d.db.close()
+
+
+def test_handler_timeout_shields_the_op_so_the_mutation_still_lands(tmp_path, monkeypatch, fake_vibe) -> None:
+    """Per-handler cap: the caller gets the Fox timeout error, but the
+    dispatch runs shielded — a slow mutating op is never cancelled mid-flight
+    and completes afterwards (pre-fix wait_for cancelled it mid-mutation)."""
+    import turbochickens.daemon as daemon_mod
+
+    f = write_settings(tmp_path)
+    monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
+    settings = load_settings(f)
+    monkeypatch.setattr(daemon_mod, "SOCKET_HANDLER_TIMEOUT_SEC", 0.3)
+    dt = DaemonThread(settings)
+    dt.start()
+    sock = settings.socket_path
+    try:
+        orig = daemon_mod.Daemon._enqueue
+        landed = {"done": False}
+
+        async def slow_enqueue(self, req, caller=None):
+            await asyncio.sleep(0.8)  # slower than the 0.3s handler cap
+            resp = await orig(self, req, caller)
+            landed["done"] = True
+            return resp
+
+        monkeypatch.setattr(daemon_mod.Daemon, "_enqueue", slow_enqueue)
+        job = write_job(tmp_path, name="slow-egg", prompt="Say hello")
+        resp = request(sock, "enqueue", spec_path=str(job), timeout=5.0)
+        # the caller got the Fox timeout answer, not a hang and not a crash
+        assert resp["ok"] is False
+        assert "cut the request short" in resp["error"], resp
+        # ... but the op itself completed (shielded), so the egg WAS queued
+        deadline = time.time() + 5
+        while time.time() < deadline and not landed["done"]:
+            time.sleep(0.05)
+        assert landed["done"] is True
+        rows = request(sock, "runs_list", timeout=5.0)["runs"]
+        assert any(r["job_id"] == "slow-egg" for r in rows), rows
+    finally:
+        dt.stop()

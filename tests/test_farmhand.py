@@ -968,3 +968,55 @@ def _token_from_lines(lines: list[str], timeout: float = 10.0) -> str:
             return tl[0].split(": ", 1)[1].strip()
         time.sleep(0.05)
     raise AssertionError(f"no ephemeral token line on stderr; stderr so far: {lines}")
+
+
+# --- reviewer finding: the standalone HTTPS runner carries the G20 caps ------
+
+
+def test_farmhand_https_caps_middleware_503_504_and_mcp_exemption(monkeypatch) -> None:
+    """`tc farmhand serve --transport https` runs the same Fence caps as the
+    coop listener: over the connection cap → 503, a slow non-MCP handler →
+    504, while the MCP path (SSE) stays exempt from the handler timeout."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from turbochickens import farmhand as fh
+
+    monkeypatch.setattr(fh, "COOP_HANDLER_TIMEOUT_SEC", 0.2)
+    app = SimpleNamespace(get=lambda k, d=None: "/mcp" if k == "farmhand_https_path" else d)
+
+    async def go() -> tuple:
+        # over the connection cap → 503 without calling the handler
+        fh._active_https_requests = fh.COOP_MAX_CONNECTIONS
+        req = SimpleNamespace(path="/other", app=app)
+
+        async def handler(request):
+            raise AssertionError("handler must not run over the cap")
+
+        over = await fh._caps_middleware(req, handler)
+        fh._active_https_requests = 0
+        # slow handler on a non-MCP path → 504
+        req2 = SimpleNamespace(path="/other", app=app)
+
+        async def slow(request):
+            await asyncio.sleep(1.0)
+            return "never"
+
+        slow_resp = await fh._caps_middleware(req2, slow)
+        # the MCP path itself is exempt from the per-handler timeout
+        req3 = SimpleNamespace(path="/mcp", app=app)
+
+        async def slow_mcp(request):
+            await asyncio.sleep(0.4)
+            return "mcp-ok"
+
+        mcp_resp = await fh._caps_middleware(req3, slow_mcp)
+        # counter is balanced again
+        counter = fh._active_https_requests
+        return over.status, slow_resp.status, mcp_resp, counter
+
+    over_status, slow_status, mcp_resp, counter = asyncio.run(go())
+    assert over_status == 503
+    assert slow_status == 504
+    assert mcp_resp == "mcp-ok"  # exempt: no 504 on the SSE path
+    assert counter == 0

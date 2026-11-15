@@ -127,6 +127,9 @@ def test_request_async_wedged_daemon_times_out_instead_of_hanging(tmp_path) -> N
     elapsed, msg = asyncio.run(go())
     assert "timed out" in msg
     assert elapsed < 2.0  # bounded by the configured timeout, not forever
+    # spec 32 (G17, reviewer finding): the timeout error is served verbatim in
+    # the coop's dead-socket payloads — it must not embed the host socket path
+    assert "wedged.sock" not in msg and str(tmp_path) not in msg, msg
 
 
 def test_request_sync_wedged_daemon_times_out(tmp_path) -> None:
@@ -235,6 +238,8 @@ def test_coop_http_wedged_daemon_answers_structured_payload_within_timeout(tmp_p
         assert body["daemon"]["up"] is False
         assert body["op"] == op
         assert "timed out" in body["error"]
+        # G17: the served daemon-down error never carries the host socket path
+        assert "wedged.sock" not in body["error"] and str(tmp_path) not in body["error"]
     assert get_elapsed < 2.0
     assert ping_code == 503 and ping_body["pong"] is False
 

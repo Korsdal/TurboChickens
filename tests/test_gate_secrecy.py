@@ -36,7 +36,7 @@ from test_run_e2e import db_row
 from turbochickens.audit import AuditLog
 from turbochickens.cli.main import app
 from turbochickens.client import request
-from turbochickens.connectors import WITHHELD_HEADER, load_connectors, public_entry, validate_connector_payload
+from turbochickens.connectors import WITHHELD_HEADER, HttpsConnector, load_connectors, public_entry, validate_connector_payload
 from turbochickens.settings import load_settings
 
 runner = CliRunner()
@@ -107,6 +107,35 @@ def test_validate_connector_payload_rejects_literal_header_secrets() -> None:
     # stdio env literals remain allowed at rest (only key names are ever served)
     entry, errs = validate_connector_payload("toolx", {"transport": "stdio", "command": "/bin/t", "env": {"K": MARKER}})
     assert entry is not None and not errs
+
+
+def test_partial_literal_dollar_values_are_not_refs() -> None:
+    # reviewer finding: the full-match ref grammar — a partial literal that
+    # merely contains a `$` (a secret like sk$abc123, or prefix$TOKEN glued to
+    # a word char) is NOT a ref: refused at registration, withheld at listing
+    from turbochickens.connectors import is_env_ref
+
+    # positive: complete refs in their dollar / dollar-brace forms
+    for v in ("$V", "${V}", "Bearer $TC_GATE_SECRET", "Bearer ${TC_GATE_SECRET}", "$A and $B"):
+        assert is_env_ref(v), v
+    # negative: glued or stray `$` — literals, never served as refs
+    for v in ("sk$abc123", "prefix$TOKEN", "Bearer$TOKEN", "x${V}", "costs $5", "$", "Bearer $$V"):
+        assert not is_env_ref(v), v
+    # negative at registration: a partial literal header is refused field-named
+    for headers in ({"Authorization": "sk-live$abc123"}, {"Authorization": "prefix$TC_GATE_SECRET"}):
+        entry, errs = validate_connector_payload(
+            "leaky", {"transport": "https", "url": "https://x.example/mcp", "headers": headers}
+        )
+        assert entry is None, headers
+        assert errs and errs[0]["field"] == "connectors.leaky.headers", errs
+        assert "sk-live" not in json.dumps(errs) and "prefix" not in json.dumps(errs)
+    # negative at listing: the same partial literal at rest is withheld
+    entry = HttpsConnector.model_validate(
+        {"transport": "https", "url": "https://l.example/mcp", "headers": {"Authorization": "sk-live$abc123"}}
+    )
+    pub = public_entry("legacy", entry)
+    assert pub["headers"] == {"Authorization": WITHHELD_HEADER}
+    assert "sk-live" not in json.dumps(pub)
 
 
 def test_public_entry_withholds_at_rest_literal_headers(tmp_path) -> None:

@@ -761,3 +761,66 @@ def test_e2e_subprocess_daemon_api_run(tmp_path, monkeypatch, providers_file, fa
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+
+
+# --- reviewer finding: transport errors / log lines never carry the provider
+# --- URL's userinfo (a base_url may embed user:pass@host) ----------------------
+
+
+def test_contract_transport_error_strips_provider_url_userinfo(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MISTRAL_API_KEY", "sk-contract")
+    secret_url = "http://feeduser:feedsecret@provider.test/v1"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # a transport error whose text embeds the full request URL (userinfo!)
+        raise httpx.ConnectError(f"cannot reach {request.url}", request=request)
+
+    adapter = MistralAPIAdapter(
+        make_spec(), providers=make_providers(base_url=secret_url), backoff_base_sec=0.01, max_retries=0
+    )
+    _, result, events, _, seen, _ = drive(adapter, make_ctx(tmp_path), handler)
+    # negative: neither the served error nor any streamed log line carries the
+    # URL or its userinfo
+    assert result.error and "ConnectError" in result.error
+    assert "provider.test" not in result.error and "feedsecret" not in result.error, result.error
+    blob = "\n".join(line for _, _, line in events)
+    assert "feedsecret" not in blob and "feeduser:feedsecret" not in blob, blob
+    assert "<url withheld by the fox>" in result.error
+    # positive: the request really went to the userinfo URL (the scrub is
+    # display-only), and the POST log line kept a scrubbed URL
+    assert seen and str(seen[0].url).startswith(secret_url)
+    post_lines = [line for _, _, line in events if "POST" in line and "fake-model" in line]
+    assert post_lines and "provider.test/v1/chat/completions" in post_lines[0]
+    assert "feeduser" not in post_lines[0] and "feedsecret" not in post_lines[0]
+
+
+def test_contract_byte_cap_counts_encoded_bytes_not_characters(tmp_path, monkeypatch) -> None:
+    # reviewer finding: OUTPUT_MAX_BYTES is a byte cap — a multibyte-heavy
+    # provider response whose CHARACTER count is under the cap must still be
+    # truncated at the encoded byte cap
+    from turbochickens.adapter import _url_scrubbed  # noqa: F401  (import smoke)
+    from turbochickens.settings import OUTPUT_MAX_BYTES
+    from turbochickens.util import cap_text_bytes
+
+    # positive seam: the helper itself
+    text = "é" * (OUTPUT_MAX_BYTES // 2 + 10)  # 2 bytes/char → over the byte cap, chars under it
+    assert len(text) < OUTPUT_MAX_BYTES < len(text.encode("utf-8"))
+    capped, truncated = cap_text_bytes(text, OUTPUT_MAX_BYTES)
+    assert truncated is True and len(capped.encode("utf-8")) <= OUTPUT_MAX_BYTES
+    plain = "a" * (OUTPUT_MAX_BYTES + 5)
+    capped2, truncated2 = cap_text_bytes(plain, OUTPUT_MAX_BYTES)
+    assert truncated2 is True and len(capped2) == OUTPUT_MAX_BYTES
+    ok, trunc3 = cap_text_bytes("short", OUTPUT_MAX_BYTES)
+    assert trunc3 is False and ok == "short"
+
+    # contract seam: the adapter caps the provider content on encoded bytes
+    monkeypatch.setenv("MISTRAL_API_KEY", "sk-contract")
+    big = "é" * (OUTPUT_MAX_BYTES // 2 + 10)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=ok_payload(json.dumps({"message": big})))
+
+    adapter = MistralAPIAdapter(make_spec(), providers=make_providers(), backoff_base_sec=0.01, max_retries=0)
+    _, result, _, _, _, _ = drive(adapter, make_ctx(tmp_path), handler)
+    assert result.truncated is True
+    assert len(result.raw_output.encode("utf-8")) <= OUTPUT_MAX_BYTES

@@ -275,6 +275,11 @@ def test_chicken_enqueue_of_uploaded_and_registered_paths_ok(daemon, tmp_path) -
 
 
 def test_chicken_schedule_add_and_rerun_allowlist(daemon, tmp_path) -> None:
+    """Merged G1+G8 semantics: on a chicken-owned connection `schedule_add`
+    and `run_rerun` are operator-only ops (docs/lexicon.md trust model —
+    refused before any handler runs, field naming the refused op), so the
+    spec-path allowlist never gets to admit them; `enqueue` keeps the
+    allowlist (covered by the tests above)."""
     sock = daemon.settings.socket_path
     cron = write_cron_job(tmp_path, "cron-egg", schedule="0 0 29 2 *")  # local, never fires
     cron_up = upload_egg(sock, cron)
@@ -284,9 +289,9 @@ def test_chicken_schedule_add_and_rerun_allowlist(daemon, tmp_path) -> None:
     wait_terminal(sock, base_run)
     prompt = (
         f"PEERPROBE {sock}\n"
-        f"sched {cron}\n"  # local path, not registered → refused
-        f"sched {cron_up}\n"  # uploads path → ok
-        f"rerun {base_run}\n"  # stored (registered) path → ok
+        f"sched {cron}\n"  # local path — operator-only op, refused regardless
+        f"sched {cron_up}\n"  # uploads path — still operator-only, refused
+        f"rerun {base_run}\n"  # re-run is operator-only too
     )
     prober = write_job(tmp_path, "prober3", prompt=prompt)
     run_id = request(sock, "enqueue", spec_path=str(prober), timeout=5.0)["run_id"]
@@ -294,18 +299,16 @@ def test_chicken_schedule_add_and_rerun_allowlist(daemon, tmp_path) -> None:
     assert run["status"] == "succeeded"
 
     probes = probe_report(sock, run_id)
-    r_bad = probes[f"sched {cron}"]
-    assert r_bad["ok"] is False
-    assert r_bad["errors"][0]["field"] == "spec_path"
-    assert "the fox refuses" in r_bad["error"]
-    r_ok = probes[f"sched {cron_up}"]
-    assert r_ok["ok"] is True and r_ok["job_id"] == "cron-egg"
-    r_rerun = probes[f"rerun {base_run}"]
-    assert r_rerun["ok"] is True and r_rerun.get("rerun_of") == base_run
-    # only the allowlisted path was scheduled
+    for line, op in ((f"sched {cron}", "schedule_add"), (f"sched {cron_up}", "schedule_add"), (f"rerun {base_run}", "run_rerun")):
+        r = probes[line]
+        assert r["ok"] is False, (line, r)
+        assert r["errors"][0]["field"] == op, (line, r)
+        assert "not an operator" in r["error"], (line, r)
+    # nothing was scheduled and no re-run was queued
     scheds = request(sock, "schedule_list", timeout=2.0)["schedules"]
-    assert len(scheds) == 1 and scheds[0]["job_id"] == "cron-egg"
-    request(sock, "schedule_rm", job_id="cron-egg", timeout=5.0)
+    assert scheds == []
+    rows = request(sock, "runs_list", timeout=2.0)["runs"]
+    assert not any(r.get("rerun_of") for r in rows)
 
 
 # --- the ChickenSub's Farmhand tool seam, from inside a real chicken ------------

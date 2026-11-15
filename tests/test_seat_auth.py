@@ -198,6 +198,34 @@ def test_seat_store_corrupt_file_fails_closed(tmp_path) -> None:
         store.load("seatco")
 
 
+def test_seat_store_unreadable_message_is_path_free(tmp_path) -> None:
+    # spec 32 (G17, reviewer finding): the unreadable-seat error surfaces via
+    # auth_providers' session_error and status_reason — it must serve only the
+    # seats/<provider>.json form, never the host path (an OSError str embeds it)
+    store = SeatStore(tmp_path / "data")
+    store.save(SeatSession("seatco", "t", "r", time.time() + 100))
+    (store.dir / "seatco.json").write_text("{not json")
+    with pytest.raises(SeatError) as ei:
+        store.load("seatco")
+    msg = str(ei.value)
+    assert "unreadable (seats/seatco.json)" in msg  # the seats/<provider>.json form
+    assert "tc auth login seatco" in msg  # the recovery hint is kept
+    assert str(tmp_path) not in msg and str(store.dir) not in msg, msg  # negative: no host path
+    # positive: an unreadable (permission-denied) file reports the same form
+    import os as _os
+    p = store.dir / "seatco.json"
+    p.write_text('{"access_token": "x", "refresh_token": "y", "expires_at": 1}')
+    _os.chmod(p, 0o000)
+    try:
+        with pytest.raises(SeatError) as ei2:
+            store.load("seatco")
+        msg2 = str(ei2.value)
+        assert "unreadable (seats/seatco.json)" in msg2
+        assert str(tmp_path) not in msg2 and str(store.dir) not in msg2, msg2
+    finally:
+        _os.chmod(p, 0o600)
+
+
 # --- broker contract over httpx.MockTransport ----------------------------------
 
 
