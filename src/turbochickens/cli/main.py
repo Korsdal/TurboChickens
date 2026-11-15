@@ -204,8 +204,9 @@ def coop_start(
     """Start coopd with the coop GUI enabled — HTTP at coop_host:coop_port serving / and /api/*.
 
     Identical to `tc daemon start` with coop_enabled = true in settings (the coop
-    container's CMD). Loopback with no coop_auth_token → open; otherwise a bearer
-    token is required and an ephemeral one is printed once to stdout."""
+    container's CMD). The bearer token is required on every bind by default; loopback
+    with no coop_auth_token is open only with the coop_loopback_open opt-in. When a
+    token is required and none configured, an ephemeral one is printed once to stdout."""
     from turbochickens.coop import coop_auth
 
     try:
@@ -221,7 +222,7 @@ def coop_start(
         f"weight_budget={settings.weight_budget}"
     )
     typer.echo(
-        f"coop: gui at {settings.coop_url} auth={'required (bearer token)' if auth.required else 'open (loopback, no token configured)'}"
+        f"coop: gui at {settings.coop_url} auth={'required (bearer token)' if auth.required else 'open (loopback opt-in coop_loopback_open, no token configured)'}"
     )
     try:
         asyncio.run(run_daemon(settings))
@@ -679,8 +680,9 @@ def farmhand_serve(
 
     stdio speaks MCP on stdin/stdout for same-machine agents (the 0600 daemon socket gates access).
     https serves streamable-HTTP at farmhand_https_path on the coop listener (coop_host:coop_port),
-    behind the same bearer rule as /api/* — loopback with no token configured is open, otherwise a
-    bearer token is required (an ephemeral one is printed once when non-loopback and none configured).
+    behind the same bearer rule as /api/* — the bearer is required on every bind by default; loopback
+    with no token configured is open only with the coop_loopback_open opt-in. When a token is required
+    and none is configured, an ephemeral one is printed once.
     both runs the two simultaneously. A coopd started with coop_enabled serves the https side itself
     on its existing listener when farmhand_transport includes 'https'."""
     from turbochickens.farmhand import TRANSPORTS, serve_transport

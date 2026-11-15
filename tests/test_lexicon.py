@@ -57,7 +57,7 @@ def fake_vibe(tmp_path, monkeypatch):
 
 @pytest.fixture
 def coop_daemon(tmp_path, monkeypatch):
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     dt = DaemonThread(settings)

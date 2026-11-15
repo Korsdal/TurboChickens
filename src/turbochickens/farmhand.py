@@ -22,8 +22,9 @@ Transports (settings ``farmhand_transport``, CLI ``--transport``):
   the 0600 daemon socket, so same-machine agents only.
 - ``https`` — streamable-HTTP at ``farmhand_https_path`` (default ``/mcp``)
   served from the coop process on the **existing listener**, behind the same
-  bearer middleware as ``/api/*`` (loopback + no token → open; non-loopback
-  or any configured token → 401 without ``Authorization: Bearer …``). The
+  bearer middleware as ``/api/*`` (bearer required on every bind by default;
+  loopback + no token → open only with the ``coop_loopback_open`` opt-in —
+  401 without ``Authorization: Bearer …``, compared in constant time). The
   SDK's Starlette app is mounted into the coop's aiohttp server through a
   small ASGI bridge (``asgi_request``), so no second server/port is needed.
 - ``both`` — the two at once (``tc farmhand serve --transport both`` runs the
@@ -480,7 +481,8 @@ async def asgi_request(app: Any, request: web.Request) -> web.StreamResponse:
 class FarmhandHTTP:
     """The Farmhand's streamable-HTTP endpoint (spec 26): the MCP server's
     Starlette app mounted at ``farmhand_https_path`` on the coop listener,
-    behind the same bearer rule as ``/api/*`` (loopback + no token → open).
+    behind the same bearer rule as ``/api/*`` (bearer required on every bind
+    by default; loopback-open only via the ``coop_loopback_open`` opt-in).
 
     Used two ways: mounted into the coop's aiohttp app (``handler`` +
     ``wants``), or standalone as the HTTPS side of ``tc farmhand serve``
@@ -553,10 +555,13 @@ class FarmhandHTTP:
     @web.middleware
     async def auth_middleware(self, request: web.Request, handler):
         """The coop bearer rule for the Farmhand endpoint (standalone mode):
-        required when non-loopback or a token is configured; loopback + no
-        token → open, exactly like /api/*. The token is never logged."""
+        required on every bind by default; loopback + no token → open only
+        with the ``coop_loopback_open`` opt-in, exactly like /api/*. The
+        comparison is constant-time (review G19). The token is never logged."""
         if self.auth.required and self.wants(request.path):
-            if request.headers.get("Authorization", "") != f"Bearer {self.auth.token}":
+            from turbochickens.coop import bearer_matches
+
+            if not bearer_matches(request.headers.get("Authorization", ""), self.auth.token or ""):
                 return web.json_response(
                     {"ok": False, "error": "unauthorized: send Authorization: Bearer <token>"}, status=401
                 )

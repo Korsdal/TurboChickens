@@ -105,9 +105,11 @@ The shipped settings bind `coop_host = "0.0.0.0"` with **no** configured
 - To pin a fixed token instead of the ephemeral one, mount your own settings
   file over `/etc/turbochickens/settings.toml` (or set
   `TURBOCHICKENS_SETTINGS` to a mounted path) with `coop_auth_token = "…"`.
-- Loopback-only deployments may set `coop_host = "127.0.0.1"` with no token —
-  then the GUI is open (same trust domain as the Unix socket). That is a
-  local-dev choice; the image default is the safe one.
+- Loopback-only deployments may set `coop_host = "127.0.0.1"` with no token **and**
+  `coop_loopback_open = true` — then the GUI is open on the loopback bind (the one
+  deliberate opening in the Fence). Without that opt-in the bearer is required on
+  every bind, loopback included, so any local user on a shared host is locked out.
+  That is a local-dev choice; the default is the safe one.
 
 ## Healthcheck
 

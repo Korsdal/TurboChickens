@@ -90,7 +90,7 @@ def seat_coop_env(tmp_path, monkeypatch) -> SimpleNamespace:
     monkeypatch.delenv("SEATCO_TOKEN", raising=False)
     providers_file = _providers_file(tmp_path, oauth.server_address[1], api.server_address[1])
     monkeypatch.setenv("TURBOCHICKENS_PROVIDERS", str(providers_file))
-    settings_file = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    settings_file = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(settings_file))
     yield SimpleNamespace(
         tmp_path=tmp_path,
@@ -381,7 +381,7 @@ def test_auth_endpoints_require_bearer_when_non_loopback(seat_auth_daemon) -> No
 
 
 def test_auth_endpoints_daemon_down_payload_not_500(tmp_path, monkeypatch) -> None:
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     port = settings.coop_port
@@ -527,7 +527,7 @@ def test_e2e_auth_flow_over_http_subprocess(tmp_path, monkeypatch) -> None:
     providers_file = _providers_file(tmp_path, oauth.server_address[1], 1)
     monkeypatch.setenv("TURBOCHICKENS_PROVIDERS", str(providers_file))
     port = free_port()
-    f = write_settings(tmp_path, coop_port=port)  # `tc coop start` forces coop on (loopback → open)
+    f = write_settings(tmp_path, coop_port=port, coop_loopback_open=True)  # `tc coop start` forces coop on; the opt-in keeps the loopback bind open
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     proc = subprocess.Popen(

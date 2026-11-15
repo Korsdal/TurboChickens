@@ -61,7 +61,7 @@ COOP_TOKEN = "spec30-coop-token"
 
 @pytest.fixture
 def coop_daemon(tmp_path, monkeypatch):
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     dt = DaemonThread(settings)
@@ -76,7 +76,7 @@ def budget1_daemon(tmp_path, monkeypatch):
     f = tmp_path / "settings.toml"
     f.write_text(
         f'data_dir = "{tmp_path / "data"}"\nweight_budget_override = 1\n'
-        f'coop_enabled = true\ncoop_port = {free_port()}\n'
+        f'coop_enabled = true\ncoop_port = {free_port()}\ncoop_loopback_open = true\n'
     )
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
@@ -461,7 +461,7 @@ def test_new_endpoints_bearer_401_when_auth_required(auth_daemon) -> None:
 
 
 def test_lifecycle_and_connectors_endpoints_daemon_down_not_500(tmp_path, monkeypatch) -> None:
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     port = settings.coop_port
@@ -590,7 +590,7 @@ def test_spa_serves_lifecycle_and_knob_markup(coop_daemon, tmp_path) -> None:
 
 def test_e2e_lifecycle_and_connectors_over_http(tmp_path, monkeypatch) -> None:
     port = free_port()
-    f = write_settings(tmp_path, coop_port=port)  # `tc coop start` forces coop on
+    f = write_settings(tmp_path, coop_port=port, coop_loopback_open=True)  # `tc coop start` forces coop on; the opt-in keeps the loopback bind open
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     bin_path = tmp_path / "fake-vibe"
     bin_path.write_text(FAKE_VIBE)

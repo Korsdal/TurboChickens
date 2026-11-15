@@ -62,7 +62,7 @@ GATE_SECRET = "SPEC31-GATE-SECRET-9f2e-do-not-serve"
 
 @pytest.fixture
 def coop_daemon(tmp_path, monkeypatch):
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     dt = DaemonThread(settings)
@@ -75,7 +75,7 @@ def coop_daemon(tmp_path, monkeypatch):
 def stdio_daemon(tmp_path, monkeypatch):
     """Coop on, but farmhand_transport = "stdio" — the HTTPS endpoint starts
     unmounted (spec 31 switches it at runtime)."""
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), farmhand_transport="stdio")
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), farmhand_transport="stdio", coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     dt = DaemonThread(settings)
@@ -178,7 +178,7 @@ def test_farmhand_and_settings_secrecy_with_configured_token(auth_daemon) -> Non
 
 
 def test_farmhand_and_settings_endpoints_daemon_down_not_500(tmp_path, monkeypatch) -> None:
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     port = settings.coop_port
@@ -399,7 +399,7 @@ def test_spa_serves_farmhand_and_connectors_views(coop_daemon, tmp_path) -> None
 
 def test_e2e_farmhand_view_and_gates_over_http(tmp_path, monkeypatch) -> None:
     port = free_port()
-    f = write_settings(tmp_path, coop_port=port)  # `tc coop start` forces coop on; transport defaults to both
+    f = write_settings(tmp_path, coop_port=port, coop_loopback_open=True)  # `tc coop start` forces coop on; transport defaults to both
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     monkeypatch.setenv("TC_GATE_SECRET", GATE_SECRET)
     settings = load_settings(f)

@@ -38,6 +38,7 @@ The loop is deliberate: eggs make chickens, chickens make eggs. Jobs beget resul
 |---|---|---|
 | **Rooster** | Cron-style scheduler — it wakes the jobs up | `scheduler.py` |
 | **Fox** | Security module — foxes eat Eggs *and* Chickens | security (future) |
+| **Fence** | The network boundary around the Coop — the bearer token keeps it shut on **every** bind (the Fox's default). The one deliberate opening is `coop_loopback_open`: a loopback bind with no token configured stays open only when the operator opts in | coop bearer middleware (`coop.py`, `farmhand.py`), `coop_loopback_open` |
 | **Perch** | Seat-based auth — a seat is a perch | `seat.py` |
 | **Headcount** | Audit log — a farmer's headcount | `audit.py` |
 
