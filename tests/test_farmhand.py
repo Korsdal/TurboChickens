@@ -597,7 +597,10 @@ def test_https_loopback_open_without_token_and_stdio_transport_not_mounted(tmp_p
         _wait_http(port2, proc)
         c = httpx.Client(base_url=f"http://127.0.0.1:{port2}", timeout=10.0)
         r = c.post("/mcp", json=MCP_INIT_BODY, headers=MCP_INIT_HEADERS)
-        assert r.status_code in (404, 405)  # not mounted; the GUI still serves
+        # spec 32 ticket 05: the route is protected even while unmounted — the
+        # no-bearer answer is the same 401 a mounted endpoint gives (uniform,
+        # no mount-state oracle); the GUI still serves
+        assert r.status_code == 401
         assert c.get("/api/ping").status_code == 200
         assert c.get("/").status_code == 200
     finally:

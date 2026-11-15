@@ -94,6 +94,26 @@ when the socket is dead). The Farmhand MCP route is now always registered at
 ``farmhand_transport`` excludes ``"https"``, and ``set_farmhand_transport``
 mounts/unmounts the endpoint at runtime when the operator switches the
 transport through ``settings_set``.
+
+Spec 32 ticket 05 (review G3 transport + G17 ping + G19 + G21) hardens the
+requests themselves — the Fence at the Coop's gate, watched by the Fox:
+
+- a JSON body is accepted only when sent as ``application/json`` — a
+  CSRF-style ``text/plain`` POST (CORS-safelisted, no preflight) is refused
+  with 415 before parsing;
+- the ``Host`` header must name the Coop's own host:port (DNS-rebinding reads
+  are refused), and any ``Origin``/``Referer`` whose host is not the Coop's
+  own is refused with 403 — a drive-by web page cannot drive the API;
+- every response — including errors and the streamed MCP responses — carries
+  ``Content-Security-Policy: default-src 'self'``, ``X-Frame-Options: DENY``,
+  and ``X-Content-Type-Options: nosniff`` (``fox.SECURITY_HEADERS``);
+- ``/api/ping`` answers a **bare pong** (``{"ok", "op", "pong"}`` only — no
+  version, pid, uptime, or host path; the 503 daemon-down shape is equally
+  bare);
+- the Farmhand MCP route is protected by the bearer middleware **even while
+  unmounted**, and its unmounted answer is the same generic 404 any unknown
+  path gets — uniform, no mount-state oracle;
+- path parameters win over same-named JSON body keys in the POST mirrors.
 """
 
 from __future__ import annotations
@@ -104,6 +124,8 @@ import hmac
 import ipaddress
 import json
 import secrets
+import socket
+import urllib.parse
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
@@ -112,6 +134,7 @@ from typing import Any, Protocol
 from aiohttp import web
 
 from turbochickens.client import DEFAULT_TIMEOUT, DaemonUnreachable, request_async
+from turbochickens.fox import security_headers_middleware
 from turbochickens.settings import (
     COOP_HANDLER_TIMEOUT_SEC,
     COOP_KEEPALIVE_TIMEOUT_SEC,
@@ -143,6 +166,102 @@ def is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host.strip()).is_loopback
     except ValueError:
         return host.strip().lower() == "localhost"
+
+
+# --- spec 32 ticket 05 (review G3): Host / Origin / Referer validation -------
+#
+# Pure seams — the Fence checks the request's claimed origin against the
+# Coop's own host:port before anything else runs. DNS rebinding works by
+# making a foreign name resolve to the coop's address, so the *name* in the
+# Host header is what is validated, never the resolved address.
+
+
+def split_host_port(value: str) -> tuple[str, str | None]:
+    """Split a Host-header / netloc value into (host, port | None). IPv6
+    literals in brackets keep their colons; the host is lowercased and
+    unbracketed."""
+    v = value.strip()
+    if v.startswith("["):
+        end = v.find("]")
+        if end == -1:
+            return v.lower(), None
+        rest = v[end + 1:]
+        port = rest[1:] if rest.startswith(":") else None
+        return v[1:end].lower(), (port or None)
+    if v.count(":") == 1:
+        host, _, port = v.partition(":")
+        return host.lower(), (port or None)
+    return v.lower(), None  # bare name or bare (unbracketed) IPv6 — no port
+
+
+def own_host_names(settings: Settings) -> set[str]:
+    """The host names this coop answers to: the loopback names, the configured
+    bind host (unless wildcard), and this machine's own hostname — all
+    lowercased, IPv6 brackets stripped."""
+    names = {"localhost", "127.0.0.1", "::1"}
+    host = settings.coop_host.strip().lower().strip("[]")
+    if host and host not in ("0.0.0.0", "::"):
+        names.add(host)
+    try:
+        names.add(socket.gethostname().strip().lower())
+    except OSError:
+        pass
+    return names
+
+
+def _host_port_ok(host: str, port: str | None, settings: Settings) -> bool:
+    if not host:
+        return False
+    if port is not None and port != str(settings.coop_port):
+        return False
+    if host in own_host_names(settings):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # a foreign name — rebinding sends the attacker's name, not an IP
+    if ip.is_loopback:
+        return True
+    # a non-loopback IP literal is only ever "our own" on a wildcard bind
+    return settings.coop_host.strip() in ("0.0.0.0", "::")
+
+
+def host_allowed(host_header: str | None, settings: Settings) -> bool:
+    """Host-header validation (review G3, DNS rebinding): the request must
+    name the Coop's own host, and the port — when present — must be the Coop's
+    own port. A missing Host header is refused."""
+    if not host_header:
+        return False
+    host, port = split_host_port(host_header)
+    return _host_port_ok(host, port, settings)
+
+
+def origin_allowed(origin: str, settings: Settings) -> bool:
+    """An ``Origin`` header is allowed only when it is the Coop's own origin
+    (``http://<own host>[:<own port>]``). ``null`` and foreign origins are
+    refused — a drive-by page cannot drive the API."""
+    try:
+        parts = urllib.parse.urlsplit(origin.strip())
+    except ValueError:
+        return False
+    if parts.scheme != "http" or not parts.netloc:
+        return False
+    host, port = split_host_port(parts.netloc.rsplit("@", 1)[-1])
+    return _host_port_ok(host, port, settings)
+
+
+def referer_allowed(referer: str, settings: Settings) -> bool:
+    """A ``Referer`` header is allowed only when its host:port is the Coop's
+    own (same-origin navigation keeps working; a foreign page's link does
+    not)."""
+    try:
+        parts = urllib.parse.urlsplit(referer.strip())
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return False
+    host, port = split_host_port(parts.netloc.rsplit("@", 1)[-1])
+    return _host_port_ok(host, port, settings)
 
 
 @dataclass(frozen=True)
@@ -252,7 +371,16 @@ class CoopServer:
         # client connection (e.g. an open MCP SSE stream, spec 26) can never
         # wedge daemon shutdown beyond it
         app = web.Application(
-            middlewares=[self._auth_middleware, self._caps_middleware], client_max_size=CLIENT_MAX_BODY
+            middlewares=[
+                # spec 32 (G21): CSP / X-Frame-Options / nosniff on EVERY response,
+                # errors included — registered first so it wraps everything
+                security_headers_middleware,
+                # spec 32 ticket 05 (G3): Host/Origin/Referer validated at the gate
+                self._request_hardening_middleware,
+                self._auth_middleware,
+                self._caps_middleware,
+            ],
+            client_max_size=CLIENT_MAX_BODY,
         )
         # spec 32 (G20): keepalive cap — an idle keep-alive connection on the
         # coop listener is closed after COOP_KEEPALIVE_TIMEOUT_SEC instead of
@@ -342,12 +470,55 @@ class CoopServer:
     # --- auth ---------------------------------------------------------------
 
     @web.middleware
+    async def _request_hardening_middleware(self, request: web.Request, handler):
+        """Spec 32 ticket 05 (review G3 transport): the Fence at the Coop's
+        gate, before auth or any handler runs. The ``Host`` header must name
+        the Coop's own host:port (a DNS-rebinding read is refused — the
+        attacker's name is in the Host, not the resolved address), and any
+        ``Origin``/``Referer`` whose host is not the Coop's own is refused —
+        a drive-by web page cannot drive the API (a CORS-safelisted
+        ``text/plain`` POST still carries a foreign ``Origin``). Requests
+        with no Origin/Referer at all (curl, httpx, the MCP client, the
+        container healthcheck) pass."""
+        if not host_allowed(request.headers.get("Host"), self.settings):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "the Fox refuses this Host — the coop answers only to its own host:port",
+                },
+                status=403,
+            )
+        origin = request.headers.get("Origin")
+        if origin is not None and not origin_allowed(origin, self.settings):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "the Fox refuses a foreign Origin — the coop serves only its own yard",
+                },
+                status=403,
+            )
+        referer = request.headers.get("Referer")
+        if referer is not None and not referer_allowed(referer, self.settings):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "the Fox refuses a foreign Referer — the coop serves only its own yard",
+                },
+                status=403,
+            )
+        return await handler(request)
+
+    @web.middleware
     async def _auth_middleware(self, request: web.Request, handler):
         # static assets stay open so the SPA can load and show its login card
         # on a 401 from /api/*; /api/ping is the unauthenticated healthcheck.
-        # spec 26: the Farmhand MCP endpoint sits behind the same rule
+        # spec 26: the Farmhand MCP endpoint sits behind the same rule.
+        # spec 32 ticket 05: the Farmhand route is protected even while
+        # UNMOUNTED — the answer is uniform, so the route leaks no mount state
+        # (no mount-state oracle: without the bearer, mounted and unmounted
+        # answer the same 401)
         protected = request.path.startswith("/api/") and request.path != "/api/ping"
-        if self.farmhand is not None and self.farmhand.wants(request.path):
+        if self._is_farmhand_path(request.path):
             protected = True
         if self.auth.required and protected:
             if not bearer_matches(request.headers.get("Authorization", ""), self.auth.token or ""):
@@ -404,14 +575,16 @@ class CoopServer:
     # --- /api/* — thin mirrors of socket ops over the transport seam --------
 
     async def _api_ping(self, request: web.Request) -> web.Response:
+        """The unauthenticated healthcheck (spec 12) answers a **bare pong**
+        (spec 32 ticket 05 / review G17): the body carries only ``ok`` / ``op``
+        / ``pong`` — never a version, pid, uptime, or host path, so the one
+        intentionally open route discloses nothing. The daemon-down answer is
+        the same bare shape with ``pong: false`` and status 503."""
         try:
-            resp = await self.transport.request("ping")
-        except DaemonUnreachable as e:
-            # healthcheck semantics: 503 when the supervisor socket is unreachable
-            return web.json_response(
-                {"ok": False, "op": "ping", "pong": False, "error": str(e)}, status=503
-            )
-        return web.json_response(resp)
+            await self.transport.request("ping")
+        except DaemonUnreachable:
+            return web.json_response({"ok": False, "op": "ping", "pong": False}, status=503)
+        return web.json_response({"ok": True, "op": "ping", "pong": True})
 
     async def _call(self, op: str, **payload: Any) -> tuple[dict[str, Any] | None, web.Response | None]:
         """One socket op over the transport seam. Returns (resp, None), or
@@ -468,7 +641,22 @@ class CoopServer:
     async def _json_body(self, request: web.Request) -> tuple[Any, web.Response | None]:
         """Read one JSON request body. Returns (body, None), or (None, response):
         413 when the raw body exceeds the client_max_size backstop (spec 15
-        bundles are large), 400 when it is not JSON."""
+        bundles are large), 415 when a body is present but not sent as
+        ``application/json`` (spec 32 / review G3: a JSON body is accepted only
+        as application/json — a CSRF-style ``text/plain`` POST is
+        CORS-safelisted, needs no preflight, and is refused here before
+        parsing), 400 when it is not JSON."""
+        if request.can_read_body and request.content_type != "application/json":
+            return None, web.json_response(
+                {
+                    "ok": False,
+                    "error": (
+                        "the Fox only takes JSON delivered as application/json — this request"
+                        f" arrived as {request.content_type!r}"
+                    ),
+                },
+                status=415,
+            )
         try:
             return await request.json(), None
         except web.HTTPRequestEntityTooLarge:
@@ -657,7 +845,10 @@ class CoopServer:
                     status=400,
                 )
             for k, v in body.items():
-                if k not in ("op", "protocol"):
+                # spec 32 ticket 05: path parameters win over same-named body
+                # keys — a body key can never override the run_id/job_id from
+                # the path (only keys the path did not set are forwarded)
+                if k not in ("op", "protocol") and k not in payload:
                     payload[k] = v
         resp, down = await self._call(op, **payload)
         if down is not None:
@@ -925,18 +1116,11 @@ class CoopServer:
         ``farmhand_transport`` excludes ``"https"`` (the endpoint is not
         mounted then; ``set_farmhand_transport`` mounts/unmounts it at
         runtime, spec 31). Behind the same bearer rule as ``/api/*`` when
-        mounted (see _auth_middleware)."""
+        mounted — and spec 32 ticket 05: protected even while unmounted (see
+        _auth_middleware), with the same generic 404 body any unknown path
+        gets, so the route is uniform and leaks no mount state."""
         if self.farmhand is None:
-            return web.json_response(
-                {
-                    "ok": False,
-                    "error": (
-                        "the Farmhand HTTPS endpoint is not served while"
-                        f" farmhand_transport={self.settings.farmhand_transport!r}"
-                    ),
-                },
-                status=404,
-            )
+            return web.json_response({"ok": False, "error": "not found"}, status=404)
         return await self.farmhand.handler(request)
 
     # --- static SPA ----------------------------------------------------------

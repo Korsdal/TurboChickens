@@ -170,14 +170,19 @@ def test_coop_auth_configured_token_wins_on_loopback_too() -> None:
 # --- HTTP API against a thread daemon (open mode) ------------------------------
 
 
-def test_api_ping_unauthenticated_mirrors_socket_op(coop_daemon) -> None:
+def test_api_ping_unauthenticated_answers_bare_pong(coop_daemon) -> None:
+    # spec 32 ticket 05 (G17): the one open route discloses nothing — the HTTP
+    # ping is a bare pong (no version/pid/host path), while the socket op
+    # keeps its full payload for the local CLI
     c = http_client(coop_daemon.settings)
     r = c.get("/api/ping")
     assert r.status_code == 200
     body = r.json()
-    assert body["ok"] is True and body["pong"] is True
+    assert body == {"ok": True, "op": "ping", "pong": True}
+    assert "version" not in body and "pid" not in body
+    assert str(coop_daemon.settings.data_dir) not in r.text and "daemon.sock" not in r.text
     sock = request(coop_daemon.settings.socket_path, "ping", timeout=2.0)
-    assert body["version"] == sock["version"] and body["pid"] == sock["pid"]
+    assert sock["ok"] is True and sock["pong"] is True and sock["version"] and sock["pid"]
 
 
 def _normalize_status(status: dict) -> dict:
