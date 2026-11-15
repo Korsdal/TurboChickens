@@ -106,8 +106,12 @@ It is available only while the workspace exists (in-flight chickens) — a
 terminal run answers a clear "the beak is closed" error, because the
 abattoir's attested teardown already removed the workspace. Paths are locked
 inside that run's workspace (traversal refused) and the chicken's private
-harness config (``.vibe/``, the farmhand settings file) is never served — see
-``beak.py`` for the pure seam.
+harness config (``.vibe/``, the farmhand settings file) is never served —
+checked on the resolved target, with symlink/hardlink targets refused and an
+O_NOFOLLOW open, so aliases and resolve→open races cannot serve private or
+out-of-workspace files (spec 32 ticket 07, review G4); the tree walk is
+capped before sorting and runs off the event loop (spec 32 ticket 07, G20) —
+see ``beak.py`` for the pure seam.
 
 Spec 31 (the Farmhand & Connectors GUI views) adds ``farmhand_info`` — the
 Farmhand view's payload: active transport(s), the HTTPS endpoint URL on the
@@ -686,7 +690,7 @@ class Daemon:
         if op == "runs_logs":
             return self._runs_logs(req)
         if op == "workspace_peek":
-            return self._workspace_peek(req)
+            return await self._workspace_peek(req)
         if op == "run_stop":
             return await self._run_stop(req, caller)
         if op == "run_rerun":
@@ -1242,16 +1246,18 @@ class Daemon:
 
     # --- spec 29: the Beak — read-only live view into a running chicken -------
 
-    def _workspace_peek(self, req: dict[str, Any]) -> dict[str, Any]:
+    async def _workspace_peek(self, req: dict[str, Any]) -> dict[str, Any]:
         """The Beak: a running chicken's workspace file tree (no ``path``), or
         one file's size-capped content (``path`` given, workspace-relative).
         Available only while the workspace exists — terminal runs answer a
         clear closed-beak error because the abattoir already removed the
         workspace. This socket op is the single place that touches workspace
         files; the coop web layer only mirrors it over the transport seam.
-        Path lock, size caps, and the private-config blocklist live in
-        ``beak.py``; tree paths are workspace-relative, so no host path ever
-        leaves the daemon in a payload."""
+        Path lock, resolved-target privacy, symlink/hardlink refusal, the
+        O_NOFOLLOW open, and the size caps live in ``beak.py``; tree paths are
+        workspace-relative, so no host path ever leaves the daemon in a
+        payload. spec 32 (G20): the tree walk runs off the event loop via
+        ``beak.workspace_tree_async``."""
         run_id = str(req.get("run_id", ""))
         if not run_id:
             return {"ok": False, "protocol": PROTOCOL_VERSION, "error": "workspace_peek requires run_id"}
@@ -1296,7 +1302,9 @@ class Daemon:
                     "run_id": run_id,
                     "status": status,
                     "mode": "tree",
-                    "tree": beak.workspace_tree(ws),
+                    # spec 32 (G20): the walk is capped before sorting and runs
+                    # in a worker thread, never on this event loop
+                    "tree": await beak.workspace_tree_async(ws),
                 }
             rel = beak.safe_relpath(str(rel))
             if rel is None:
