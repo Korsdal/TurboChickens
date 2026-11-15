@@ -86,7 +86,6 @@ from turbochickens.adapter import (
     TeardownReport,
     auth_telemetry_of,
     make_adapter,
-    sanitize_log_line,
 )
 from turbochickens.audit import AuditLog
 from turbochickens.chaining import (
@@ -102,7 +101,7 @@ from turbochickens.settings import Settings
 from turbochickens.spec.loader import load_spec
 from turbochickens.spec.model import JobSpec
 from turbochickens.stats import rollup_usage
-from turbochickens.util import utcnow_iso
+from turbochickens.util import sanitize_log_line, utcnow_iso
 from turbochickens.validate import OutputValidation, validate_output
 
 #: terminal states — every one requires a teardown attestation (baseline §5).
@@ -201,6 +200,11 @@ class RunPipeline:
     # --- db helpers -------------------------------------------------------
 
     async def _event(self, run_id: str, source: str, level: str, line: str) -> None:
+        # G10: every streamed run-event line passes through the log sanitizer
+        # at this single choke point — supervisor-authored lines included — so
+        # a hostile Feeder's error bytes can never reach `tc runs logs` raw
+        # (no ANSI/OSC escape sequences). Length caps stay the callers' job.
+        line = sanitize_log_line(line, None)
         async with self._db_lock:
             row = self.db.execute(
                 "SELECT COALESCE(MAX(seq), -1) + 1 FROM run_events WHERE run_id = ?", (run_id,)
@@ -763,7 +767,7 @@ class RunPipeline:
         terminal state — nothing was spawned or provisioned, so the
         attestation verifies that (1, 1, 1)."""
         run_id = item["run_id"]
-        reason = "cancelled while queued — the egg never hatched"
+        reason = sanitize_log_line("cancelled while queued — the egg never hatched")
         now = utcnow_iso()
         spec = load_spec(item["spec_path"])
         manifest: dict[str, Any] = {
@@ -862,6 +866,11 @@ class RunPipeline:
         """Manifest + terminal status + teardown attestation + audit rows.
         Runs for every path out of `execute`, including exceptions."""
         run_id = ctx.run_id
+        # G10: the terminal reason lands in the manifest (status_reason), the
+        # Headcount and run events — served via /api/runs* and printed by the
+        # CLI. It may quote a Feeder/OAuth error, so it is sanitized here:
+        # control/format characters stripped, never raw response bytes.
+        reason = sanitize_log_line(reason)
         manifest = self._manifest(item, ctx, harness, result, status, reason, budget, auth, chaining)
         # teardown first: destruction is verified, not assumed
         try:

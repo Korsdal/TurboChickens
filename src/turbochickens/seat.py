@@ -38,6 +38,7 @@ from turbochickens.providers import (
     verification_uri_scheme_error,
 )
 from turbochickens.settings import Settings
+from turbochickens.util import http_error_detail
 
 #: refresh a token this many seconds before its stated expiry
 EXPIRY_LEEWAY_SEC = 30.0
@@ -308,7 +309,7 @@ class SeatBroker:
             self.store.delete(provider_name)
             raise SeatError(
                 f"perch seat for provider {provider_name!r} is revoked or expired "
-                f"(token endpoint http {resp.status_code}: {resp.text[:200]}); "
+                f"(token endpoint http {resp.status_code}: {http_error_detail(resp)}); "
                 f"run `tc auth login {provider_name}` again"
             )
         session = self._session_from_token(provider_name, resp.json(), fallback_refresh=session.refresh_token)
@@ -361,7 +362,8 @@ class SeatBroker:
             )
             if resp.status_code != 200:
                 raise SeatError(
-                    f"device endpoint for provider {provider_name!r} http {resp.status_code}: {resp.text[:200]}"
+                    f"device endpoint for provider {provider_name!r} http {resp.status_code}:"
+                    f" {http_error_detail(resp)}"
                 )
             dev = resp.json()
             device_code = dev.get("device_code")
@@ -422,10 +424,10 @@ class SeatBroker:
             session = self._session_from_token(grant.provider, resp.json())
             self.store.save(session)
             return {"status": "authorized", "session": session}
-        try:
-            error = resp.json().get("error", "")
-        except ValueError:
-            error = resp.text[:200]
+        # G10: the token endpoint's error body is untrusted bytes — a hostile
+        # auth server can echo the posted device/refresh credential in it.
+        # Only the parsed `error` field (sanitized) may surface in the error.
+        error = http_error_detail(resp)
         if error == "authorization_pending":
             return {"status": "pending"}
         if error == "slow_down":
