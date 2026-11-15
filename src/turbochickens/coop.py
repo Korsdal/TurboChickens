@@ -110,7 +110,7 @@ from typing import Any, Protocol
 
 from aiohttp import web
 
-from turbochickens.client import DaemonUnreachable, request_async
+from turbochickens.client import DEFAULT_TIMEOUT, DaemonUnreachable, request_async
 from turbochickens.settings import UPLOAD_MAX_BYTES, UPLOAD_MAX_HTTP_BODY, Settings
 
 #: backstop for request bodies (spec 15): a bundle at the decoded cap encodes
@@ -180,13 +180,17 @@ class CoopTransport(Protocol):
 
 
 class SocketTransport:
-    """CoopTransport over the daemon's own Unix socket."""
+    """CoopTransport over the daemon's own Unix socket. The round trip is
+    bounded by ``timeout`` (enforced inside ``client.request_async``, spec 32 /
+    G14), so a wedged or over-limit coopd maps to the structured daemon-down
+    payload instead of hanging the handler or raising."""
 
-    def __init__(self, socket_path: str | Path) -> None:
+    def __init__(self, socket_path: str | Path, timeout: float = DEFAULT_TIMEOUT) -> None:
         self.socket_path = socket_path
+        self.timeout = timeout
 
     async def request(self, op: str, **payload: Any) -> dict[str, Any]:
-        return await request_async(self.socket_path, op, **payload)
+        return await request_async(self.socket_path, op, timeout=self.timeout, **payload)
 
 
 def _load_static() -> dict[str, tuple[bytes, str, str | None]]:
