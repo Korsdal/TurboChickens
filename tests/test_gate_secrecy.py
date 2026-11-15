@@ -74,7 +74,9 @@ def daemon(settings_file, fake_vibe):
 
 @pytest.fixture
 def coop_daemon(tmp_path, monkeypatch):
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    # open-mode HTTP tests: loopback bind + the coop_loopback_open opt-in
+    # (bearer-by-default is covered separately in test_coop_bearer_default)
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     monkeypatch.delenv("TURBOCHICKENS_CONNECTORS", raising=False)
     settings = load_settings(f)

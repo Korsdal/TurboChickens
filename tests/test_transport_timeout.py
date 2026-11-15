@@ -99,7 +99,11 @@ async def _over_limit(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 
 
 def _coop_settings(tmp_path: Path, monkeypatch) -> object:
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), farmhand_transport="stdio")
+    # coop_loopback_open: these tests exercise the open-mode HTTP contract
+    # (bearer-by-default is covered separately in test_coop_bearer_default)
+    f = write_settings(
+        tmp_path, coop_enabled=True, coop_port=free_port(), farmhand_transport="stdio", coop_loopback_open=True
+    )
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     return load_settings(f)
 

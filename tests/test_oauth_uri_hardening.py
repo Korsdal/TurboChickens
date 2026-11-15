@@ -300,7 +300,7 @@ def coop_daemon(tmp_path, monkeypatch, oauth_server):
     monkeypatch.setenv("TURBOCHICKENS_PROVIDERS", str(providers_file))
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
     monkeypatch.delenv("SEATCO_TOKEN", raising=False)
-    settings_file = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    settings_file = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(settings_file))
     settings = load_settings(settings_file)
     dt = DaemonThread(settings)

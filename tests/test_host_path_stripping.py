@@ -62,8 +62,10 @@ def fake_vibe(tmp_path, monkeypatch) -> Path:
 
 @pytest.fixture
 def coop_daemon(tmp_path, monkeypatch, fake_vibe):
-    """Coop-enabled daemon in a thread, temp data dir, fake vibe harness."""
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    """Coop-enabled daemon in a thread, temp data dir, fake vibe harness.
+    Open-mode HTTP: loopback bind + the coop_loopback_open opt-in (the
+    bearer-by-default rule is covered separately in test_coop_bearer_default)."""
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     dt = DaemonThread(settings)
@@ -465,7 +467,7 @@ def test_client_daemon_unreachable_message_is_path_free(tmp_path) -> None:
 
 
 def test_dead_socket_http_payload_is_path_free(tmp_path, monkeypatch) -> None:
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     server = CoopServer(settings, transport=SocketTransport(tmp_path / "dead.sock"))

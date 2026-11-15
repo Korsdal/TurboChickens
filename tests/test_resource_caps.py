@@ -257,14 +257,16 @@ def test_socket_handler_timeout_answers_error_instead_of_hanging(daemon, monkeyp
     monkeypatch.setattr(dm, "SOCKET_HANDLER_TIMEOUT_SEC", 0.3)
     orig_respond = dm.Daemon._respond
 
-    async def slow_respond(self, line: bytes):
+    async def slow_respond(self, line: bytes, caller=None):
+        # caller: the SO_PEERCRED identity param added by the ticket-10 merge —
+        # _handle_client calls _respond(line, caller), so the stub must accept it
         try:
             req = json.loads(line.decode("utf-8"))
         except Exception:
             req = {}
         if req.get("op") == "ping":
             await asyncio.sleep(2.0)  # wedge this one op past the handler cap
-        return await orig_respond(self, line)
+        return await orig_respond(self, line, caller)
 
     monkeypatch.setattr(dm.Daemon, "_respond", slow_respond)
     sock = daemon.settings.socket_path
@@ -424,6 +426,9 @@ class HangTransport:
 
 
 def _coop_settings(tmp_path, monkeypatch, **fields: object):
+    # open-mode HTTP tests: loopback bind + the coop_loopback_open opt-in
+    # (bearer-by-default is covered separately in test_coop_bearer_default)
+    fields.setdefault("coop_loopback_open", True)
     f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), **fields)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     return load_settings(f)
@@ -554,7 +559,8 @@ def test_coop_keepalive_cap_closes_idle_connection(tmp_path, monkeypatch) -> Non
 
 @pytest.fixture
 def coop_daemon(tmp_path, monkeypatch, fake_vibe):
-    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port())
+    # open-mode HTTP: loopback bind + the coop_loopback_open opt-in
+    f = write_settings(tmp_path, coop_enabled=True, coop_port=free_port(), coop_loopback_open=True)
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
     dt = DaemonThread(settings)

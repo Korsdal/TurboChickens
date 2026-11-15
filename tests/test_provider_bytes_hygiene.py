@@ -155,8 +155,10 @@ def _seat_providers() -> ProvidersConfig:
                     "base_url": "http://provider.test/v1",
                     "api_key_env": "SEATCO_TOKEN",
                     "auth": "seat",
-                    "oauth_device_url": "http://oauth.test/device",
-                    "oauth_token_url": "http://oauth.test/token",
+                    # spec 32 (G7): OAuth endpoints are https-only (http only on
+                    # loopback hosts) — the fake endpoints point at https loopback
+                    "oauth_device_url": "https://127.0.0.1/device",
+                    "oauth_token_url": "https://127.0.0.1/token",
                     "oauth_client_id": "tc-test-client",
                     "models": {"seat-model": {"context_window": 8192, "input_usd_per_mtok": 1.0, "output_usd_per_mtok": 2.0, "json_mode": True}},
                 }
@@ -248,7 +250,7 @@ def test_device_poll_echo_never_reaches_seat_error(tmp_path, monkeypatch) -> Non
                 json={
                     "device_code": DEVICE_MARKER,
                     "user_code": "ABCD-EFGH",
-                    "verification_uri": "http://oauth.test/verify",
+                    "verification_uri": "https://oauth.test/verify",
                     "interval": 0.05,
                     "expires_in": 300,
                 },
@@ -379,7 +381,7 @@ class FakeOAuthHandler(BaseHTTPRequestHandler):
                 {
                     "device_code": DEVICE_MARKER,
                     "user_code": "ABCD-EFGH",
-                    "verification_uri": "http://127.0.0.1/verify",
+                    "verification_uri": "https://127.0.0.1/verify",
                     "interval": 0.05,
                     "expires_in": 300,
                 },

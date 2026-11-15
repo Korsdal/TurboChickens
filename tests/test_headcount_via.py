@@ -88,6 +88,7 @@ def coop_daemon(tmp_path, monkeypatch, fake_vibe):
         f"weight_budget_override = 1\n"
         f"coop_enabled = true\n"
         f"coop_port = {free_port()}\n"
+        f"coop_loopback_open = true\n"  # open-mode HTTP tests (bearer-by-default is covered elsewhere)
     )
     monkeypatch.setenv("TURBOCHICKENS_SETTINGS", str(f))
     settings = load_settings(f)
